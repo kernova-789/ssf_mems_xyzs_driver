@@ -1,0 +1,11 @@
+config SSF_SENSOR
+	tristate "SSF Modbus sensor driver"
+	depends on SERIAL_DEV_BUS
+	select CRC16
+	help
+	  Build the SSF sensor driver for a Modbus RTU device connected through
+	  the Linux serial-device (serdev) bus.  The driver is structured into
+	  transport, protocol, sensor, core, and data subsystems.
+
+	  Select M to build a loadable module named ssf_sensor.ko, or Y to link
+	  it into the kernel.

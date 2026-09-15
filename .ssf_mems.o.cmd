@@ -1,0 +1,1 @@
+cmd_/home/u-yoimiya/文档/mems_driver/ssf_mems.o := aarch64-linux-gnu-ld -EL  -maarch64elf -z noexecstack --no-warn-rwx-segments   -r -o /home/u-yoimiya/文档/mems_driver/ssf_mems.o /home/u-yoimiya/文档/mems_driver/core/core.o
