@@ -1,0 +1,46 @@
+# 编译产生的文件
+*.o
+*.ko
+*.a
+*.so
+*.elf
+*.map
+*.bin
+*.img
+*.dtb
+
+# 编译目录
+build/
+out/
+
+# 临时文件
+*.swp
+*.swo
+*~
+*.tmp
+
+# VS Code
+.vscode/
+
+# CLion / JetBrains
+.idea/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+
+# 编译数据库
+compile_commands.json
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时目录
+tmp/
+temp/

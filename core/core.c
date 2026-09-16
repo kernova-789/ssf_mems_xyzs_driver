@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/serdev.h>
+#include <linux/types.h>
 
 struct ssf_mems_xyzs_data{
     struct serdev_device *serdev;
@@ -10,11 +11,14 @@ struct ssf_mems_xyzs_data{
 };
 
 static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev, const unsigned char *buf, size_t len){
-
-    return 0;
+    u8 data[] = "message from serdev device";
+    int ret = 0;
+    ret += serdev_device_write_buf(serdev, buf, len);
+    ret += serdev_device_write_buf(serdev, data, sizeof(data));
+    return ret;
 }
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev){
-
+    
 }
 
 static const struct serdev_device_ops ssf_mems_xyzs_ops = {
@@ -31,13 +35,13 @@ static int	ssf_mems_xyzs_probe(struct serdev_device *serdev){
     serdev_device_set_drvdata(serdev, data);
 
     serdev_device_set_client_ops(serdev, &ssf_mems_xyzs_ops);
-    // serdev_device_set_baudrate(serdev, 9600);
+    devm_serdev_device_open(&serdev->dev, serdev);
+    serdev_device_set_baudrate(serdev, 9600);
     serdev_device_set_flow_control(serdev, false);
-    serdev_device_open(serdev);
     return 0;
 }
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev){
-    serdev_device_close(serdev);
+
 }
 
 static const struct of_device_id ssf_mems_of_matchs[] = {
