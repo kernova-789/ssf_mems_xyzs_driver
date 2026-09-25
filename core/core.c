@@ -1,34 +1,34 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/kfifo.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/serdev.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #include "core.h"
+#include "modbus_receive.h"
 
 #define SSF_RX_BUF_SIZE 5
 #define SSF_FRAME_MAX_SIZE 1024
 
-struct ssf_mems_xyzs_data {
-  struct serdev_device *serdev;
-  struct ssf_rx_frame rx_frames[SSF_RX_BUF_SIZE];
-  u8 slave_addr;    //从机地址
-};
-
 static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
-                                         const unsigned char *buf, size_t len) {
-  u8 data[] = "message from serdev device";
-  int ret = 0;
-  ret += serdev_device_write(serdev, buf, len, 1000);
-  if(ret < 0) {
-    dev_err(&serdev->dev, "Failed to write data to serdev device\n");
-    return ret;
-  }
-  ret += serdev_device_write(serdev, data, sizeof(data), 1000);
+                                         const unsigned char *buf,
+                                         size_t count) {
+  struct ssf_mems_data *data;
+  int ret;
 
+  data = serdev_device_get_drvdata(serdev);
+
+  ret = ssf_mems_rx_push(serdev, buf, count);
+  if (ret < 0) {
+    dev_err(&serdev->dev, "failed to push received data into rx fifo: %d\n",
+            ret);
+  }
   return ret;
 }
+
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {}
 
 static const struct serdev_device_ops ssf_mems_xyzs_ops = {
@@ -37,12 +37,26 @@ static const struct serdev_device_ops ssf_mems_xyzs_ops = {
 };
 
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_xyzs_data *data = NULL;
+  int index = 0;
+  struct kfifo *rx_fifo = NULL;
+  int ret = 0;
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
   if (!data)
     return -ENOMEM;
+  for(index = 0; index < SSF_MEMS_FRAME_SLOT_NUM; index++){
+    data->frame[index].data = NULL;
+    atomic_set(&data->frame[index].in_use, SSF_MEMS_FRAME_SLOT_FREE);
+  }
   data->serdev = serdev;
-  data->slave_addr = 0x01; // Set the slave address
+  data->parse_frame_state = 0;
+  spin_lock_init(&data->rx_fifo_lock);
+  ret = kfifo_alloc(rx_fifo, 1024, GFP_KERNEL);
+  if (ret) {
+    dev_err(&serdev->dev, "Failed to allocate RX FIFO\n");
+    return ret;
+  }
+  data->rx_fifo = rx_fifo;
 
   serdev_device_set_drvdata(serdev, data);
 
@@ -52,7 +66,10 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   serdev_device_set_flow_control(serdev, false);
   return 0;
 }
-static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {}
+static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
+  struct ssf_mems_xyzs_data *data = serdev_device_get_drvdata(serdev);
+  kfifo_free(data->rx_fifo);
+}
 
 static const struct of_device_id ssf_mems_of_matchs[] = {
     {

@@ -5,6 +5,7 @@ ssf_mems-y += core/core.o
 # ssf_mems-y += data/temperature.o
 # ssf_mems-y += data/vibration.o
 ssf_mems-y += protocol/modbus.o
+ssf_mems-y += protocol/modbus_receive.o
 # ssf_mems-y += protocol/protocol.o
 # ssf_mems-y += sensor/sensor.o
 # ssf_mems-y += serdev/serdev.o
