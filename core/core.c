@@ -10,22 +10,20 @@
 #include "core.h"
 #include "modbus_receive.h"
 
-#define SSF_RX_BUF_SIZE 5
-#define SSF_FRAME_MAX_SIZE 1024
+#define SSF_RX_FIFO_SIZE 1024
 
 static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
                                          const unsigned char *buf,
                                          size_t count) {
-  struct ssf_mems_data *data;
   int ret;
 
-  data = serdev_device_get_drvdata(serdev);
-
   ret = ssf_mems_rx_push(serdev, buf, count);
+
   if (ret < 0) {
     dev_err(&serdev->dev, "failed to push received data into rx fifo: %d\n",
             ret);
   }
+
   return ret;
 }
 
@@ -37,45 +35,61 @@ static const struct serdev_device_ops ssf_mems_xyzs_ops = {
 };
 
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data = NULL;
-  int index = 0;
-  struct kfifo *rx_fifo = NULL;
-  int ret = 0;
+  struct ssf_mems_xyzs_data *data;
+  int index;
+  int ret;
+
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
   if (!data)
     return -ENOMEM;
-  for(index = 0; index < SSF_MEMS_FRAME_SLOT_NUM; index++){
+
+  for (index = 0; index < SSF_MEMS_FRAME_SLOT_NUM; index++) {
     data->frame[index].data = NULL;
+    data->frame[index].data_len = 0;
+    data->frame[index].data_pos = 0;
+    data->frame[index].frame_len = 0;
+    data->frame[index].state = SSF_MEMS_RX_IDLE;
+    data->frame[index].slave_id = 0;
+    data->frame[index].function = 0;
+
     atomic_set(&data->frame[index].in_use, SSF_MEMS_FRAME_SLOT_FREE);
   }
+
   data->serdev = serdev;
-  data->parse_frame_state = 0;
+
   spin_lock_init(&data->rx_fifo_lock);
-  ret = kfifo_alloc(rx_fifo, 1024, GFP_KERNEL);
+
+  ret = kfifo_alloc(&data->rx_fifo, SSF_RX_FIFO_SIZE, GFP_KERNEL);
   if (ret) {
-    dev_err(&serdev->dev, "Failed to allocate RX FIFO\n");
+    dev_err(&serdev->dev, "failed to allocate RX FIFO\n");
     return ret;
   }
-  data->rx_fifo = rx_fifo;
 
   serdev_device_set_drvdata(serdev, data);
 
   serdev_device_set_client_ops(serdev, &ssf_mems_xyzs_ops);
+
   devm_serdev_device_open(&serdev->dev, serdev);
+
   serdev_device_set_baudrate(serdev, 9600);
   serdev_device_set_flow_control(serdev, false);
+
   return 0;
 }
+
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data = serdev_device_get_drvdata(serdev);
-  kfifo_free(data->rx_fifo);
+  struct ssf_mems_xyzs_data *data;
+
+  data = serdev_device_get_drvdata(serdev);
+
+  kfifo_free(&data->rx_fifo);
 }
 
 static const struct of_device_id ssf_mems_of_matchs[] = {
     {
         .compatible = "sange-cbm,ssf-mems-xyzs",
     },
-    {/* sentinel */}};
+    {}};
 
 MODULE_DEVICE_TABLE(of, ssf_mems_of_matchs);
 
@@ -86,6 +100,7 @@ static struct serdev_device_driver ssf_mems_driver = {
             .of_match_table = ssf_mems_of_matchs,
             .owner = THIS_MODULE,
         },
+
     .probe = ssf_mems_xyzs_probe,
     .remove = ssf_mems_xyzs_remove,
 };
