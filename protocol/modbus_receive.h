@@ -16,6 +16,7 @@ struct ssf_mems_frame_desc {
 
 enum ssf_mems_modbus_func {
   SSF_MEMS_MODBUS_FUNC_READ = 0x03,
+  SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE = 0x06,
   SSF_MEMS_MODBUS_FUNC_WRITE_MULTI = 0x10,
 };
 

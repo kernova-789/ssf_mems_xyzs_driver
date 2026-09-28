@@ -1,5 +1,7 @@
 #include "modbus_receive.h"
 #include "core.h"
+#include "modbus_request.h"
+#include "protocol.h"
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -26,7 +28,7 @@
  *
  * 总长度 = 8 bytes
  */
-#define SSF_MEMS_MODBUS_WRITE_MULTI_FRAME_LEN 8
+#define SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN 8
 
 static const struct ssf_mems_frame_desc ssf_mems_frames[] = {
     {
@@ -126,15 +128,15 @@ static int ssf_mems_rx_alloc_read_frame(struct ssf_mems_frame_slot *slot,
 }
 
 static int
-ssf_mems_rx_alloc_write_multi_frame(struct ssf_mems_frame_slot *slot) {
-  slot->data = kzalloc(SSF_MEMS_MODBUS_WRITE_MULTI_FRAME_LEN, GFP_KERNEL);
+ssf_mems_rx_alloc_write_fixed_frame(struct ssf_mems_frame_slot *slot) {
+  slot->data = kzalloc(SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN, GFP_KERNEL);
 
   if (!slot->data)
     return -ENOMEM;
 
-  slot->data_len = SSF_MEMS_MODBUS_WRITE_MULTI_FRAME_LEN;
+  slot->data_len = SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN;
 
-  slot->frame_len = SSF_MEMS_MODBUS_WRITE_MULTI_FRAME_LEN;
+  slot->frame_len = SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN;
 
   slot->data_pos = 0;
 
@@ -146,21 +148,20 @@ static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot,
   int ret;
 
   if (function != SSF_MEMS_MODBUS_FUNC_READ &&
+      function != SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE &&
       function != SSF_MEMS_MODBUS_FUNC_WRITE_MULTI) {
     return -EINVAL;
   }
 
   slot->function = function;
 
-  if (function == SSF_MEMS_MODBUS_FUNC_WRITE_MULTI) {
-    ret = ssf_mems_rx_alloc_write_multi_frame(slot);
+  if (function == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE ||
+      function == SSF_MEMS_MODBUS_FUNC_WRITE_MULTI) {
+    ret = ssf_mems_rx_alloc_write_fixed_frame(slot);
     if (ret)
       return ret;
 
-    /*
-     * 此时 Slave ID 和 Function 已经确定，
-     * 直接写入 frame buffer。
-     */
+    /* 此时 Slave ID 和 Function 已经确定，直接写入 frame buffer。 */
     ret = ssf_mems_rx_append_byte(slot, slot->slave_id);
     if (ret)
       return ret;
@@ -170,10 +171,7 @@ static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot,
       return ret;
   }
 
-  /*
-   * 0x03 此时还不知道 Byte Count，
-   * 所以暂时不能创建完整 frame buffer。
-   */
+  /* 0x03 此时还不知道 Byte Count，所以暂时不能创建完整 frame buffer。 */
   slot->state = SSF_MEMS_RX_DATA;
 
   return 0;
@@ -221,6 +219,7 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
                                  struct ssf_mems_frame_slot *slot) {
   u16 crc_calc; // 自己算的crc
   u16 crc_recv; // 接收到的crc
+  int ret = 0;
 
   if (!slot->data)
     return;
@@ -250,7 +249,17 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
   }
 
   /* 校验通过，将帧发送给协议处理模块 */
-  ssf_mems_protocol_process(data, slot);
+  ret = ssf_mems_modbus_claim_frame(data, slot);
+  if (ret > 0) {
+    ssf_mems_rx_free_slot(slot);
+    return;
+  }
+
+  ret = ssf_mems_protocol_process(data, slot);
+  if (ret < 0) {
+    dev_err(&data->serdev->dev, "failed to ssf_mems_protocol_process: %d\n",
+            ret);
+  }
 }
 
 static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
@@ -411,13 +420,13 @@ int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf,
 
   ret = kfifo_in_spinlocked(&data->rx_fifo, buf, count, &data->rx_fifo_lock);
 
+  ssf_mems_modbus_queue_parse(serdev);
   if (ret != count) {
     dev_err(&serdev->dev,
             "rx fifo overflow: "
             "received %zu bytes, "
             "stored %u bytes\n",
             count, ret);
-
     return -ENOSPC;
   }
 

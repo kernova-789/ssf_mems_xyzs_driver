@@ -9,6 +9,7 @@
 
 #include "core.h"
 #include "modbus_receive.h"
+#include "modbus_request.h"
 
 #define SSF_RX_FIFO_SIZE 1024
 
@@ -18,10 +19,10 @@ static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
   int ret;
 
   ret = ssf_mems_rx_push(serdev, buf, count);
-
   if (ret < 0) {
     dev_err(&serdev->dev, "failed to push received data into rx fifo: %d\n",
             ret);
+    return count;
   }
 
   return ret;
@@ -67,9 +68,20 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
 
   serdev_device_set_drvdata(serdev, data);
 
+  ret = ssf_mems_modbus_request_init(data);
+  if (ret) {
+    kfifo_free(&data->rx_fifo);
+    return ret;
+  }
+
   serdev_device_set_client_ops(serdev, &ssf_mems_xyzs_ops);
 
-  devm_serdev_device_open(&serdev->dev, serdev);
+  ret = devm_serdev_device_open(&serdev->dev, serdev);
+  if (ret) {
+    ssf_mems_modbus_request_remove(data);
+    kfifo_free(&data->rx_fifo);
+    return ret;
+  }
 
   serdev_device_set_baudrate(serdev, 9600);
   serdev_device_set_flow_control(serdev, false);
@@ -79,9 +91,8 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
 
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
-
   data = serdev_device_get_drvdata(serdev);
-
+  ssf_mems_modbus_request_remove(data);
   kfifo_free(&data->rx_fifo);
 }
 

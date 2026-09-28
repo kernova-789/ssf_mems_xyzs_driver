@@ -5,6 +5,7 @@
 #include <linux/spinlock.h>
 
 #include "modbus_receive.h"
+#include "modbus_request.h"
 
 #define SSF_MEMS_FRAME_SLOT_NUM 4
 
@@ -13,9 +14,11 @@
 
 struct ssf_mems_xyzs_data {
   struct serdev_device *serdev;
+  struct kfifo rx_fifo;       //收到的字节流放进这里
+  spinlock_t rx_fifo_lock;    //读写rx_fifo时的锁
 
-  struct kfifo rx_fifo;
-  spinlock_t rx_fifo_lock;
+  struct work_struct rx_work; //从fifo中分离完整帧的工作
+  struct ssf_mems_modbus_request_state modbus_req;  
 
-  struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM];
+  struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM];  //用于放置完整的帧的空间的描述结构体数组
 };
