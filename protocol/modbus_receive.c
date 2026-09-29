@@ -249,8 +249,7 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
   }
 
   /* 校验通过，将帧发送给协议处理模块 */
-  ret = ssf_mems_modbus_claim_frame(data, slot);
-  if (ret > 0) {
+  if (ssf_mems_modbus_claim_frame(data, slot)) {
     ssf_mems_rx_free_slot(slot);
     return;
   }
