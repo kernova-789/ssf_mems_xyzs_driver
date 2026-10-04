@@ -19,22 +19,43 @@ static u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len) {
   return crc;
 }
 
-/* 根据功能码、方向、寄存器号和数量查找对应的命令表项。 */
-static const struct ssf_cmd_desc *
-ssf_mems_modbus_find_cmd(u8 function, enum ssf_cmd_dir direction,
-                         u16 display_reg, u16 reg_count) {
-  size_t i;
+/* 在发送前检查整个范围，任何一个地址不满足条件都不发送。 */
+static int ssf_mems_modbus_check_range(u16 display_reg, u16 reg_count,
+                                     enum ssf_reg_access access,
+                                     u16 *protocol_addr) {
+  const struct ssf_reg_desc *first;
+  const struct ssf_reg_desc *reg;
+  u16 i;
 
-  for (i = 0; i < SSF_CMD_TABLE_SIZE; i++) {
-    const struct ssf_cmd_desc *cmd = &ssf_cmd_table[i];
+  if (!reg_count || !protocol_addr ||
+      (u32)display_reg + reg_count - 1 > 0xffffU)
+    return -EINVAL;
 
-    if (cmd->function == function && cmd->direction == direction &&
-        cmd->display_reg == display_reg && cmd->reg_count == reg_count) {
-      return cmd;
-    }
+  first = ssf_mems_modbus_find_reg(display_reg);
+  if (!first)
+    return -ENOENT;
+
+  if ((u32)first->protocol_addr + reg_count - 1 > 0xffffU)
+    return -EINVAL;
+
+  for (i = 0; i < reg_count; i++) {
+    reg = ssf_mems_modbus_find_reg(display_reg + i);
+    if (!reg)
+      return -ENOENT;
+
+    if (!(reg->access & access))
+      return -EACCES;
+
+    if (reg->protocol_addr != (u32)first->protocol_addr + i)
+      return -EINVAL;
+
+    /* 特殊原始数据响应不能交给普通 0x03 寄存器解析器。 */
+    if (access == SSF_REG_READ && reg->read_frame_type != SSF_FRAME_FIXED)
+      return -EOPNOTSUPP;
   }
 
-  return NULL;
+  *protocol_addr = first->protocol_addr;
+  return 0;
 }
 
 /* 组装并发送 Modbus 0x03 读取请求帧。 */
@@ -254,34 +275,35 @@ ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *req,
   return ret;
 }
 
-/* 发送一个 0x03 读取请求，并等待对应的响应或超时。 */
+/* 连续读取普通寄存器；整个范围通过可读权限检查后才发送 0x03。 */
 int ssf_mems_modbus_read(struct serdev_device *serdev, u16 display_reg,
                          u16 reg_count, u16 *values, size_t values_count,
                          unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data = serdev_device_get_drvdata(serdev);
+  struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_request_state *req;
-  const struct ssf_cmd_desc *cmd;
+  u16 protocol_addr;
   int ret;
 
-  if (!data || !values || !reg_count)
+  if (!serdev || !values || !reg_count)
     return -EINVAL;
 
   if (values_count < reg_count)
     return -EINVAL;
 
+  data = serdev_device_get_drvdata(serdev);
+  if (!data)
+    return -ENODEV;
+
   if (!timeout_ms)
     timeout_ms = SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS;
 
-  if (reg_count > 125)
+  if (reg_count > SSF_MEMS_MODBUS_READ_MAX_REGS)
     return -EINVAL;
 
-  cmd = ssf_mems_modbus_find_cmd(SSF_MEMS_MODBUS_FUNC_READ, SSF_CMD_READ,
-                                 display_reg, reg_count);
-  if (!cmd)
-    return -EINVAL;
-
-  if (cmd->frame_type != SSF_FRAME_FIXED)
-    return -EOPNOTSUPP;
+  ret = ssf_mems_modbus_check_range(display_reg, reg_count, SSF_REG_READ,
+                                  &protocol_addr);
+  if (ret)
+    return ret;
 
   req = &data->modbus_req;
   mutex_lock(&req->lock);
@@ -297,9 +319,9 @@ int ssf_mems_modbus_read(struct serdev_device *serdev, u16 display_reg,
   }
 
   req->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
-  req->function = cmd->function;
+  req->function = SSF_MEMS_MODBUS_FUNC_READ;
   req->display_reg = display_reg;
-  req->protocol_addr = cmd->protocol_addr;
+  req->protocol_addr = protocol_addr;
   req->reg_count = reg_count;
   req->values = values;
   req->values_count = values_count;
@@ -330,21 +352,30 @@ int ssf_mems_modbus_read_reg(struct serdev_device *serdev, u16 display_reg,
 /* 发送一个 0x06 写请求，并等待对应的响应或超时。 */
 int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
                               u16 value, unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data = serdev_device_get_drvdata(serdev);
+  struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_request_state *req;
-  const struct ssf_cmd_desc *cmd;
+  const struct ssf_reg_desc *reg;
   int ret;
 
+  if (!serdev)
+    return -EINVAL;
+
+  data = serdev_device_get_drvdata(serdev);
   if (!data)
     return -ENODEV;
 
   if (!timeout_ms)
     timeout_ms = SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS;
 
-  cmd = ssf_mems_modbus_find_cmd(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
-                                 SSF_CMD_WRITE, display_reg, 1);
-  if (!cmd)
-    return -EINVAL;
+  reg = ssf_mems_modbus_find_reg(display_reg);
+  if (!reg)
+    return -ENOENT;
+
+  if (!(reg->access & SSF_REG_WRITE))
+    return -EACCES;
+
+  if (!reg->write_single)
+    return -EOPNOTSUPP;
 
   req = &data->modbus_req;
   mutex_lock(&req->lock);
@@ -360,9 +391,9 @@ int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
   }
 
   req->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
-  req->function = cmd->function;
+  req->function = SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE;
   req->display_reg = display_reg;
-  req->protocol_addr = cmd->protocol_addr;
+  req->protocol_addr = reg->protocol_addr;
   req->reg_count = 1;
   req->values = NULL;
   req->values_count = 0;
@@ -384,31 +415,35 @@ out_unlock:
   return ret;
 }
 
-/* 发送一个 0x10 多寄存器写请求，并等待对应的响应或超时。 */
+/* 连续写普通寄存器；整个范围通过可写权限检查后才发送 0x10。 */
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
                                u16 reg_count, const u16 *values,
                                size_t values_count, unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data = serdev_device_get_drvdata(serdev);
+  struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_request_state *req;
-  const struct ssf_cmd_desc *cmd;
+  u16 protocol_addr;
   int ret;
 
-  if (!data || !values || !reg_count)
+  if (!serdev || !values || !reg_count)
     return -EINVAL;
 
   if (values_count < reg_count)
     return -EINVAL;
 
+  data = serdev_device_get_drvdata(serdev);
+  if (!data)
+    return -ENODEV;
+
   if (!timeout_ms)
     timeout_ms = SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS;
 
-  if (reg_count > 123)
+  if (reg_count > SSF_MEMS_MODBUS_WRITE_MAX_REGS)
     return -EINVAL;
 
-  cmd = ssf_mems_modbus_find_cmd(SSF_MEMS_MODBUS_FUNC_WRITE_MULTI,
-                                 SSF_CMD_WRITE, display_reg, reg_count);
-  if (!cmd)
-    return -EINVAL;
+  ret = ssf_mems_modbus_check_range(display_reg, reg_count, SSF_REG_WRITE,
+                                  &protocol_addr);
+  if (ret)
+    return ret;
 
   req = &data->modbus_req;
   mutex_lock(&req->lock);
@@ -424,9 +459,9 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
   }
 
   req->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
-  req->function = cmd->function;
+  req->function = SSF_MEMS_MODBUS_FUNC_WRITE_MULTI;
   req->display_reg = display_reg;
-  req->protocol_addr = cmd->protocol_addr;
+  req->protocol_addr = protocol_addr;
   req->reg_count = reg_count;
   req->values = NULL;
   req->values_count = 0;
@@ -446,6 +481,26 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
 out_unlock:
   mutex_unlock(&req->lock);
   return ret;
+}
+
+/* 手册规定的块写命令：固定写入 40061～40070 十个工作参数。 */
+int ssf_mems_modbus_write_work_parameters(struct serdev_device *serdev,
+                                         const u16 *values,
+                                         size_t values_count,
+                                         unsigned int timeout_ms) {
+  const struct ssf_block_cmd_desc *cmd;
+
+  cmd = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_WRITE_WORK_PARAMETERS);
+  if (!cmd)
+    return -ENOENT;
+
+  if (cmd->function != SSF_MEMS_MODBUS_FUNC_WRITE_MULTI ||
+      cmd->direction != SSF_CMD_WRITE || cmd->frame_type != SSF_FRAME_FIXED)
+    return -EOPNOTSUPP;
+
+  return ssf_mems_modbus_write_regs(serdev, cmd->start_display_reg,
+                                  cmd->reg_count, values, values_count,
+                                  timeout_ms);
 }
 
 /* 判断完整响应帧是否属于当前请求，并在读取请求中保存寄存器数据。 */

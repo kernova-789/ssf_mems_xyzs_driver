@@ -59,6 +59,8 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   data->serdev = serdev;
 
   spin_lock_init(&data->rx_fifo_lock);
+  mutex_init(&data->sensor_data_lock);
+  data->sensor_data_valid = false;
 
   ret = kfifo_alloc(&data->rx_fifo, SSF_RX_FIFO_SIZE, GFP_KERNEL);
   if (ret) {

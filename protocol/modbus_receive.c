@@ -254,11 +254,14 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
     return;
   }
 
+  /* TODO：暂未声明/定义；未认领帧的处理策略确定后再实现。 */
   ret = ssf_mems_protocol_process(data, slot);
   if (ret < 0) {
     dev_err(&data->serdev->dev, "failed to ssf_mems_protocol_process: %d\n",
             ret);
   }
+
+  ssf_mems_rx_free_slot(slot);
 }
 
 static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
