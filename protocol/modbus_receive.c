@@ -1,6 +1,8 @@
 #include "modbus_receive.h"
 #include "core.h"
+#include "modbus.h"
 #include "modbus_request.h"
+#include "modbus_table.h"
 #include "protocol.h"
 
 #include <linux/errno.h>
@@ -8,449 +10,250 @@
 #include <linux/kfifo.h>
 #include <linux/slab.h>
 
-#define SSF_MEMS_MODBUS_SLAVE_ID_LEN 1
-#define SSF_MEMS_MODBUS_FUNC_LEN 1
-#define SSF_MEMS_MODBUS_BYTE_COUNT_LEN 1
-#define SSF_MEMS_MODBUS_CRC_LEN 2
-
-#define SSF_MEMS_MODBUS_READ_FIXED_LEN                                         \
-  (SSF_MEMS_MODBUS_SLAVE_ID_LEN + SSF_MEMS_MODBUS_FUNC_LEN +                   \
-   SSF_MEMS_MODBUS_BYTE_COUNT_LEN + SSF_MEMS_MODBUS_CRC_LEN)
-
-/*
- * Modbus 0x10 响应：
- *
- * Slave ID
- * Function
- * Starting Address : 2 bytes
- * Register Quantity: 2 bytes
- * CRC              : 2 bytes
- *
- * 总长度 = 8 bytes
- */
-#define SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN 8
-
-static const struct ssf_mems_frame_desc ssf_mems_frames[] = {
-    {
-        .type = SSF_MEMS_FRAME_MODBUS,
-        .slave_id = 0x01,
-    },
-    {
-        .type = SSF_MEMS_FRAME_RAW_VIB,
-        .slave_id = 0x15,
-    },
-};
-
-static size_t ssf_mems_modbus_read_frame_len(u8 byte_count) {
-  return SSF_MEMS_MODBUS_READ_FIXED_LEN + byte_count;
-}
-
+/* 返回 true 槽位已占用，false 槽位未占用。 */
 static bool ssf_mems_rx_slot_is_used(const struct ssf_mems_frame_slot *slot) {
   return atomic_read(&slot->in_use) == SSF_MEMS_FRAME_SLOT_USED;
 }
 
+/* 返回已认领的槽位；没有空闲槽位返回 NULL。 */
 static struct ssf_mems_frame_slot *
 ssf_mems_rx_alloc_slot(struct ssf_mems_xyzs_data *data) {
-  struct ssf_mems_frame_slot *slot;
-  int index;
+  int i;
 
-  for (index = 0; index < SSF_MEMS_FRAME_SLOT_NUM; index++) {
-
-    slot = &data->frame[index];
+  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++) {
+    struct ssf_mems_frame_slot *slot = &data->frame[i];
 
     if (atomic_cmpxchg(&slot->in_use, SSF_MEMS_FRAME_SLOT_FREE,
-                       SSF_MEMS_FRAME_SLOT_USED) == SSF_MEMS_FRAME_SLOT_FREE) {
-
+                       SSF_MEMS_FRAME_SLOT_USED) == SSF_MEMS_FRAME_SLOT_FREE)
       return slot;
-    }
   }
-
   return NULL;
 }
 
+/* 释放帧缓冲区并归还槽位；无返回值。 */
 static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot) {
   kfree(slot->data);
-
   slot->data = NULL;
   slot->data_len = 0;
   slot->data_pos = 0;
   slot->frame_len = 0;
-
   slot->state = SSF_MEMS_RX_IDLE;
-
   slot->slave_id = 0;
   slot->function = 0;
-
+  slot->frame_desc = NULL;
   atomic_set(&slot->in_use, SSF_MEMS_FRAME_SLOT_FREE);
 }
 
-static void ssf_mems_rx_init_candidate(struct ssf_mems_frame_slot *slot,
-                                       u8 slave_id) {
+/* 初始化候选帧状态；无返回值。 */
+static void ssf_mems_rx_init_candidate(struct ssf_mems_frame_slot *slot, u8 slave_id) {
   slot->data = NULL;
   slot->data_len = 0;
   slot->data_pos = 0;
   slot->frame_len = 0;
-
   slot->state = SSF_MEMS_RX_FUNC;
-
   slot->slave_id = slave_id;
   slot->function = 0;
+  slot->frame_desc = NULL;
 }
 
+/* 追加一个字节；返回 0 成功，-EINVAL 无缓冲区，-ENOSPC 缓冲区已满。 */
 static int ssf_mems_rx_append_byte(struct ssf_mems_frame_slot *slot, u8 byte) {
   if (!slot->data)
     return -EINVAL;
-
   if (slot->data_pos >= slot->data_len)
     return -ENOSPC;
-
-  slot->data[slot->data_pos] = byte;
-  slot->data_pos++;
-
+  slot->data[slot->data_pos++] = byte;
   return 0;
 }
 
-static int ssf_mems_rx_alloc_read_frame(struct ssf_mems_frame_slot *slot,
-                                        u8 byte_count) {
-  size_t frame_len;
-
-  frame_len = ssf_mems_modbus_read_frame_len(byte_count);
-
-  slot->data = kzalloc(frame_len, GFP_KERNEL);
+/* 分配帧缓冲区；返回 0 成功，-ENOMEM 分配失败。 */
+static int ssf_mems_rx_alloc_frame(struct ssf_mems_frame_slot *slot, size_t len) {
+  slot->data = kzalloc(len, GFP_KERNEL);
   if (!slot->data)
     return -ENOMEM;
-
-  slot->data_len = frame_len;
-  slot->frame_len = frame_len;
+  slot->data_len = len;
+  slot->frame_len = len;
   slot->data_pos = 0;
-
   return 0;
 }
 
-static int
-ssf_mems_rx_alloc_write_fixed_frame(struct ssf_mems_frame_slot *slot) {
-  slot->data = kzalloc(SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN, GFP_KERNEL);
-
-  if (!slot->data)
-    return -ENOMEM;
-
-  slot->data_len = SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN;
-
-  slot->frame_len = SSF_MEMS_MODBUS_WRITE_FIXED_FRAME_LEN;
-
-  slot->data_pos = 0;
-
-  return 0;
-}
-
-static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot,
-                                    u8 function) {
+/* 按表选择响应格式；返回 0 成功，-EOPNOTSUPP 功能码/布局不支持；其他负值来自长度计算、分配或追加字节。 */
+static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot, u8 function) {
   int ret;
+  int len;
 
-  if (function != SSF_MEMS_MODBUS_FUNC_READ &&
-      function != SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE &&
-      function != SSF_MEMS_MODBUS_FUNC_WRITE_MULTI) {
-    return -EINVAL;
-  }
-
+  slot->frame_desc = ssf_mems_modbus_find_rx_frame(function);
+  if (!slot->frame_desc)
+    return -EOPNOTSUPP;
   slot->function = function;
 
-  if (function == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE ||
-      function == SSF_MEMS_MODBUS_FUNC_WRITE_MULTI) {
-    ret = ssf_mems_rx_alloc_write_fixed_frame(slot);
+  if (slot->frame_desc->rx_bytes_per_reg) {
+    if (slot->frame_desc->rx_byte_count_offset != 2)
+      return -EOPNOTSUPP;
+  } else {
+    len = ssf_mems_modbus_rx_frame_len(slot->frame_desc, 0);
+    if (len < 0)
+      return len;
+    ret = ssf_mems_rx_alloc_frame(slot, len);
     if (ret)
       return ret;
-
-    /* 此时 Slave ID 和 Function 已经确定，直接写入 frame buffer。 */
     ret = ssf_mems_rx_append_byte(slot, slot->slave_id);
     if (ret)
       return ret;
-
     ret = ssf_mems_rx_append_byte(slot, slot->function);
     if (ret)
       return ret;
   }
 
-  /* 0x03 此时还不知道 Byte Count，所以暂时不能创建完整 frame buffer。 */
   slot->state = SSF_MEMS_RX_DATA;
-
   return 0;
 }
 
-static int ssf_mems_rx_start_read_frame(struct ssf_mems_frame_slot *slot,
-                                        u8 byte_count) {
+/* 根据字节数准备读取响应；返回 0 成功，-EMSGSIZE 字节数异常；其他负值来自分配或追加字节。 */
+static int ssf_mems_rx_start_read_frame(struct ssf_mems_frame_slot *slot, u8 byte_count) {
+  int len;
   int ret;
 
-  ret = ssf_mems_rx_alloc_read_frame(slot, byte_count);
+  len = ssf_mems_modbus_rx_frame_len(slot->frame_desc, byte_count);
+  if (len < 0)
+    return len;
+  ret = ssf_mems_rx_alloc_frame(slot, len);
   if (ret)
     return ret;
-
   ret = ssf_mems_rx_append_byte(slot, slot->slave_id);
   if (ret)
     return ret;
-
   ret = ssf_mems_rx_append_byte(slot, slot->function);
   if (ret)
     return ret;
-
-  ret = ssf_mems_rx_append_byte(slot, byte_count);
-  if (ret)
-    return ret;
-
-  return 0;
+  return ssf_mems_rx_append_byte(slot, byte_count);
 }
 
-static u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len) {
-  u16 crc = 0xFFFF;
-  while (len--) {
-    int i;
-    crc ^= *buf++;
-    for (i = 0; i < 8; i++) {
-      if (crc & 0x0001)
-        crc = (crc >> 1) ^ 0xA001;
-      else
-        crc >>= 1;
-    }
-  }
-  return crc;
-}
-
+/* 校验并分发完整帧；无返回值，损坏帧释放槽位，未认领帧策略仍保留 TODO。 */
 static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
-                                 struct ssf_mems_frame_slot *slot) {
-  u16 crc_calc; // 自己算的crc
-  u16 crc_recv; // 接收到的crc
-  int ret = 0;
+                                struct ssf_mems_frame_slot *slot) {
+  int ret;
 
-  if (!slot->data)
-    return;
-
-  if (slot->data_pos != slot->frame_len) {
-    dev_err(&data->serdev->dev, "incomplete frame: pos=%zu len=%zu\n",
-            slot->data_pos, slot->frame_len);
-    return;
-  }
-
-  if (slot->data_len < 4) {
-    dev_err(&data->serdev->dev, "invalid frame length: %zu\n", slot->data_len);
-    return;
-  }
-
-  crc_calc = ssf_mems_modbus_crc16(slot->data, slot->data_len - 2);
-
-  /* Modbus RTU CRC 先传输低8位 */
-  crc_recv = slot->data[slot->data_len - 2] |
-             ((u16)slot->data[slot->data_len - 1] << 8);
-
-  if (crc_calc != crc_recv) {
+  if (!slot->data || slot->data_pos != slot->frame_len) {
     ssf_mems_rx_free_slot(slot);
-    dev_err(&data->serdev->dev, "CRC error: calc=0x%04x recv=0x%04x\n",
-            crc_calc, crc_recv);
     return;
   }
-
-  /* 校验通过，将帧发送给协议处理模块 */
+  ret = ssf_mems_modbus_check_crc(slot->data, slot->data_len);
+  if (ret) {
+    dev_err(&data->serdev->dev, "invalid frame CRC/length: %d\n", ret);
+    ssf_mems_rx_free_slot(slot);
+    return;
+  }
   if (ssf_mems_modbus_claim_frame(data, slot)) {
     ssf_mems_rx_free_slot(slot);
     return;
   }
 
-  /* TODO：暂未声明/定义；未认领帧的处理策略确定后再实现。 */
+  /* TODO：按此前要求保留未声明/未定义调用，未认领帧策略确定后再实现。 */
   ret = ssf_mems_protocol_process(data, slot);
-  if (ret < 0) {
-    dev_err(&data->serdev->dev, "failed to ssf_mems_protocol_process: %d\n",
-            ret);
-  }
-
+  if (ret < 0)
+    dev_err(&data->serdev->dev, "failed to ssf_mems_protocol_process: %d\n", ret);
   ssf_mems_rx_free_slot(slot);
 }
 
+/* 推进候选帧状态；无返回值，准备或追加失败时释放槽位。 */
 static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
-                                          struct ssf_mems_frame_slot *slot,
-                                          u8 byte) {
+                                         struct ssf_mems_frame_slot *slot, u8 byte) {
   int ret;
 
   switch (slot->state) {
   case SSF_MEMS_RX_FUNC:
-
     ret = ssf_mems_rx_set_function(slot, byte);
-
+    if (ret)
+      ssf_mems_rx_free_slot(slot);
+    break;
+  case SSF_MEMS_RX_DATA:
+    if (!slot->data)
+      ret = ssf_mems_rx_start_read_frame(slot, byte);
+    else
+      ret = ssf_mems_rx_append_byte(slot, byte);
     if (ret) {
       ssf_mems_rx_free_slot(slot);
-      return;
-    }
-
-    break;
-
-  case SSF_MEMS_RX_DATA:
-
-    /*
-     * 0x03：
-     *
-     * 当前 candidate 还没有 data buffer，
-     * 说明当前 byte 是 Byte Count。
-     */
-    if (slot->function == SSF_MEMS_MODBUS_FUNC_READ && !slot->data) {
-
-      ret = ssf_mems_rx_start_read_frame(slot, byte);
-
-      if (ret) {
-        ssf_mems_rx_free_slot(slot);
-        return;
-      }
-
       break;
     }
-
-    /*
-     * 0x03：
-     * 接收 Data。
-     *
-     * 0x10：
-     * 接收 Starting Address 和
-     * Register Quantity。
-     */
-    ret = ssf_mems_rx_append_byte(slot, byte);
-
-    if (ret) {
-      ssf_mems_rx_free_slot(slot);
-      return;
-    }
-
-    /*
-     * frame_len 已经包含 CRC。
-     *
-     * 剩下两个字节就是 CRC。
-     */
-    if (slot->data_pos == slot->frame_len - SSF_MEMS_MODBUS_CRC_LEN) {
-
+    if (slot->data_pos == slot->frame_len - SSF_MEMS_MODBUS_CRC_LEN)
       slot->state = SSF_MEMS_RX_CRC;
-    }
-
     break;
-
   case SSF_MEMS_RX_CRC:
-
     ret = ssf_mems_rx_append_byte(slot, byte);
-
     if (ret) {
       ssf_mems_rx_free_slot(slot);
-      return;
+      break;
     }
-
     if (slot->data_pos == slot->frame_len) {
-
       slot->state = SSF_MEMS_RX_DONE;
-
       ssf_mems_rx_complete(data, slot);
     }
-
     break;
-
   default:
     ssf_mems_rx_free_slot(slot);
     break;
   }
 }
 
-static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data,
-                                         u8 byte) {
+/* 识别从机地址并创建候选帧；无返回值，非当前支持地址或无槽位时退出，私有 0x15 帧仍待实现。 */
+static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_frame_slot *slot;
 
-  /*
-   * 当前只识别 Modbus Slave ID。
-   *
-   * 0x15 的私有协议以后单独增加。
-   */
-  if (byte != ssf_mems_frames[SSF_MEMS_FRAME_MODBUS].slave_id) {
+  if (byte != SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID)
     return;
-  }
-
   slot = ssf_mems_rx_alloc_slot(data);
-
   if (!slot) {
     dev_warn(&data->serdev->dev, "no free frame slot for new candidate\n");
     return;
   }
-
   ssf_mems_rx_init_candidate(slot, byte);
 }
 
+/* 先让已有候选帧消费字节，再尝试以该字节建立新帧；无返回值。 */
 static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
-  struct ssf_mems_frame_slot *slot;
-  int index;
+  int i;
 
-  /*
-   * 第一阶段：
-   *
-   * 让所有已经存在的 candidate
-   * 消费当前字节。
-   */
-  for (index = 0; index < SSF_MEMS_FRAME_SLOT_NUM; index++) {
-
-    slot = &data->frame[index];
-
-    if (!ssf_mems_rx_slot_is_used(slot))
-      continue;
-
-    ssf_mems_rx_process_candidate(data, slot, byte);
+  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++) {
+    if (ssf_mems_rx_slot_is_used(&data->frame[i]))
+      ssf_mems_rx_process_candidate(data, &data->frame[i], byte);
   }
-
-  /*
-   * 第二阶段：
-   *
-   * 当前字节还可能是一个新的
-   * Slave ID。
-   *
-   * 因此建立新的 candidate。
-   *
-   * 注意：
-   * 必须在已有 candidate 消费完之后
-   * 再创建。
-   */
   ssf_mems_rx_create_candidate(data, byte);
 }
 
-int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf,
-                     size_t count) {
+/* 返回 count 全部入队（count 为 0 返回 0），-EINVAL 空设备/数据，-ENODEV 无驱动数据，-ENOSPC 部分入队或 FIFO 已满。 */
+int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf, size_t count) {
   struct ssf_mems_xyzs_data *data;
   unsigned int ret;
-
-  data = serdev_device_get_drvdata(serdev);
 
   if (!count)
     return 0;
-
+  if (!serdev || !buf)
+    return -EINVAL;
+  data = serdev_device_get_drvdata(serdev);
+  if (!data)
+    return -ENODEV;
   ret = kfifo_in_spinlocked(&data->rx_fifo, buf, count, &data->rx_fifo_lock);
-
   ssf_mems_modbus_queue_parse(serdev);
   if (ret != count) {
-    dev_err(&serdev->dev,
-            "rx fifo overflow: "
-            "received %zu bytes, "
-            "stored %u bytes\n",
-            count, ret);
+    dev_err(&serdev->dev, "rx fifo overflow: received %zu bytes, stored %u bytes\n", count, ret);
     return -ENOSPC;
   }
-
   return ret;
 }
 
+/* 返回 0 FIFO 消费完成，-EINVAL 空设备，-ENODEV 无驱动数据；单帧错误由内部处理或记录日志。 */
 int ssf_mems_modbus_parse_frame(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
-  u8 recv_data;
-  unsigned int ret;
+  u8 byte;
 
+  if (!serdev)
+    return -EINVAL;
   data = serdev_device_get_drvdata(serdev);
-
-  while (1) {
-    ret = kfifo_out_spinlocked(&data->rx_fifo, &recv_data, sizeof(recv_data),
-                               &data->rx_fifo_lock);
-
-    if (ret != sizeof(recv_data))
-      break;
-
-    ssf_mems_rx_process_byte(data, recv_data);
-  }
-
+  if (!data)
+    return -ENODEV;
+  while (kfifo_out_spinlocked(&data->rx_fifo, &byte, sizeof(byte),
+                               &data->rx_fifo_lock) == sizeof(byte))
+    ssf_mems_rx_process_byte(data, byte);
   return 0;
 }

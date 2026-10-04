@@ -4,9 +4,9 @@
 
 struct serdev_device;
 struct ssf_mems_xyzs_data;
-
-#define SSF_MEMS_FEATURE_FIRST_REG 40001U
-#define SSF_MEMS_FEATURE_REG_COUNT 29U
+struct ssf_modbus_frame_desc;
+struct ssf_block_cmd_desc;
+struct ssf_modbus_transfer;
 #define SSF_MEMS_FEATURE_SCALE 100U
 
 /*
@@ -45,14 +45,41 @@ struct ssf_mems_sensor_data {
   u8 startup_flags;
 };
 
-/* 将寄存器 40001～40029 的值转换为传感器特征字段。 */
+/* 返回输入字节序列的 Modbus CRC16。 */
+u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len);
+
+/* 返回请求帧长度；-EINVAL 数量/描述错误，-EOPNOTSUPP 无发送格式，-EMSGSIZE 帧超限。 */
+int ssf_mems_modbus_tx_frame_len(const struct ssf_modbus_frame_desc *frame, u16 reg_count);
+
+/* 返回响应帧长度；-EINVAL 无描述，-EMSGSIZE 普通读取字节数为零、非整寄存器或超限。 */
+int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame, u8 byte_count);
+
+/* 返回 0 请求描述已生成，-EINVAL 参数/范围错误，-ENOENT 地址未入表，-EACCES 权限不足，-EOPNOTSUPP 格式不支持。 */
+int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
+                                const struct ssf_block_cmd_desc *block,
+                                struct ssf_modbus_transfer *transfer);
+
+/* 返回组装帧长度；-EINVAL 参数/布局错误，-ENOSPC 容量不足，其他负值来自帧长度检查。 */
+int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
+                                 u8 slave_id, const u16 *values, size_t values_count,
+                                 u8 *buf, size_t capacity);
+
+/* 返回 0 CRC 正确，-EINVAL 空帧，-EMSGSIZE 帧过短，-EBADMSG CRC 不匹配。 */
+int ssf_mems_modbus_check_crc(const u8 *buf, size_t len);
+
+/* 返回 0 响应成功，-ENOMSG 不匹配，-EREMOTEIO 从机异常，-EFAULT 结果缓冲区异常，-EINVAL 参数错误，-EMSGSIZE 帧长错误，-EBADMSG CRC 错误。 */
+int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
+                                   u8 slave_id, u16 write_value, const u8 *buf,
+                                   size_t len, u16 *values, size_t values_count);
+
+/* 按块表解码完整连续特征块；返回 0 成功，-ENOENT 块命令缺失，-EINVAL 参数/数量错误；删除表项对应字段置零。 */
 int ssf_mems_modbus_decode_features(const u16 *registers, size_t count,
                                     struct ssf_mems_sensor_data *result);
 
-/* 读取全部特征寄存器，并以原子方式替换 data->sensor_data。 */
+/* 按保留表项分段读取特征；返回 0 成功（无特征时缓存全零），-EINVAL 参数/范围错误，-ENODEV 无驱动数据，-ENOENT 块命令缺失，-EOPNOTSUPP 块格式不支持；其他负值来自读请求或解码。 */
 int ssf_mems_modbus_read_features(struct serdev_device *serdev,
                                   unsigned int timeout_ms);
 
-/* 复制最近一次解析的值；若尚未读取过数据，则返回 -ENODATA。 */
+/* 复制特征值缓存；返回 0 成功，-EINVAL 设备/输出指针为空，-ENODEV 未绑定驱动数据，-ENODATA 缓存尚无有效数据。 */
 int ssf_mems_modbus_get_features(struct serdev_device *serdev,
                                  struct ssf_mems_sensor_data *result);
