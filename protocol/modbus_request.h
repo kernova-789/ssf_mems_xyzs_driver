@@ -4,11 +4,10 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-#include "modbus_table.h"
+#include "modbus_types.h"
 
 struct serdev_device;
 struct ssf_mems_xyzs_data;
-struct ssf_mems_frame_slot;
 
 /* 保存当前正在执行的 Modbus 请求状态。 */
 struct ssf_mems_modbus_request_state {
@@ -28,12 +27,15 @@ struct ssf_mems_modbus_request_state {
 #define SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS 1000U
 #define SSF_MEMS_MODBUS_WRITE_TIMEOUT_MS 100U
 
-/* 初始化请求状态和工作队列；返回 0，当前实现没有失败分支。 */
+/* 返回 0 请求描述已生成，-EINVAL 参数/范围错误，-ENOENT 地址未入表，-EACCES 权限不足，-EOPNOTSUPP 格式不支持。 */
+int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
+                                const struct ssf_block_cmd_desc *block,
+                                struct ssf_modbus_transfer *transfer);
+
+/* 初始化请求状态及其锁和等待队列；返回 0 成功，-EINVAL 驱动数据为空；仅用于尚未投入使用的状态。 */
 int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data);
-/* 清理请求状态并停止工作队列；无返回值，等待中的请求以 -ENODEV 结束。 */
+/* 清理请求状态并唤醒等待者；无返回值，等待中的请求以 -ENODEV 结束，空指针直接退出。 */
 void ssf_mems_modbus_request_remove(struct ssf_mems_xyzs_data *data);
-/* 将接收帧解析任务加入工作队列；无返回值，空设备或未绑定驱动数据时直接退出。 */
-void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);
 /* 连续读取 1～125 个普通寄存器，校验失败不发送；返回 0 成功，-EINVAL 参数/数量/地址范围错误，-ENOENT 地址未入表，-EACCES 不可读，-EOPNOTSUPP 特殊响应，-ENODEV 无设备/关闭中，-EBUSY 请求占用，-ENOMEM 分配失败，-EIO 发送不足，-EREMOTEIO 从机异常，-EFAULT 结果缓冲区异常，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；其他负值来自组帧或串口。 */
 int ssf_mems_modbus_read(struct serdev_device *serdev, u16 display_reg,
                          u16 reg_count, u16 *values, size_t values_count,
@@ -55,11 +57,11 @@ int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
                                u16 reg_count, const u16 *values,
                                size_t values_count, unsigned int timeout_ms);
-/* 按地址递增写入 40061～40070，values_count 至少为 10；返回 0 写入成功，-ENOENT 块命令缺失，-EOPNOTSUPP 块命令格式不支持；参数、权限、发送及等待错误同 ssf_mems_modbus_write_regs()。 */
-int ssf_mems_modbus_write_work_parameters(struct serdev_device *serdev,
-                                         const u16 *values,
-                                         size_t values_count,
-                                         unsigned int timeout_ms);
-/* 返回 true 帧已消费（成功、从机异常或 -EFAULT），false 无等待请求、响应不匹配或帧损坏；true 不代表请求成功。 */
+/* 按块描述执行写入，保留功能码/响应格式/方向和固定范围校验；返回 0 成功，-EINVAL 参数错误，-EOPNOTSUPP 不是可写块或格式不支持；其余负值同 ssf_mems_modbus_write_regs()。 */
+int ssf_mems_modbus_write_block(struct serdev_device *serdev,
+                                const struct ssf_block_cmd_desc *block,
+                                const u16 *values, size_t values_count,
+                                unsigned int timeout_ms);
+/* 返回 true 帧已消费（成功、从机异常或 -EFAULT），false 无等待请求、响应不匹配或帧损坏；true 不代表请求成功，不持有 buf。 */
 bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
-                                 struct ssf_mems_frame_slot *slot);
+                                 const u8 *buf, size_t len);

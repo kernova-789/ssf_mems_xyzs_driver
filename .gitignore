@@ -44,3 +44,6 @@ __pycache__/
 # 临时目录
 tmp/
 temp/
+
+# 手册文件
+*.pdf

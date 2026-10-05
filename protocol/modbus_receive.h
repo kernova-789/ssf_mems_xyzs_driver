@@ -1,10 +1,22 @@
 #pragma once
 
 #include <linux/atomic.h>
+#include <linux/kfifo.h>
 #include <linux/serdev.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
+struct ssf_mems_xyzs_data;
 struct ssf_modbus_frame_desc;
+
+/* 帧仅在同步回调期间有效，context 必须存活到接收清理结束，不得保存缓冲区或等待需要同一接收工作项处理的响应；返回 0 已处理，负值处理失败。 */
+typedef int (*ssf_mems_frame_handler_t)(void *context, const u8 *buf, size_t len);
+
+#define SSF_MEMS_RX_FIFO_SIZE 1024U
+#define SSF_MEMS_FRAME_SLOT_NUM 4
+#define SSF_MEMS_FRAME_SLOT_FREE 0
+#define SSF_MEMS_FRAME_SLOT_USED 1
 
 enum ssf_mems_rx_state {
   SSF_MEMS_RX_IDLE,
@@ -37,9 +49,27 @@ struct ssf_mems_frame_slot {
   atomic_t in_use;
 };
 
-/* 返回 count 全部入队（count 为 0 返回 0），-EINVAL 空设备/数据，-ENODEV 无驱动数据，-ENOSPC 部分入队或 FIFO 已满。 */
+/* 接收模块独立拥有字节 FIFO、FIFO 锁、解析工作项和候选帧槽位。 */
+struct ssf_mems_modbus_receive_state {
+  struct kfifo fifo;                     // 尚未解析的接收字节流
+  spinlock_t fifo_lock;                  // 保护 FIFO 读写和关闭状态
+  struct work_struct work;              // 从 FIFO 中分离完整帧的工作项
+  bool shutting_down;                   // 关闭后禁止入队和调度新工作
+  ssf_mems_frame_handler_t handler;      // 同步交出 CRC 校验通过的完整帧
+  void *handler_context;                // 由上层提供的帧处理上下文
+  struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM]; // 候选帧上下文
+};
+
+/* 初始化接收状态并注册完整帧回调；返回 0 成功，-EINVAL 驱动数据/回调为空且不修改状态，其他负值来自 FIFO 分配；仅用于尚未投入使用的状态。 */
+int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
+                               ssf_mems_frame_handler_t handler, void *context);
+
+/* 清理已初始化的接收状态；无返回值，停止入队/工作项并释放 FIFO 和候选帧缓冲区，空指针直接退出。 */
+void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
+
+/* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
+void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);
+
+/* 返回 count 全部入队（count 为 0 返回 0），-EINVAL 空设备/数据，-ENODEV 无驱动数据或接收已关闭，-ENOSPC 部分入队或 FIFO 已满。 */
 int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf,
                      size_t count);
-
-/* 返回 0 FIFO 消费完成，-EINVAL 空设备，-ENODEV 无驱动数据；单帧错误由内部处理或记录日志。 */
-int ssf_mems_modbus_parse_frame(struct serdev_device *serdev);

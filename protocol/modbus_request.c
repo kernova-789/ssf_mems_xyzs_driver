@@ -9,6 +9,68 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+/* 返回 0 请求描述已生成；-EINVAL 参数/范围错误，-ENOENT 地址未入表，-EACCES 权限不足，-EOPNOTSUPP 帧或块命令不支持。 */
+int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
+                                const struct ssf_block_cmd_desc *block,
+                                struct ssf_modbus_transfer *transfer) {
+  const struct ssf_modbus_frame_desc *frame;
+  const struct ssf_reg_desc *first;
+  unsigned int access;
+  u16 i;
+
+  if (!transfer || !reg_count ||
+      (u32)display_reg + reg_count > 0x10000U)
+    return -EINVAL;
+
+  frame = ssf_mems_modbus_find_frame(function);
+  if (!frame)
+    return -EOPNOTSUPP;
+  if (reg_count > frame->max_reg_count)
+    return -EINVAL;
+
+  access = frame->tx_format == SSF_TX_READ_REGS ? SSF_REG_READ : SSF_REG_WRITE;
+  if (block) {
+    if (block->function != function || block->rx_format != frame->rx_format ||
+        block->direction != (access == SSF_REG_READ ? SSF_CMD_READ : SSF_CMD_WRITE))
+      return -EOPNOTSUPP;
+    if (!block->reg_count || (u32)block->start_display_reg + block->reg_count > 0x10000U ||
+        display_reg < block->start_display_reg ||
+        (u32)display_reg + reg_count > (u32)block->start_display_reg + block->reg_count)
+      return -EINVAL;
+    if (!block->sparse_read &&
+        (display_reg != block->start_display_reg || reg_count != block->reg_count))
+      return -EINVAL;
+  }
+
+  first = ssf_mems_modbus_find_reg(display_reg);
+  if (!first)
+    return -ENOENT;
+  if ((u32)first->protocol_addr + reg_count > 0x10000U)
+    return -EINVAL;
+
+  for (i = 0; i < reg_count; i++) {
+    const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(display_reg + i);
+
+    if (!reg)
+      return -ENOENT;
+    if (!(reg->access & access))
+      return -EACCES;
+    if (reg->protocol_addr != (u32)first->protocol_addr + i)
+      return -EINVAL;
+    if (access == SSF_REG_READ && reg->read_format != frame->rx_format)
+      return -EOPNOTSUPP;
+    if (frame->tx_format == SSF_TX_WRITE_SINGLE && !reg->write_single)
+      return -EOPNOTSUPP;
+  }
+
+  transfer->frame = frame;
+  transfer->block = block;
+  transfer->display_reg = display_reg;
+  transfer->protocol_addr = first->protocol_addr;
+  transfer->reg_count = reg_count;
+  return 0;
+}
+
 /* 按请求描述组帧并发送；返回 0 完整发送，-ENOMEM 分配失败，-EIO 写入不足；其他负值来自组帧或串口。 */
 static int ssf_mems_modbus_send_request(struct serdev_device *serdev,
                                        const struct ssf_modbus_transfer *transfer,
@@ -47,29 +109,13 @@ out:
   return ret;
 }
 
-/* 工作队列调用帧解析函数；无返回值。 */
-static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
-  struct ssf_mems_xyzs_data *data =
-      container_of(work, struct ssf_mems_xyzs_data, rx_work);
-
-  ssf_mems_modbus_parse_frame(data->serdev);
-}
-
-/* 将解析任务加入工作队列；无返回值，空设备或未绑定驱动数据时直接退出。 */
-void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
-
-  if (!serdev)
-    return;
-  data = serdev_device_get_drvdata(serdev);
-  if (data)
-    queue_work(system_wq, &data->rx_work);
-}
-
-/* 初始化请求状态和工作队列；返回 0，当前没有失败分支。 */
+/* 初始化请求状态及其锁和等待队列；返回 0 成功，-EINVAL 驱动数据为空。 */
 int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
-  struct ssf_mems_modbus_request_state *req = &data->modbus_req;
+  struct ssf_mems_modbus_request_state *req;
 
+  if (!data)
+    return -EINVAL;
+  req = &data->modbus_req;
   mutex_init(&req->lock);
   init_waitqueue_head(&req->waitq);
   req->busy = false;
@@ -81,15 +127,16 @@ int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
   req->values_count = 0;
   req->write_value = 0;
   req->status = 0;
-  INIT_WORK(&data->rx_work, ssf_mems_modbus_rx_workfn);
   return 0;
 }
 
-/* 停止工作队列并唤醒等待者；无返回值，当前请求状态设为 -ENODEV。 */
+/* 关闭请求模块并唤醒等待者；无返回值，当前请求状态设为 -ENODEV，空指针直接退出。 */
 void ssf_mems_modbus_request_remove(struct ssf_mems_xyzs_data *data) {
-  struct ssf_mems_modbus_request_state *req = &data->modbus_req;
+  struct ssf_mems_modbus_request_state *req;
 
-  cancel_work_sync(&data->rx_work);
+  if (!data)
+    return;
+  req = &data->modbus_req;
   mutex_lock(&req->lock);
   req->shutting_down = true;
   req->pending = false;
@@ -247,36 +294,32 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
   return ssf_mems_modbus_execute(serdev, &transfer, values, values_count, NULL, 0, timeout_ms);
 }
 
-/* 固定写入块表规定的十个工作参数；返回 0 成功，-ENOENT 块/地址缺失，-EINVAL 参数错误，-EOPNOTSUPP 块格式不支持；其他负值同多寄存器写入。 */
-int ssf_mems_modbus_write_work_parameters(struct serdev_device *serdev,
-                                         const u16 *values, size_t values_count,
-                                         unsigned int timeout_ms) {
-  const struct ssf_block_cmd_desc *block;
+/* 按表中块描述执行写入；返回 0 成功，-EINVAL 参数/范围错误，-EOPNOTSUPP 不是可写块或格式不支持；其他负值同连续写入。 */
+int ssf_mems_modbus_write_block(struct serdev_device *serdev,
+                                const struct ssf_block_cmd_desc *block,
+                                const u16 *values, size_t values_count,
+                                unsigned int timeout_ms) {
   struct ssf_modbus_transfer transfer;
   int ret;
 
-  if (!serdev || !values)
+  if (!serdev || !block || !values || values_count < block->reg_count)
     return -EINVAL;
-  block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_WRITE_WORK_PARAMETERS);
-  if (!block)
-    return -ENOENT;
-  if (values_count < block->reg_count)
-    return -EINVAL;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_MULTI,
-                                     block->start_display_reg, block->reg_count,
-                                     block, &transfer);
+  if (block->direction != SSF_CMD_WRITE)
+    return -EOPNOTSUPP;
+  ret = ssf_mems_modbus_plan_request(block->function, block->start_display_reg,
+                                     block->reg_count, block, &transfer);
   if (ret)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, values, values_count, NULL, 0, timeout_ms);
 }
 
-/* 返回 true 帧已消费（成功、从机异常或 -EFAULT），false 无等待请求、响应不匹配或帧损坏；true 不代表请求成功。 */
+/* 返回 true 帧已消费（成功、从机异常或 -EFAULT），false 无等待请求、响应不匹配或帧损坏；true 不代表请求成功，不依赖接收槽位。 */
 bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
-                                 struct ssf_mems_frame_slot *slot) {
+                                 const u8 *buf, size_t len) {
   struct ssf_mems_modbus_request_state *req;
   int ret;
 
-  if (!data || !slot || !slot->data)
+  if (!data || !buf)
     return false;
   req = &data->modbus_req;
   mutex_lock(&req->lock);
@@ -286,7 +329,7 @@ bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
   }
 
   ret = ssf_mems_modbus_parse_response(&req->transfer, req->slave_id,
-                                       req->write_value, slot->data, slot->data_len,
+                                       req->write_value, buf, len,
                                        req->values, req->values_count);
   if (ret == -ENOMSG || ret == -EMSGSIZE || ret == -EBADMSG || ret == -EINVAL) {
     mutex_unlock(&req->lock);
