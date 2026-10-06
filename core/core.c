@@ -42,6 +42,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
     return -ENOMEM;
 
   data->serdev = serdev;
+  data->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
 
   ret = ssf_mems_protocol_init(data);
   if (ret)

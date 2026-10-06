@@ -121,7 +121,7 @@ int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
   req->busy = false;
   req->pending = false;
   req->shutting_down = false;
-  req->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
+  req->slave_id = 0;
   memset(&req->transfer, 0, sizeof(req->transfer));
   req->values = NULL;
   req->values_count = 0;
@@ -209,7 +209,7 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
   }
 
   req->transfer = *transfer;
-  req->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
+  req->slave_id = data->slave_id;
   req->values = rx_values;
   req->values_count = rx_values_count;
   req->write_value = transfer->frame->tx_format == SSF_TX_WRITE_SINGLE ? tx_values[0] : 0;

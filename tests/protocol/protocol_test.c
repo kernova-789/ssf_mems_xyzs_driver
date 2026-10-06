@@ -163,6 +163,7 @@ static void reset_sensor(void) {
   memset(&serial, 0, sizeof(serial));
   serial.drvdata = &sensor;
   sensor.serdev = &serial;
+  sensor.slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
   test_allocation_failure = false;
   CHECK(ssf_mems_protocol_init(&sensor) == 0);
   CHECK(ssf_mems_modbus_request_init(&sensor) == 0);
@@ -203,7 +204,8 @@ static void test_initialization_and_cleanup(void) {
   CHECK(local.protocol.valid && local.protocol.features.x.acc_rms_x100 == 0x4321);
   CHECK(!local.modbus_req.busy && !local.modbus_req.pending && !local.modbus_req.shutting_down);
   CHECK(!local.modbus_req.values && !local.modbus_req.transfer.frame);
-  CHECK(local.modbus_req.status == 0 && local.modbus_req.lock.unused == 0);
+  CHECK(!local.modbus_req.slave_id && local.modbus_req.status == 0 &&
+        local.modbus_req.lock.unused == 0);
 
   test_allocation_failure = true;
   CHECK(ssf_mems_modbus_receive_init(&local, ssf_mems_protocol_handle_frame, &local) == -ENOMEM);
@@ -502,7 +504,9 @@ static void test_requests(void) {
   const struct ssf_block_cmd_desc *block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_WRITE_WORK_PARAMETERS);
 
   reset_sensor();
+  sensor.slave_id = 0x11;
   CHECK(ssf_mems_modbus_read(&serial, 40101, 3, values, 126, 0) == 0);
+  CHECK(last_tx[0] == sensor.slave_id && sensor.modbus_req.slave_id == sensor.slave_id);
   CHECK(values[0] == wire_value(100) && values[2] == wire_value(102));
   CHECK(!saw_block_description);
   CHECK(ssf_mems_modbus_write_regs(&serial, 40101, 3, values, 126, 0) == 0);

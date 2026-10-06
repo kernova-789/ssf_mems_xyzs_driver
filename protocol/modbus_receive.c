@@ -271,11 +271,11 @@ static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
   }
 }
 
-/* 识别从机地址并创建候选帧；无返回值，非当前支持地址或无槽位时退出，私有 0x15 帧仍待实现。 */
+/* 识别设备实例的从机地址并创建候选帧；无返回值，地址不匹配或无槽位时退出，私有 0x15 帧仍待实现。 */
 static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_frame_slot *slot;
 
-  if (byte != SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID)
+  if (byte != data->slave_id)
     return;
   slot = ssf_mems_rx_alloc_slot(data);
   if (!slot) {

@@ -6,6 +6,7 @@
 #include "modbus_types.h"
 #include "sensor_data.h"
 
+/* 帧格式表：描述 0x03/0x06/0x10 和异常响应的长度、字段位置及解析方式。 */
 static const struct ssf_modbus_frame_desc ssf_frame_table[] = {
     {
         .function = SSF_MEMS_MODBUS_FUNC_READ,
@@ -51,6 +52,10 @@ static const struct ssf_modbus_frame_desc ssf_frame_table[] = {
     },
 };
 
+/*
+ * 寄存器表：把手册显示地址映射到线上地址，并记录权限、类型和解码位置。
+ * 表项删除后不重编其他地址，稀疏特征由块读取逻辑自动跳过。
+ */
 static const struct ssf_reg_desc ssf_reg_table[] = {
     /* 40001～40029：只读特征值。 */
     {
@@ -590,6 +595,7 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
     },
 };
 
+/* 块命令表：把“读全部特征”、“写工作参数”这类高层操作组织成固定地址范围。 */
 static const struct ssf_block_cmd_desc ssf_block_cmd_table[] = {
     {
         .id = SSF_BLOCK_READ_ALL_FEATURES,
@@ -614,11 +620,12 @@ static const struct ssf_block_cmd_desc ssf_block_cmd_table[] = {
     },
 };
 
+/* 三个宏分别给出帧表、寄存器表和块命令表的表项数。 */
 #define SSF_FRAME_TABLE_SIZE ARRAY_SIZE(ssf_frame_table)
 #define SSF_REG_TABLE_SIZE ARRAY_SIZE(ssf_reg_table)
 #define SSF_BLOCK_CMD_TABLE_SIZE ARRAY_SIZE(ssf_block_cmd_table)
 
-/* 返回普通请求的帧描述；功能码未入表返回 NULL。 */
+/* 按功能码查普通请求帧；跳过只用于接收的异常描述，未找到返回 NULL。 */
 static inline const struct ssf_modbus_frame_desc *
 ssf_mems_modbus_find_frame(u8 function) {
   size_t i;
@@ -631,7 +638,7 @@ ssf_mems_modbus_find_frame(u8 function) {
   return NULL;
 }
 
-/* 返回正常/异常响应帧描述；对应请求功能码不支持时返回 NULL。 */
+/* 按响应功能码查帧；如 0x83 先还原为 0x03，再返回通用异常描述。 */
 static inline const struct ssf_modbus_frame_desc *
 ssf_mems_modbus_find_rx_frame(u8 function) {
   const struct ssf_modbus_frame_desc *normal;
@@ -648,7 +655,7 @@ ssf_mems_modbus_find_rx_frame(u8 function) {
   return NULL;
 }
 
-/* 返回匹配的寄存器表项指针；地址未入表返回 NULL。 */
+/* 按手册显示地址（如 40001）查寄存器表；未入表返回 NULL。 */
 static inline const struct ssf_reg_desc *
 ssf_mems_modbus_find_reg(u16 display_reg) {
   size_t i;
@@ -660,7 +667,7 @@ ssf_mems_modbus_find_reg(u16 display_reg) {
   return NULL;
 }
 
-/* 返回匹配的块命令表项指针；命令 ID 未入表返回 NULL。 */
+/* 按逻辑命令 ID 查块命令表；未入表返回 NULL。 */
 static inline const struct ssf_block_cmd_desc *
 ssf_mems_modbus_find_block_cmd(enum ssf_block_cmd_id id) {
   size_t i;

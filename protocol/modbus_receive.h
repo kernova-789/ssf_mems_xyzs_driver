@@ -51,12 +51,12 @@ struct ssf_mems_frame_slot {
 
 /* 接收模块独立拥有字节 FIFO、FIFO 锁、解析工作项和候选帧槽位。 */
 struct ssf_mems_modbus_receive_state {
-  struct kfifo fifo;                     // 尚未解析的接收字节流
-  spinlock_t fifo_lock;                  // 保护 FIFO 读写和关闭状态
-  struct work_struct work;              // 从 FIFO 中分离完整帧的工作项
-  bool shutting_down;                   // 关闭后禁止入队和调度新工作
-  ssf_mems_frame_handler_t handler;      // 同步交出 CRC 校验通过的完整帧
-  void *handler_context;                // 由上层提供的帧处理上下文
+  struct kfifo fifo;                 // 尚未解析的接收字节流
+  spinlock_t fifo_lock;              // 保护 FIFO 读写和关闭状态
+  struct work_struct work;           // 从 FIFO 中分离完整帧的工作项
+  bool shutting_down;                // 关闭后禁止入队和调度新工作
+  ssf_mems_frame_handler_t handler;  // 收到数据并组帧成功后自动调用这个函数指针并交出帧
+  void *handler_context;             // 函数指针的上下文
   struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM]; // 候选帧上下文
 };
 
