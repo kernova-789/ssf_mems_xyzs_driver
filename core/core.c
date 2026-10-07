@@ -7,6 +7,7 @@
 #include <linux/types.h>
 
 #include "core.h"
+#include "ssf_mems_iio.h"
 #include "protocol.h"
 #include "modbus_receive.h"
 #include "modbus_request.h"
@@ -35,6 +36,8 @@ static const struct serdev_device_ops ssf_mems_xyzs_ops = {
 
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
+  unsigned int actual_baudrate;
+  int baudrate;
   int ret;
 
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
@@ -65,8 +68,23 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   if (ret)
     goto err_receive;
 
-  serdev_device_set_baudrate(serdev, 9600);
+  baudrate = ssf_mems_baudrate_to_value(data->protocol.baudrate);
+  if (baudrate < 0) {
+    ret = baudrate;
+    goto err_receive;
+  }
+  actual_baudrate = serdev_device_set_baudrate(serdev, baudrate);
+  if (!actual_baudrate) {
+    ret = -EIO;
+    goto err_receive;
+  }
   serdev_device_set_flow_control(serdev, false);
+
+  ret = ssf_mems_iio_register(data);
+  if (ret) {
+    dev_err(&serdev->dev, "failed to register IIO device: %d\n", ret);
+    goto err_receive;
+  }
 
   return 0;
 
@@ -80,6 +98,7 @@ err_request:
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   data = serdev_device_get_drvdata(serdev);
+  ssf_mems_iio_unregister(data);
   ssf_mems_modbus_receive_remove(data);
   ssf_mems_modbus_request_remove(data);
 }

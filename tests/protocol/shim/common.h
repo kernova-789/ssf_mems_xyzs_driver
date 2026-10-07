@@ -26,7 +26,12 @@ typedef struct { int unused; } wait_queue_head_t;
 typedef int spinlock_t;
 typedef struct { int counter; } atomic_t;
 struct work_struct { void (*fn)(struct work_struct *); };
-struct serdev_device { void *drvdata; int dev; };
+struct serdev_device {
+  void *drvdata;
+  int dev;
+  unsigned int baudrate;
+  unsigned int baudrate_set_count;
+};
 struct kfifo { u8 *data; size_t capacity, head, tail, count; };
 struct ssf_mems_xyzs_data;
 
@@ -49,6 +54,7 @@ extern unsigned int test_queue_count, test_cancel_count, test_wake_count;
 #define wait_event_interruptible_timeout(q, condition, timeout) ((void)(q), (void)(timeout), (condition) ? 1L : test_wait_result)
 #define dev_err(dev, ...) ((void)(dev))
 #define dev_warn(dev, ...) ((void)(dev))
+#define dev_dbg(dev, ...) ((void)(dev))
 
 static inline int atomic_read(const atomic_t *p) { return p->counter; }
 static inline void atomic_set(atomic_t *p, int value) { p->counter = value; }
@@ -79,6 +85,9 @@ static inline void kfifo_free(struct kfifo *fifo) {
   kfree(fifo->data);
   memset(fifo, 0, sizeof(*fifo));
 }
+static inline void kfifo_reset(struct kfifo *fifo) {
+  fifo->head = fifo->tail = fifo->count = 0;
+}
 static inline unsigned int kfifo_in(struct kfifo *fifo, const u8 *buf, size_t size) {
   size_t i;
   for (i = 0; i < size && fifo->count < fifo->capacity; i++) {
@@ -95,6 +104,13 @@ static inline unsigned int kfifo_out_spinlocked(struct kfifo *fifo, u8 *buf, siz
     fifo->count--;
   }
   return i;
+}
+
+static inline unsigned int
+serdev_device_set_baudrate(struct serdev_device *s, unsigned int baudrate) {
+  s->baudrate = baudrate;
+  s->baudrate_set_count++;
+  return baudrate;
 }
 
 ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf, size_t size, unsigned long timeout);

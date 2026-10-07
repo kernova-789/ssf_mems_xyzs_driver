@@ -68,6 +68,7 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   rx = &data->modbus_rx;
   spin_lock_init(&rx->fifo_lock);
   rx->shutting_down = true;
+  rx->flushing = false;
   rx->handler = NULL;
   rx->handler_context = NULL;
   INIT_WORK(&rx->work, ssf_mems_modbus_rx_workfn);
@@ -86,6 +87,37 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   return 0;
 }
 
+/* 清空旧串口参数下的字节和候选帧；清理期间到达的字节也会被丢弃。 */
+void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
+  struct ssf_mems_modbus_receive_state *rx;
+  unsigned long flags;
+  int i;
+
+  if (!data)
+    return;
+  rx = &data->modbus_rx;
+
+  spin_lock_irqsave(&rx->fifo_lock, flags);
+  if (rx->shutting_down) {
+    spin_unlock_irqrestore(&rx->fifo_lock, flags);
+    return;
+  }
+  WRITE_ONCE(rx->flushing, true);
+  spin_unlock_irqrestore(&rx->fifo_lock, flags);
+
+  cancel_work_sync(&rx->work);
+
+  spin_lock_irqsave(&rx->fifo_lock, flags);
+  kfifo_reset(&rx->fifo);
+  spin_unlock_irqrestore(&rx->fifo_lock, flags);
+  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++)
+    ssf_mems_rx_free_slot(&rx->frame[i]);
+
+  spin_lock_irqsave(&rx->fifo_lock, flags);
+  WRITE_ONCE(rx->flushing, false);
+  spin_unlock_irqrestore(&rx->fifo_lock, flags);
+}
+
 /* 清理接收模块；无返回值，先禁止新入队和新工作，再停止工作并释放 FIFO/候选帧，空指针直接退出。 */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
@@ -97,6 +129,7 @@ void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   rx = &data->modbus_rx;
   spin_lock_irqsave(&rx->fifo_lock, flags);
   WRITE_ONCE(rx->shutting_down, true);
+  WRITE_ONCE(rx->flushing, false);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
   cancel_work_sync(&rx->work);
   rx->handler = NULL;
@@ -119,7 +152,7 @@ void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
     return;
   rx = &data->modbus_rx;
   spin_lock_irqsave(&rx->fifo_lock, flags);
-  if (!rx->shutting_down)
+  if (!rx->shutting_down && !rx->flushing)
     queue_work(system_wq, &rx->work);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
 }
@@ -316,6 +349,10 @@ int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf, siz
     spin_unlock_irqrestore(&rx->fifo_lock, flags);
     return -ENODEV;
   }
+  if (rx->flushing) {
+    spin_unlock_irqrestore(&rx->fifo_lock, flags);
+    return count;
+  }
   ret = kfifo_in(&rx->fifo, buf, count);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
   ssf_mems_modbus_queue_parse(serdev);
@@ -340,7 +377,7 @@ static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev) {
   rx = &data->modbus_rx;
   if (READ_ONCE(rx->shutting_down))
     return -ENODEV;
-  while (!READ_ONCE(rx->shutting_down) &&
+  while (!READ_ONCE(rx->shutting_down) && !READ_ONCE(rx->flushing) &&
          kfifo_out_spinlocked(&rx->fifo, &byte, sizeof(byte), &rx->fifo_lock) == sizeof(byte))
     ssf_mems_rx_process_byte(data, byte);
   return 0;

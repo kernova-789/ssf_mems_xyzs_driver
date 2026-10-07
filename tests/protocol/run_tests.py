@@ -29,7 +29,7 @@ ALLOWED_DEPENDENCIES = {
     "modbus": set(),
     "modbus_request": {"modbus"},
     "modbus_receive": {"modbus"},
-    "protocol": {"modbus", "modbus_request"},
+    "protocol": {"modbus", "modbus_request", "modbus_receive"},
 }
 
 def check_module_dependencies(objects):

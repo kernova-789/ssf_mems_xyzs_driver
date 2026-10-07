@@ -22,6 +22,9 @@ static unsigned int fail_on_send;
 static bool check_busy_handoff;
 static bool saw_block_description;
 static bool sensor_initialized;
+static bool enforce_sensor_baudrate;
+static bool invalid_baudrate_value;
+static enum ssf_mems_baudrate sensor_baudrate;
 
 enum { REPLY_NORMAL, REPLY_EXCEPTION, REPLY_BAD_CRC, REPLY_WRONG_COUNT, REPLY_NONE, REPLY_MISMATCH_THEN_NORMAL };
 #define CHECK(expr) do { checks++; if (!(expr)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); abort(); } } while (0)
@@ -99,6 +102,9 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     return -EIO;
   if (forced_send_result != -1)
     return forced_send_result;
+  if (enforce_sensor_baudrate &&
+      s->baudrate != (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate))
+    return size;
   if (response_mode == REPLY_NONE)
     return size;
 
@@ -121,7 +127,13 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     response[2] = count * 2;
     len = 5 + count * 2;
     for (i = 0; i < count; i++) {
-      u16 value = wire_value(address + i);
+      u16 value;
+
+      if (enforce_sensor_baudrate && address + i == 101)
+        value = invalid_baudrate_value ? SSF_MEMS_BAUDRATE_MAX
+                                       : sensor_baudrate;
+      else
+        value = wire_value(address + i);
       response[3 + i * 2] = value >> 8;
       response[4 + i * 2] = value;
     }
@@ -146,6 +158,10 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     CHECK(data->modbus_req.busy);
     CHECK(ssf_mems_modbus_read_reg(s, 40121, &ignored, 0) == -EBUSY);
   }
+  if (enforce_sensor_baudrate && response_mode != REPLY_EXCEPTION &&
+      buf[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE && address == 101 &&
+      count < SSF_MEMS_BAUDRATE_MAX)
+    sensor_baudrate = count;
   return size;
 }
 
@@ -164,6 +180,7 @@ static void reset_sensor(void) {
   serial.drvdata = &sensor;
   sensor.serdev = &serial;
   sensor.slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
+  serial.baudrate = 9600;
   test_allocation_failure = false;
   CHECK(ssf_mems_protocol_init(&sensor) == 0);
   CHECK(ssf_mems_modbus_request_init(&sensor) == 0);
@@ -174,6 +191,8 @@ static void reset_sensor(void) {
   response_mode = REPLY_NORMAL;
   fail_on_send = 0;
   check_busy_handoff = saw_block_description = test_allocation_failure = false;
+  enforce_sensor_baudrate = invalid_baudrate_value = false;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
   test_wait_result = 0;
   test_queue_count = test_cancel_count = test_wake_count = 0;
 }
@@ -196,7 +215,9 @@ static void test_initialization_and_cleanup(void) {
   /* Initialization must not depend on core having zero-filled each module's state. */
   memset(&local, 0xa5, sizeof(local));
   CHECK(ssf_mems_protocol_init(&local) == 0);
-  CHECK(!local.protocol.valid && local.protocol.lock.unused == 0);
+  CHECK(!local.protocol.valid && local.protocol.lock.unused == 0 &&
+        local.protocol.io_lock.unused == 0);
+  CHECK(local.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT);
   CHECK(memcmp(&local.protocol.features, &zero, sizeof(zero)) == 0);
   local.protocol.features.x.acc_rms_x100 = 0x4321;
   local.protocol.valid = true;
@@ -574,6 +595,83 @@ static void test_requests(void) {
   CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
 }
 
+static void test_baudrate_management(void) {
+  enum ssf_mems_baudrate baudrate = SSF_MEMS_BAUDRATE_MAX;
+  unsigned int sends_before;
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
+  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_DEFAULT) == 9600);
+  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_38400) == 38400);
+  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_MAX) == -EINVAL);
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == 0);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_9600);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_9600);
+  CHECK(serial.baudrate == 9600 && serial.baudrate_set_count == 0);
+  CHECK(sends == 1);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_38400;
+  baudrate = SSF_MEMS_BAUDRATE_MAX;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == 0);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_38400);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_38400);
+  CHECK(serial.baudrate == 38400 && serial.baudrate_set_count == 4);
+  /* 当前 9600 只试一次：DEFAULT 和显式 9600 不重复扫描。 */
+  CHECK(sends == 5);
+
+  sends_before = sends;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200,
+                                       0) == 0);
+  CHECK(sends == sends_before + 1);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(serial.baudrate == 115200);
+  CHECK(last_tx[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE && last_tx[3] == 101);
+  CHECK(last_tx[4] == 0 && last_tx[5] == SSF_MEMS_BAUDRATE_115200);
+
+  sends_before = sends;
+  NO_SEND(ssf_mems_protocol_set_baudrate(
+              &serial, (enum ssf_mems_baudrate)SSF_MEMS_BAUDRATE_MAX, 0),
+          -EINVAL);
+  CHECK(sends == sends_before);
+
+  response_mode = REPLY_EXCEPTION;
+  sends_before = sends;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_57600, 0) ==
+        -EREMOTEIO);
+  CHECK(sends == sends_before + 1);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(serial.baudrate == 115200);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
+  invalid_baudrate_value = true;
+  baudrate = SSF_MEMS_BAUDRATE_MAX;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == -EPROTO);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_MAX);
+  CHECK(sends == 1 && serial.baudrate == 9600 &&
+        serial.baudrate_set_count == 0);
+
+  reset_sensor();
+  response_mode = REPLY_NONE;
+  baudrate = SSF_MEMS_BAUDRATE_MAX;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == -ETIMEDOUT);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_MAX);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT);
+  CHECK(serial.baudrate == 9600);
+  /* 17 个不同实际速率：入口试 1 次，其余 16 个各试 1 次。 */
+  CHECK(sends == 17);
+  CHECK(serial.baudrate_set_count == 17); /* 16 次扫描 + 1 次恢复 */
+
+  NO_SEND(ssf_mems_protocol_get_baudrate(NULL, &baudrate, 0), -EINVAL);
+  NO_SEND(ssf_mems_protocol_get_baudrate(&serial, NULL, 0), -EINVAL);
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   test_initialization_and_cleanup();
@@ -582,6 +680,7 @@ int main(int argc, char **argv) {
   test_codecs();
   test_response_matching();
   test_requests();
+  test_baudrate_management();
   test_sparse_features();
   cleanup_sensor();
   printf("PASS %-23s %u checks\n", argv[1], checks);

@@ -55,6 +55,7 @@ struct ssf_mems_modbus_receive_state {
   spinlock_t fifo_lock;              // 保护 FIFO 读写和关闭状态
   struct work_struct work;           // 从 FIFO 中分离完整帧的工作项
   bool shutting_down;                // 关闭后禁止入队和调度新工作
+  bool flushing;                     // 串口参数切换时丢弃旧速率的字节
   ssf_mems_frame_handler_t handler;  // 收到数据并组帧成功后自动调用这个函数指针并交出帧
   void *handler_context;             // 函数指针的上下文
   struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM]; // 候选帧上下文
@@ -66,6 +67,9 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
 
 /* 清理已初始化的接收状态；无返回值，停止入队/工作项并释放 FIFO 和候选帧缓冲区，空指针直接退出。 */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
+
+/* 清空 FIFO 和未完成的候选帧；串口波特率切换前调用，空指针或已关闭时直接返回。 */
+void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
 
 /* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);

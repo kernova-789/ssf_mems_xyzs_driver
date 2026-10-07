@@ -32,8 +32,12 @@
 - `ssf_mems_protocol_read_features()`
 - `ssf_mems_protocol_get_features()`
 - `ssf_mems_protocol_write_work_parameters()`
+- `ssf_mems_protocol_get_baudrate()`
+- `ssf_mems_protocol_set_baudrate()`
 
 通用 `ssf_mems_modbus_read()`、`ssf_mems_modbus_write_reg()` 和 `ssf_mems_modbus_write_regs()` 仍在请求模块。新增 `ssf_mems_modbus_write_block()` 保留块表的功能码、方向、响应格式和固定范围校验，供业务层执行块命令。请求认领接口现在接收 `data, buf, len`，不再依赖接收模块的 `frame_slot`。`ssf_mems_modbus_plan_request()` 也归请求模块，不再属于帧编解码模块。
+
+波特率读取先以当前 serdev 速率读 40102。只有请求超时（即没有可匹配的正确应答帧）才启动枚举扫描；每个不同实际速率只发送一次读请求，避免 `DEFAULT` 和显式 `9600` 重复。切换前清理旧速率留下的 FIFO/候选帧；成功时保留匹配速率，全部超时或扫描中发生其他错误时恢复入口速率。读特征、写工作参数和波特率操作由业务层 `io_lock` 串行化。
 
 ## 不再读取某个特征
 

@@ -1,1 +1,0 @@
-cmd_/home/u-yoimiya/文档/mems_driver/Module.symvers := sed 's/\.ko$$/\.o/' /home/u-yoimiya/文档/mems_driver/modules.order | scripts/mod/modpost     -o /home/u-yoimiya/文档/mems_driver/Module.symvers -e -i Module.symvers   -T -

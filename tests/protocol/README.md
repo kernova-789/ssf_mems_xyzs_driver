@@ -12,4 +12,9 @@ Temporary table configurations delete the first, middle, last, several, or all f
 
 The harness exercises independent module initialization, FIFO allocation failure, partial-frame cleanup, rejection of new work after receive shutdown, complete-frame callback/context delivery, request encoding, fragmented byte reception through the receive work item, CRC, response matching, exception responses, permission checks, sparse feature reads, unchanged physical addresses, field masks, zeroing removed fields, failed-read cache preservation, and request ownership until the waiter consumes its result. Unclaimed frames must be discarded without changing request state, output buffers, feature caches, or wake counts; completed frame buffers and slots must be released, and a subsequent matching response must still complete the request.
 
+Baud-rate cases cover a direct 40102 read, switching through unique enum rates,
+skipping the duplicate default/9600 value, keeping the discovered rate,
+restoring the entry rate after a full timeout, invalid register values, write
+echo errors, and synchronizing the simulated sensor and serdev after a write.
+
 This does not test actual hardware, workqueue scheduling, or concurrent kernel execution. The tests link the production frame-dispatch implementation directly; no fallback-handler stub is used.
