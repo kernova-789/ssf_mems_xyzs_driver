@@ -25,7 +25,8 @@ struct ssf_mems_modbus_request_state {
 };
 
 #define SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS 1000U
-#define SSF_MEMS_MODBUS_WRITE_TIMEOUT_MS 100U
+#define SSF_MEMS_MODBUS_MIN_WRITE_TIMEOUT_MS 100U
+#define SSF_MEMS_MODBUS_WRITE_MARGIN_MS 100U
 
 /* 返回 0 请求描述已生成，-EINVAL 参数/范围错误，-ENOENT 地址未入表，-EACCES 权限不足，-EOPNOTSUPP 格式不支持。 */
 int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
@@ -46,12 +47,25 @@ int ssf_mems_modbus_read_block_range(struct serdev_device *serdev,
                                      u16 display_reg, u16 reg_count,
                                      u16 *values, size_t values_count,
                                      unsigned int timeout_ms);
+/* 与 read_block_range 相同，但调用者必须已持有 protocol.bus_lock。 */
+int ssf_mems_modbus_read_block_range_locked(
+    struct serdev_device *serdev, const struct ssf_block_cmd_desc *block,
+    u16 display_reg, u16 reg_count, u16 *values, size_t values_count,
+    unsigned int timeout_ms);
 /* 读取单个寄存器；返回 0 成功，失败原因和负值同 ssf_mems_modbus_read()。 */
 int ssf_mems_modbus_read_reg(struct serdev_device *serdev, u16 display_reg,
                              u16 *value, unsigned int timeout_ms);
+/* 与 read_reg 相同，但调用者必须已持有 protocol.bus_lock。 */
+int ssf_mems_modbus_read_reg_locked(struct serdev_device *serdev,
+                                    u16 display_reg, u16 *value,
+                                    unsigned int timeout_ms);
 /* 以 0x06 写入 write_single 为真的可写寄存器；返回 0 成功，-EOPNOTSUPP 表项不支持 0x06；其余校验、发送、响应和等待错误同 ssf_mems_modbus_write_regs()。 */
 int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
                               u16 value, unsigned int timeout_ms);
+/* 与 write_reg 相同，但调用者必须已持有 protocol.bus_lock。 */
+int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
+                                     u16 display_reg, u16 value,
+                                     unsigned int timeout_ms);
 /* 连续写入 1～123 个寄存器，校验失败不发送；返回 0 成功，-EINVAL 参数/数量/地址范围错误，-ENOENT 地址未入表，-EACCES 不可写，-EOPNOTSUPP 帧格式不支持，-ENODEV 无设备/关闭中，-EBUSY 请求占用，-ENOMEM 分配失败，-EIO 发送不足，-EREMOTEIO 从机异常，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；其他负值来自组帧或串口。 */
 /* 此接口检查寄存器权限，设备是否接受任意子范围的 0x10 仍需实测。 */
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
@@ -62,6 +76,10 @@ int ssf_mems_modbus_write_block(struct serdev_device *serdev,
                                 const struct ssf_block_cmd_desc *block,
                                 const u16 *values, size_t values_count,
                                 unsigned int timeout_ms);
+/* 与 write_block 相同，但调用者必须已持有 protocol.bus_lock。 */
+int ssf_mems_modbus_write_block_locked(
+    struct serdev_device *serdev, const struct ssf_block_cmd_desc *block,
+    const u16 *values, size_t values_count, unsigned int timeout_ms);
 /* 返回 true 帧已消费（成功、从机异常或 -EFAULT），false 无等待请求、响应不匹配或帧损坏；true 不代表请求成功，不持有 buf。 */
 bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
                                  const u8 *buf, size_t len);

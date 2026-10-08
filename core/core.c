@@ -11,20 +11,26 @@
 #include "protocol.h"
 #include "modbus_receive.h"
 #include "modbus_request.h"
+#include "ssf_mems_acquisition.h"
 
-static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
-                                         const unsigned char *buf,
-                                         size_t count) {
-  int ret;
+/* receive_buf 在旧内核返回 int，新内核返回 size_t；从 API 本身推导类型。 */
+typedef typeof(((struct serdev_device_ops *)0)->receive_buf(
+    (struct serdev_device *)0, (const unsigned char *)0, (size_t)0))
+    ssf_mems_receive_ret_t;
+
+static ssf_mems_receive_ret_t
+ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
+                              const unsigned char *buf, size_t count) {
+  ssize_t ret;
 
   ret = ssf_mems_rx_push(serdev, buf, count);
   if (ret < 0) {
-    dev_err(&serdev->dev, "failed to push received data into rx fifo: %d\n",
+    dev_err(&serdev->dev, "failed to push received data into rx fifo: %zd\n",
             ret);
-    return count;
+    return 0;
   }
 
-  return ret;
+  return (ssf_mems_receive_ret_t)ret;
 }
 
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {}
@@ -36,8 +42,6 @@ static const struct serdev_device_ops ssf_mems_xyzs_ops = {
 
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
-  unsigned int actual_baudrate;
-  int baudrate;
   int ret;
 
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
@@ -45,11 +49,13 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
     return -ENOMEM;
 
   data->serdev = serdev;
-  data->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
 
   ret = ssf_mems_protocol_init(data);
-  if (ret)
+  if (ret) {
+    dev_err(&serdev->dev, "failed to initialize protocol configuration: %d\n",
+            ret);
     return ret;
+  }
 
   ret = ssf_mems_modbus_request_init(data);
   if (ret)
@@ -68,17 +74,15 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   if (ret)
     goto err_receive;
 
-  baudrate = ssf_mems_baudrate_to_value(data->protocol.baudrate);
-  if (baudrate < 0) {
-    ret = baudrate;
+  ret = ssf_mems_protocol_configure_serial(data);
+  if (ret) {
+    dev_err(&serdev->dev, "failed to configure serial parameters: %d\n", ret);
     goto err_receive;
   }
-  actual_baudrate = serdev_device_set_baudrate(serdev, baudrate);
-  if (!actual_baudrate) {
-    ret = -EIO;
+
+  ret = ssf_mems_acquisition_init(data);
+  if (ret)
     goto err_receive;
-  }
-  serdev_device_set_flow_control(serdev, false);
 
   ret = ssf_mems_iio_register(data);
   if (ret) {
@@ -86,8 +90,18 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
     goto err_receive;
   }
 
+  ret = ssf_mems_acquisition_start(data);
+  if (ret) {
+    dev_err(&serdev->dev, "failed to start sensor acquisition: %d\n", ret);
+    goto err_iio;
+  }
+
   return 0;
 
+err_iio:
+  ssf_mems_modbus_request_remove(data);
+  ssf_mems_acquisition_stop(data);
+  ssf_mems_iio_unregister(data);
 err_receive:
   ssf_mems_modbus_receive_remove(data);
 err_request:
@@ -98,9 +112,11 @@ err_request:
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   data = serdev_device_get_drvdata(serdev);
+  /* 先拒绝新请求并唤醒在途请求，再等待生产者退出，最后释放其使用的资源。 */
+  ssf_mems_modbus_request_remove(data);
+  ssf_mems_acquisition_stop(data);
   ssf_mems_iio_unregister(data);
   ssf_mems_modbus_receive_remove(data);
-  ssf_mems_modbus_request_remove(data);
 }
 
 static const struct of_device_id ssf_mems_of_matchs[] = {

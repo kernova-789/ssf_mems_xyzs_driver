@@ -5,7 +5,7 @@
 - `modbus.c/.h`：无设备状态的帧长度、CRC、请求编码和响应解码，不调用请求、接收或传感器业务。
 - `modbus_request.c/.h`：查表校验、发送、请求状态、等待/超时，以及按实际请求上下文认领响应。
 - `modbus_receive.c/.h`：FIFO、候选帧和拼帧工作项；只通过初始化注册的回调交出完整帧，不直接调用请求或业务模块。
-- `protocol.c/.h`：完整帧分发、特征分段读取、寄存器字段映射、特征缓存和固定工作参数操作。
+- `protocol.c/.h`：完整帧分发、特征分段读取、寄存器字段映射、特征缓存、固定工作参数操作及波特率/校验位配置。
 - `modbus_types.h`：公共线格式常量、帧/寄存器/块描述和实际请求描述类型，不包含上层模块接口。
 - `sensor_data.h`：可复制的传感器结果类型，不含锁或运行状态。
 - `modbus_table.h`：实际帧格式、寄存器属性和块命令的唯一配置入口，三个数据表仍保留在这里。
@@ -16,13 +16,22 @@
 
 ## 模块状态和初始化
 
-`ssf_mems_xyzs_data` 仅组合设备指针和三个模块状态，`probe()` 依次调用各模块初始化函数：
+`ssf_mems_xyzs_data` 组合设备指针和各模块状态，`probe()` 依次调用各模块初始化函数：
 
-- `protocol` / `ssf_mems_protocol_init()`：特征缓存、互斥量及缓存有效标记。
+- `protocol` / `ssf_mems_protocol_init()`：特征缓存、缓存互斥量、公共串口总线锁、缓存有效标记及启动参数。
 - `modbus_req` / `ssf_mems_modbus_request_init()`：当前请求、请求互斥量和等待队列。
 - `modbus_rx` / `ssf_mems_modbus_receive_init(data, handler, context)`：接收 FIFO、自旋锁、解析工作项、候选帧及完整帧回调。
+- `acquisition` / `ssf_mems_acquisition_init(data)`：独立采集模块的线程、等待队列、调速统计和连接状态，在 IIO 注册前初始化、注册成功后启动。
 
-锁都封装在所属模块的状态内。初始化只用于尚未投入使用的状态，不能直接对运行中的状态重复初始化。接收清理负责停止工作项并释放 FIFO/候选帧，请求清理负责唤醒等待者；探测失败或卸载时按逆序清理。传感器业务状态和纯帧编解码没有额外动态资源需要释放。
+`ssf_mems_protocol_init()` 先设置手册默认值（从站地址 1、9600、无校验），再调用私有的 `ssf_mems_protocol_parse_properties()` 解析从站地址、`current-speed` 和 `sange-cbm,parity`。属性缺失或读取失败时，逐项记录 info 日志并保留该项默认值，继续解析其他属性；能读到但取值非法时仍报错。调用 init 前必须设置有效的 `data->serdev`，不需要打开串口。
+
+serdev 打开后，`ssf_mems_protocol_configure_serial()` 统一配置主机波特率、校验位和关闭流控，记录控制器实际速率；`core.c` 只调用接口，不直接管理串口参数。probe 自身不发起 Modbus 请求；IIO 注册后启动采集线程，等待 1 秒后异步匹配/修改波特率并轮询特征。不写入 40103，也不执行保存/重启。
+
+`protocol.parity` 在初始化时设为无校验，启动属性解析时按 `none/odd/even` 更新，主机 UART 配置时读取并转换为 Linux 的 `serdev_parity`；请求层读取它，按每字节 10/11 位计算发送超时。目前没有运行时读取、扫描或修改传感器校验位的专用接口，启动配置必须与传感器已生效的参数一致。
+
+`ssf_mems_protocol_set_baudrate()` 当前按约定假设传感器以旧速率回复写入应答，随后自动切换；主机收到应答后切换 UART。不接入保存/重启命令，固件的实际生效时序留待硬件验证。采集模块切换后会执行完整特征读取验证通信。
+
+锁都封装在所属模块的状态内。初始化只用于尚未投入使用的状态，不能直接对运行中的状态重复初始化。接收清理负责停止工作项并释放 FIFO/候选帧，请求清理负责唤醒等待者。卸载时先关闭请求模块，以中断采集线程的在途请求，再停止线程，注销 IIO，最后释放接收状态。传感器业务状态和纯帧编解码没有额外动态资源需要释放。
 
 ## 接口迁移
 
@@ -34,10 +43,11 @@
 - `ssf_mems_protocol_write_work_parameters()`
 - `ssf_mems_protocol_get_baudrate()`
 - `ssf_mems_protocol_set_baudrate()`
+- `ssf_mems_protocol_invalidate_features()`：断线、切换或读失败导致缓存过期时使快照失效，下一次完整成功读取恢复有效。
 
 通用 `ssf_mems_modbus_read()`、`ssf_mems_modbus_write_reg()` 和 `ssf_mems_modbus_write_regs()` 仍在请求模块。新增 `ssf_mems_modbus_write_block()` 保留块表的功能码、方向、响应格式和固定范围校验，供业务层执行块命令。请求认领接口现在接收 `data, buf, len`，不再依赖接收模块的 `frame_slot`。`ssf_mems_modbus_plan_request()` 也归请求模块，不再属于帧编解码模块。
 
-波特率读取先以当前 serdev 速率读 40102。只有请求超时（即没有可匹配的正确应答帧）才启动枚举扫描；每个不同实际速率只发送一次读请求，避免 `DEFAULT` 和显式 `9600` 重复。切换前清理旧速率留下的 FIFO/候选帧；成功时保留匹配速率，全部超时或扫描中发生其他错误时恢复入口速率。读特征、写工作参数和波特率操作由业务层 `io_lock` 串行化。
+波特率读取先以当前 serdev 速率读 40102。只有请求超时（即没有可匹配的正确应答帧）才启动枚举扫描；每个不同实际速率只发送一次读请求，避免 `DEFAULT` 和显式 `9600` 重复。切换前清理旧速率留下的 FIFO/候选帧；成功时保留匹配速率，全部超时或扫描中发生其他错误时恢复入口速率。通用 Modbus 请求、读特征、写工作参数和串口参数操作共用 `bus_lock`；多步操作在整个流程内持锁。发送超时根据当前波特率、校验位和帧长计算，不再固定为 100 ms。
 
 ## 不再读取某个特征
 

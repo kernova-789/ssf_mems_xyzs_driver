@@ -329,8 +329,9 @@ static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   ssf_mems_rx_create_candidate(data, byte);
 }
 
-/* 返回 count 全部入队（count 为 0 返回 0），-EINVAL 空设备/数据，-ENODEV 无驱动数据或接收已关闭，-ENOSPC 部分入队或 FIFO 已满。 */
-int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf, size_t count) {
+/* 返回实际入队字节数；FIFO 不足时保留已入队部分，由 serdev 根据返回值重送剩余数据。 */
+ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
+                         const unsigned char *buf, size_t count) {
   struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
@@ -351,16 +352,15 @@ int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf, siz
   }
   if (rx->flushing) {
     spin_unlock_irqrestore(&rx->fifo_lock, flags);
-    return count;
+    return (ssize_t)count;
   }
   ret = kfifo_in(&rx->fifo, buf, count);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
   ssf_mems_modbus_queue_parse(serdev);
   if (ret != count) {
     dev_err(&serdev->dev, "rx fifo overflow: received %zu bytes, stored %u bytes\n", count, ret);
-    return -ENOSPC;
   }
-  return ret;
+  return (ssize_t)ret;
 }
 
 /* 仅由接收工作项串行消费 FIFO 并拼帧；返回 0 已消费，-EINVAL 空设备，-ENODEV 无驱动数据或接收已关闭，单帧错误内部处理或记录日志。 */

@@ -18,3 +18,12 @@ restoring the entry rate after a full timeout, invalid register values, write
 echo errors, and synchronizing the simulated sensor and serdev after a write.
 
 This does not test actual hardware, workqueue scheduling, or concurrent kernel execution. The tests link the production frame-dispatch implementation directly; no fallback-handler stub is used.
+
+Startup serial configuration tests cover default properties, none/odd/even
+mapping (the Linux enum order differs from the sensor enum), slave-ID bounds,
+unsupported baud rates, logged defaults for missing/unreadable properties,
+independent per-property fallback, invalid parity enums, controller
+baud/parity failures, and recording a rounded actual host rate. Startup parsing
+and configuration must not send any sensor commands. The existing baud-write
+simulation still models immediate application; it is a regression fixture, not
+validation of the firmware's save/reset workflow.

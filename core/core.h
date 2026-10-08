@@ -6,6 +6,7 @@
 #include "protocol.h"
 #include "modbus_receive.h"
 #include "modbus_request.h"
+#include "ssf_mems_acquisition.h"
 
 struct iio_dev;
 
@@ -16,5 +17,6 @@ struct ssf_mems_xyzs_data {
   struct ssf_mems_modbus_receive_state modbus_rx;
   struct ssf_mems_modbus_request_state modbus_req;
   struct ssf_mems_protocol_state protocol;
+  struct ssf_mems_acquisition_state acquisition;
   struct iio_dev *indio_dev; // IIO 对象的创建/释放由 iio 目录代码负责
 };

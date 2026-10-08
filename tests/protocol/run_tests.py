@@ -24,6 +24,7 @@ MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol")
 HEADERS = (
     "sensor_data.h", "modbus_types.h", "modbus.h", "modbus_table.h",
     "modbus_request.h", "modbus_receive.h", "protocol.h", "core.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h",
 )
 ALLOWED_DEPENDENCIES = {
     "modbus": set(),
@@ -73,6 +74,7 @@ def main():
             project = scratch / name
             shutil.copytree(ROOT / "protocol", project / "protocol")
             shutil.copytree(ROOT / "core", project / "core")
+            shutil.copytree(ROOT / "acquisition", project / "acquisition")
             table_path = project / "protocol" / "modbus_table.h"
             # Mechanical test-fixture transformation; production table is never edited.
             table_path.write_text(configure_table(table_path.read_text(), deleted, name == "reverse_table"))
@@ -82,6 +84,7 @@ def main():
                 "-Wno-sign-compare", "-fsanitize=address,undefined", "-g",
                 "-I" + str(TEST_DIR / "shim"), "-I" + str(project / "protocol"),
                 "-I" + str(project / "core"),
+                "-I" + str(project / "acquisition"),
             ]
             # Headers must provide their own prerequisites, not rely on include order.
             for header in HEADERS:

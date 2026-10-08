@@ -74,6 +74,7 @@ void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
 /* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);
 
-/* 返回 count 全部入队（count 为 0 返回 0），-EINVAL 空设备/数据，-ENODEV 无驱动数据或接收已关闭，-ENOSPC 部分入队或 FIFO 已满。 */
-int ssf_mems_rx_push(struct serdev_device *serdev, const unsigned char *buf,
-                     size_t count);
+/* 返回实际入队字节数（0 表示未接收），-EINVAL 空设备/数据，-ENODEV
+ * 无驱动数据或接收已关闭；FIFO 空间不足时返回部分入队数，便于 serdev 重送剩余数据。 */
+ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
+                         const unsigned char *buf, size_t count);

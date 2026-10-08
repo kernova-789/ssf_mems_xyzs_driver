@@ -27,22 +27,37 @@ enum ssf_mems_baudrate {
   SSF_MEMS_BAUDRATE_MAX,
 };
 
+/* 与固件 40103 寄存器的数值一致。 */
+enum ssf_mems_parity {
+  SSF_MEMS_PARITY_NONE = 0,
+  SSF_MEMS_PARITY_ODD = 1,
+  SSF_MEMS_PARITY_EVEN = 2,
+  SSF_MEMS_PARITY_MAX,
+};
+
 struct serdev_device;
 struct ssf_mems_xyzs_data;
 
-/* 传感器协议业务状态；lock 保护缓存，io_lock 保护多步请求/串口配置。 */
+/* 传感器协议业务状态；lock 保护缓存，bus_lock 串行化所有请求和串口配置。 */
 struct ssf_mems_protocol_state {
   struct mutex lock;                    // 保护 features 和 valid
   struct ssf_mems_sensor_data features; // 最近一次完整读取的特征缓存
   bool valid;                           // 是否已有有效缓存
 
-  struct mutex io_lock;                 // 保护一整套串口操作流程
+  struct mutex bus_lock;                // 公共 Modbus/serdev 总线锁
   enum ssf_mems_baudrate baudrate;      // 与传感器同步的波特率寄存器值
+  enum ssf_mems_parity parity;          // 当前主机校验位，数值与 40103 一致
+  unsigned int host_baudrate;           // 控制器实际波特率，用于计算发送超时
 };
 
-/* 初始化传感器协议缓存及其锁；返回 0 成功，-EINVAL
- * 驱动数据为空；仅用于尚未投入使用的状态。 */
+/* 初始化协议状态和手册默认参数，再用启动属性覆盖；缺失或读取失败时
+ * 记录日志并保留默认值，可读取但取值非法时返回 -EINVAL。
+ * data/serdev 必须有效；仅用于尚未投入使用的状态，不发送 Modbus。 */
 int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data);
+
+/* 在 serdev 打开后、业务接口注册前配置主机 UART；使用 bus_lock。
+ * 更新 host_baudrate 为控制器实际速率，不写 40102/40103 或保存寄存器。 */
+int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data);
 
 /* 同步处理完整帧；返回 0 已认领或已丢弃，-EINVAL
  * 空上下文/帧；未认领帧不额外解析、不缓存，buf 仅回调期间有效。 */
@@ -57,6 +72,9 @@ int ssf_mems_protocol_get_features(struct serdev_device *serdev,
 int ssf_mems_protocol_store_features(
     struct ssf_mems_xyzs_data *data,
     const struct ssf_mems_sensor_data *features);
+
+/* 断线或数据过期时使缓存失效；保留内容，下次完整读取后再次有效。 */
+void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data);
 
 /* 按块表解码完整连续特征块；返回 0 成功，-ENOENT 块命令缺失，-EINVAL
  * 参数/数量错误；删除表项对应字段置零。 */
@@ -78,6 +96,10 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
 
 /* 将寄存器枚举转换为串口波特率；返回正整数，非法枚举返回 -EINVAL。 */
 int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate);
+
+/* 将数值波特率转换为寄存器枚举；9600 选显式枚举，返回 0 或 -EINVAL。 */
+int ssf_mems_baudrate_from_value(unsigned int value,
+                                 enum ssf_mems_baudrate *baudrate);
 
 /* 写 40102，收到正确应答后同步修改 serdev 波特率；返回 0 或负 errno。 */
 int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,

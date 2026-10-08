@@ -6,6 +6,7 @@
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/property.h>
 #include <linux/string.h>
 
 static const int ssf_mems_baudrates_table[SSF_MEMS_BAUDRATE_MAX] = {
@@ -20,18 +21,76 @@ static const int ssf_mems_baudrates_table[SSF_MEMS_BAUDRATE_MAX] = {
     [SSF_MEMS_BAUDRATE_921600] = 921600, [SSF_MEMS_BAUDRATE_1000000] = 1000000,
 };
 
-/* 初始化传感器协议缓存及其锁；返回 0 成功，-EINVAL 驱动数据为空。 */
+static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data);
+
+/* 初始化协议状态并应用启动属性；不配置 UART、不发送 Modbus。 */
 int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_protocol_state *state;
 
-  if (!data)
+  if (!data || !data->serdev)
     return -EINVAL;
+  data->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
   state = &data->protocol;
   state->baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
+  state->host_baudrate =
+      ssf_mems_baudrates_table[SSF_MEMS_BAUDRATE_DEFAULT];
+  state->parity = SSF_MEMS_PARITY_NONE;
   mutex_init(&state->lock);
-  mutex_init(&state->io_lock);
+  mutex_init(&state->bus_lock);
   memset(&state->features, 0, sizeof(state->features));
   state->valid = false;
+  return ssf_mems_protocol_parse_properties(data);
+}
+
+/* 属性缺失或无法读取时保留手册默认值；可读取但非法的取值仍报错。 */
+static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
+  struct device *dev = &data->serdev->dev;
+  const char *parity;
+  u32 value;
+  int ret;
+
+  ret = device_property_read_u32(dev, "sange-cbm,slave-id", &value);
+  if (ret) {
+    dev_info(dev, "could not read sange-cbm,slave-id (%d), using default slave ID 1\n",
+             ret);
+  } else {
+    if (value < 1 || value > 247) {
+      dev_err(dev, "invalid sange-cbm,slave-id: %u (expected 1..247)\n", value);
+      return -EINVAL;
+    }
+    data->slave_id = value;
+  }
+
+  ret = device_property_read_u32(dev, "current-speed", &value);
+  if (ret) {
+    dev_info(dev, "could not read current-speed (%d), using default baud rate 9600\n",
+             ret);
+  } else {
+    ret = ssf_mems_baudrate_from_value(value, &data->protocol.baudrate);
+    if (ret) {
+      dev_err(dev, "unsupported current-speed: %u\n", value);
+      return ret;
+    }
+    data->protocol.host_baudrate = value;
+  }
+
+  ret = device_property_read_string(dev, "sange-cbm,parity", &parity);
+  if (ret) {
+    dev_info(dev, "could not read sange-cbm,parity (%d), using default parity none\n",
+             ret);
+    return 0;
+  }
+  if (!strcmp(parity, "none"))
+    data->protocol.parity = SSF_MEMS_PARITY_NONE;
+  else if (!strcmp(parity, "odd"))
+    data->protocol.parity = SSF_MEMS_PARITY_ODD;
+  else if (!strcmp(parity, "even"))
+    data->protocol.parity = SSF_MEMS_PARITY_EVEN;
+  else {
+    dev_err(dev, "invalid sange-cbm,parity: %s (expected none/odd/even)\n", parity);
+    return -EINVAL;
+  }
+
   return 0;
 }
 
@@ -137,6 +196,14 @@ ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
   return 0;
 }
 
+void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data) {
+  if (!data)
+    return;
+  mutex_lock(&data->protocol.lock);
+  data->protocol.valid = false;
+  mutex_unlock(&data->protocol.lock);
+}
+
 /* 按保留表项分段读取并缓存特征；返回 0 成功（无特征时缓存全零），-EINVAL
  * 参数/块范围错误，-ENODEV 无驱动数据，-ENOENT 块命令缺失，-EOPNOTSUPP
  * 块格式不支持；其他负值来自读请求或字段解码。 */
@@ -157,7 +224,7 @@ int ssf_mems_protocol_read_features(struct serdev_device *serdev,
   if (!data)
     return -ENODEV;
   state = &data->protocol;
-  mutex_lock(&state->io_lock);
+  mutex_lock(&state->bus_lock);
 
   block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_READ_ALL_FEATURES);
   if (!block) {
@@ -197,9 +264,9 @@ int ssf_mems_protocol_read_features(struct serdev_device *serdev,
       count++;
     }
 
-    ret = ssf_mems_modbus_read_block_range(serdev, block, first->display_reg,
-                                           count, registers,
-                                           ARRAY_SIZE(registers), timeout_ms);
+    ret = ssf_mems_modbus_read_block_range_locked(
+        serdev, block, first->display_reg, count, registers,
+        ARRAY_SIZE(registers), timeout_ms);
     if (ret)
       goto out_unlock;
     ret = ssf_mems_protocol_decode_feature_range(first->display_reg, registers,
@@ -212,7 +279,7 @@ int ssf_mems_protocol_read_features(struct serdev_device *serdev,
   ret = ssf_mems_protocol_store_features(data, &features);
 
 out_unlock:
-  mutex_unlock(&state->io_lock);
+  mutex_unlock(&state->bus_lock);
   return ret;
 }
 
@@ -259,10 +326,10 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
   if (!block)
     return -ENOENT;
 
-  mutex_lock(&data->protocol.io_lock);
-  ret = ssf_mems_modbus_write_block(serdev, block, values, values_count,
-                                    timeout_ms);
-  mutex_unlock(&data->protocol.io_lock);
+  mutex_lock(&data->protocol.bus_lock);
+  ret = ssf_mems_modbus_write_block_locked(serdev, block, values,
+                                           values_count, timeout_ms);
+  mutex_unlock(&data->protocol.bus_lock);
   return ret;
 }
 
@@ -272,6 +339,22 @@ int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate) {
     return -EINVAL;
 
   return ssf_mems_baudrates_table[baudrate];
+}
+
+/* 将数值波特率转换为固件枚举；9600 优先返回显式枚举 3。 */
+int ssf_mems_baudrate_from_value(unsigned int value,
+                                 enum ssf_mems_baudrate *baudrate) {
+  unsigned int i;
+
+  if (!baudrate)
+    return -EINVAL;
+  for (i = SSF_MEMS_BAUDRATE_2400; i < SSF_MEMS_BAUDRATE_MAX; i++) {
+    if (ssf_mems_baudrates_table[i] == value) {
+      *baudrate = i;
+      return 0;
+    }
+  }
+  return -EINVAL;
 }
 
 /* 设置主机串口波特率；返回 0，控制器不支持设置时返回 -EIO。 */
@@ -292,7 +375,50 @@ ssf_mems_protocol_set_host_baudrate(struct ssf_mems_xyzs_data *data,
     dev_dbg(&data->serdev->dev,
             "requested baudrate %d, controller selected %u\n", requested,
             actual);
+  data->protocol.host_baudrate = actual;
   return 0;
+}
+
+/* 将固件枚举转换成 Linux serdev 的主机校验位；非法枚举不配置 UART。 */
+static int ssf_mems_protocol_set_host_parity(struct ssf_mems_xyzs_data *data,
+                                           enum ssf_mems_parity parity) {
+  enum serdev_parity host_parity;
+
+  switch (parity) {
+  case SSF_MEMS_PARITY_NONE:
+    host_parity = SERDEV_PARITY_NONE;
+    break;
+  case SSF_MEMS_PARITY_ODD:
+    host_parity = SERDEV_PARITY_ODD;
+    break;
+  case SSF_MEMS_PARITY_EVEN:
+    host_parity = SERDEV_PARITY_EVEN;
+    break;
+  default:
+    return -EINVAL;
+  }
+
+  return serdev_device_set_parity(data->serdev, host_parity);
+}
+
+/* 仅配置启动时的主机 UART，不修改传感器的暂存或持久化参数。 */
+int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data) {
+  int ret;
+
+  if (!data || !data->serdev ||
+      (unsigned int)data->protocol.parity >= SSF_MEMS_PARITY_MAX)
+    return -EINVAL;
+
+  mutex_lock(&data->protocol.bus_lock);
+  ret = ssf_mems_protocol_set_host_baudrate(data, data->protocol.baudrate);
+  if (ret)
+    goto out_unlock;
+  serdev_device_set_flow_control(data->serdev, false);
+  ret = ssf_mems_protocol_set_host_parity(data, data->protocol.parity);
+
+out_unlock:
+  mutex_unlock(&data->protocol.bus_lock);
+  return ret;
 }
 
 /* 只尝试一次读取 40102，并校验寄存器值是受支持的枚举。 */
@@ -302,7 +428,7 @@ static int ssf_mems_protocol_read_baudrate_once(
   u16 value;
   int ret;
 
-  ret = ssf_mems_modbus_read_reg(serdev, 40102, &value, timeout_ms);
+  ret = ssf_mems_modbus_read_reg_locked(serdev, 40102, &value, timeout_ms);
   if (ret)
     return ret;
   if (value >= SSF_MEMS_BAUDRATE_MAX)
@@ -342,8 +468,9 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
   if (!data)
     return -ENODEV;
 
-  mutex_lock(&data->protocol.io_lock);
-  ret = ssf_mems_modbus_write_reg(serdev, 40102, baudrate, timeout_ms);
+  mutex_lock(&data->protocol.bus_lock);
+  ret = ssf_mems_modbus_write_reg_locked(serdev, 40102, baudrate,
+                                         timeout_ms);
   if (ret)
     goto out_unlock;
 
@@ -353,7 +480,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
     data->protocol.baudrate = baudrate;
 
 out_unlock:
-  mutex_unlock(&data->protocol.io_lock);
+  mutex_unlock(&data->protocol.bus_lock);
   return ret;
 }
 
@@ -376,7 +503,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
     return -ENODEV;
   state = &data->protocol;
 
-  mutex_lock(&state->io_lock);
+  mutex_lock(&state->bus_lock);
   initial = state->baudrate;
   if ((unsigned int)initial >= SSF_MEMS_BAUDRATE_MAX) {
     ret = -EINVAL;
@@ -428,6 +555,6 @@ restore_initial:
     ret = restore_ret;
 
 out_unlock:
-  mutex_unlock(&state->io_lock);
+  mutex_unlock(&state->bus_lock);
   return ret;
 }

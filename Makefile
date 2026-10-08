@@ -7,10 +7,13 @@ ssf_mems-y += protocol/modbus_receive.o
 ssf_mems-y += protocol/modbus_request.o
 ssf_mems-y += protocol/protocol.o
 ssf_mems-y += iio/ssf_mems_iio.o
+ssf_mems-y += acquisition/ssf_mems_acquisition.o
+ssf_mems-y += acquisition/acquisition_policy.o
 
 ccflags-y += -I$(src)/core
 ccflags-y += -I$(src)/iio
 ccflags-y += -I$(src)/protocol
+ccflags-y += -I$(src)/acquisition
 
 KDIR ?= /home/u-yoimiya/rk3588/kernel
 ARCH ?= arm64

@@ -82,9 +82,9 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
   struct ssf_mems_xyzs_data *data = s->drvdata;
   size_t len, offset;
   u16 address, count, i;
-  (void)timeout;
 
   CHECK(size <= sizeof(last_tx));
+  s->write_timeout = timeout;
   memcpy(last_tx, buf, size);
   last_tx_len = size;
   sends++;
@@ -201,6 +201,7 @@ static void test_initialization_and_cleanup(void) {
   struct ssf_mems_xyzs_data local;
   struct ssf_mems_sensor_data zero = {0};
   const u8 partial_frame[] = {1, 3, 2, 0x12};
+  u8 fifo_data[SSF_MEMS_RX_FIFO_SIZE] = {0};
   u16 output;
   size_t i;
   unsigned int queued;
@@ -214,10 +215,13 @@ static void test_initialization_and_cleanup(void) {
 
   /* Initialization must not depend on core having zero-filled each module's state. */
   memset(&local, 0xa5, sizeof(local));
+  local.serdev = &serial;
   CHECK(ssf_mems_protocol_init(&local) == 0);
   CHECK(!local.protocol.valid && local.protocol.lock.unused == 0 &&
-        local.protocol.io_lock.unused == 0);
+        local.protocol.bus_lock.unused == 0);
   CHECK(local.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT);
+  CHECK(local.protocol.host_baudrate == 9600 &&
+        local.protocol.parity == SSF_MEMS_PARITY_NONE);
   CHECK(memcmp(&local.protocol.features, &zero, sizeof(zero)) == 0);
   local.protocol.features.x.acc_rms_x100 = 0x4321;
   local.protocol.valid = true;
@@ -246,6 +250,13 @@ static void test_initialization_and_cleanup(void) {
   }
   ssf_mems_modbus_receive_remove(&local);
   ssf_mems_modbus_request_remove(&local);
+
+  reset_sensor();
+  CHECK(ssf_mems_rx_push(&serial, fifo_data,
+                         SSF_MEMS_RX_FIFO_SIZE - 4) ==
+        SSF_MEMS_RX_FIFO_SIZE - 4);
+  CHECK(ssf_mems_rx_push(&serial, fifo_data, 8) == 4);
+  CHECK(sensor.modbus_rx.fifo.count == SSF_MEMS_RX_FIFO_SIZE);
 
   reset_sensor();
   CHECK(ssf_mems_rx_push(&serial, partial_frame, sizeof(partial_frame)) == sizeof(partial_frame));
@@ -375,8 +386,8 @@ static const struct expected_field feature_fields[] = {
   FIELD(13, x.acc_rms_x100), FIELD(14, y.acc_rms_x100), FIELD(15, z.acc_rms_x100),
   FIELD(16, x.kurtosis_x100), FIELD(17, y.kurtosis_x100), FIELD(18, z.kurtosis_x100),
   FIELD(19, x.velocity_rms_x100), FIELD(20, y.velocity_rms_x100), FIELD(21, z.velocity_rms_x100),
-  FIELD(22, sound.rms_x100), FIELD(23, sound.peak_x100), FIELD(24, sound.peak_to_peak_x100),
-  FIELD(25, zero_crossing_rate_x100), FIELD(26, spectral_centroid_x100),
+  FIELD(22, sound.rms_db_x100), FIELD(23, sound.peak_db_x100), FIELD(24, sound.peak_to_peak_db_x100),
+  FIELD(25, zero_crossing_rate_percent), FIELD(26, spectral_centroid_hz_x10),
   FIELD(27, spectral_flux_x100),
   {40029, offsetof(struct ssf_mems_sensor_data, startup_flags), sizeof(u8), 7},
 };
@@ -439,6 +450,16 @@ static void test_sparse_features(void) {
     CHECK(memcmp(&sensor.protocol.features, &actual, sizeof(actual)) == 0);
     CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
   }
+
+  ssf_mems_protocol_invalidate_features(&sensor);
+  CHECK(!sensor.protocol.valid);
+  CHECK(memcmp(&sensor.protocol.features, &actual, sizeof(actual)) == 0);
+  CHECK(ssf_mems_protocol_get_features(&serial, &decoded) == -ENODATA);
+  fail_on_send = 0;
+  read_runs = 0;
+  CHECK(ssf_mems_protocol_read_features(&serial, 0) == 0);
+  CHECK(ssf_mems_protocol_get_features(&serial, &decoded) == 0);
+  CHECK(memcmp(&decoded, &expected, sizeof(expected)) == 0);
 }
 
 static void test_codecs(void) {
@@ -540,9 +561,14 @@ static void test_requests(void) {
   else
     NO_SEND(ssf_mems_modbus_write_reg(&serial, 40050, 1, 0), -ENOENT);
   if (work) {
+    sensor.protocol.host_baudrate = 2400;
+    sensor.protocol.parity = SSF_MEMS_PARITY_NONE;
     CHECK(ssf_mems_protocol_write_work_parameters(&serial, values, 126, 0) == 0);
     CHECK(last_tx_len == 29 && last_tx[3] == 0x3c && last_tx[5] == 10 && last_tx[6] == 20);
+    CHECK(serial.write_timeout == 221 && serial.wait_timeout == 221);
+    sensor.protocol.parity = SSF_MEMS_PARITY_ODD;
     CHECK(ssf_mems_modbus_write_block(&serial, block, values, 126, 0) == 0);
+    CHECK(serial.write_timeout == 233 && serial.wait_timeout == 233);
     NO_SEND(ssf_mems_modbus_plan_request(0x10, 40062, 2, block, &planned), -EINVAL);
   } else {
     NO_SEND(ssf_mems_protocol_write_work_parameters(&serial, values, 126, 0), -ENOENT);
@@ -595,6 +621,163 @@ static void test_requests(void) {
   CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
 }
 
+/* 未投入使用的启动夹具：init 应自行设置默认值并解析属性。 */
+static void reset_startup_configuration(void) {
+  cleanup_sensor();
+  memset(&sensor, 0, sizeof(sensor));
+  memset(&serial, 0, sizeof(serial));
+  serial.drvdata = &sensor;
+  sensor.serdev = &serial;
+  sends = 0;
+}
+
+static void test_serial_configuration(void) {
+  static const struct {
+    const char *name;
+    enum ssf_mems_parity protocol_parity;
+    enum serdev_parity host_parity;
+  } parity_cases[] = {
+      {"none", SSF_MEMS_PARITY_NONE, SERDEV_PARITY_NONE},
+      {"odd", SSF_MEMS_PARITY_ODD, SERDEV_PARITY_ODD},
+      {"even", SSF_MEMS_PARITY_EVEN, SERDEV_PARITY_EVEN},
+  };
+  struct ssf_mems_xyzs_data no_serial = {0};
+  size_t i;
+
+  CHECK(ssf_mems_protocol_init(NULL) == -EINVAL);
+  CHECK(ssf_mems_protocol_init(&no_serial) == -EINVAL);
+  CHECK(ssf_mems_protocol_configure_serial(NULL) == -EINVAL);
+  CHECK(ssf_mems_protocol_configure_serial(&no_serial) == -EINVAL);
+
+  reset_startup_configuration();
+  CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  CHECK(sensor.slave_id == 1 &&
+        sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT &&
+        sensor.protocol.parity == SSF_MEMS_PARITY_NONE);
+  CHECK(sensor.protocol.host_baudrate == 9600 && serial.dev.info_count == 3);
+  CHECK(strstr(serial.dev.last_info, "default parity none") != NULL);
+  serial.flow_control = true;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+  CHECK(serial.baudrate == 9600 && sensor.protocol.host_baudrate == 9600);
+  CHECK(serial.parity == SERDEV_PARITY_NONE && !serial.flow_control);
+  CHECK(sends == 0);
+
+  for (i = 0; i < ARRAY_SIZE(parity_cases); i++) {
+    reset_startup_configuration();
+    serial.dev.has_slave_id = serial.dev.has_current_speed =
+        serial.dev.has_parity = true;
+    serial.dev.slave_id = 247;
+    serial.dev.current_speed = 115200;
+    serial.dev.parity = parity_cases[i].name;
+    CHECK(ssf_mems_protocol_init(&sensor) == 0);
+    CHECK(sensor.slave_id == 247 &&
+          sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200 &&
+          sensor.protocol.host_baudrate == 115200 &&
+          sensor.protocol.parity == parity_cases[i].protocol_parity);
+    CHECK(serial.baudrate_set_count == 0 && serial.parity_set_count == 0);
+    CHECK(serial.dev.info_count == 0);
+    CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+    CHECK(serial.baudrate == 115200 &&
+          serial.parity == parity_cases[i].host_parity);
+    CHECK(serial.baudrate_set_count == 1 && serial.parity_set_count == 1);
+    CHECK(sends == 0);
+  }
+
+  reset_startup_configuration();
+  serial.dev.has_slave_id = true;
+  serial.dev.slave_id = 0;
+  CHECK(ssf_mems_protocol_init(&sensor) == -EINVAL);
+  serial.dev.slave_id = 248;
+  CHECK(ssf_mems_protocol_init(&sensor) == -EINVAL);
+
+  reset_startup_configuration();
+  serial.dev.has_current_speed = true;
+  serial.dev.current_speed = 12345;
+  CHECK(ssf_mems_protocol_init(&sensor) == -EINVAL);
+
+  reset_startup_configuration();
+  serial.dev.has_parity = true;
+  serial.dev.parity = "invalid";
+  CHECK(ssf_mems_protocol_init(&sensor) == -EINVAL);
+  CHECK(sensor.protocol.parity == SSF_MEMS_PARITY_NONE);
+
+  /* 单个属性读取失败不影响其他合法属性，也必须记录对应默认值。 */
+  for (i = 0; i < 3; i++) {
+    reset_startup_configuration();
+    serial.dev.has_slave_id = serial.dev.has_current_speed =
+        serial.dev.has_parity = true;
+    serial.dev.slave_id = 42;
+    serial.dev.current_speed = 115200;
+    serial.dev.parity = "odd";
+    if (i == 0)
+      serial.dev.slave_id_read_error = -EIO;
+    else if (i == 1)
+      serial.dev.current_speed_read_error = -EINVAL;
+    else
+      serial.dev.parity_read_error = -ENODATA;
+    CHECK(ssf_mems_protocol_init(&sensor) == 0);
+    CHECK(sensor.slave_id == (i == 0 ? 1 : 42));
+    CHECK(sensor.protocol.baudrate == (i == 1 ? SSF_MEMS_BAUDRATE_DEFAULT
+                                             : SSF_MEMS_BAUDRATE_115200));
+    CHECK(sensor.protocol.host_baudrate == (i == 1 ? 9600 : 115200));
+    CHECK(sensor.protocol.parity == (i == 2 ? SSF_MEMS_PARITY_NONE
+                                           : SSF_MEMS_PARITY_ODD));
+    CHECK(serial.dev.info_count == 1);
+    CHECK(strstr(serial.dev.last_info, i == 0 ? "default slave ID 1"
+                                      : i == 1 ? "default baud rate 9600"
+                                               : "default parity none") != NULL);
+    CHECK(serial.baudrate_set_count == 0 && serial.parity_set_count == 0);
+    CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+    CHECK(serial.baudrate == sensor.protocol.host_baudrate);
+    CHECK(serial.parity == (i == 2 ? SERDEV_PARITY_NONE : SERDEV_PARITY_ODD));
+    CHECK(sends == 0);
+  }
+
+  reset_startup_configuration();
+  serial.dev.has_slave_id = serial.dev.has_current_speed =
+      serial.dev.has_parity = true;
+  serial.dev.slave_id_read_error = serial.dev.current_speed_read_error =
+      serial.dev.parity_read_error = -EIO;
+  CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  CHECK(sensor.slave_id == 1 && sensor.protocol.host_baudrate == 9600 &&
+        sensor.protocol.parity == SSF_MEMS_PARITY_NONE);
+  CHECK(serial.dev.info_count == 3 && sends == 0);
+
+  reset_startup_configuration();
+  serial.dev.has_current_speed = true;
+  serial.dev.current_speed = 57600;
+  CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  CHECK(sensor.slave_id == 1 && sensor.protocol.host_baudrate == 57600 &&
+        sensor.protocol.parity == SSF_MEMS_PARITY_NONE);
+  CHECK(serial.dev.info_count == 2 && sends == 0);
+
+  reset_sensor();
+  sensor.protocol.parity = SSF_MEMS_PARITY_MAX;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == -EINVAL);
+  CHECK(serial.baudrate_set_count == 0 && serial.parity_set_count == 0);
+  sensor.protocol.parity = SSF_MEMS_PARITY_NONE;
+  sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_MAX;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == -EINVAL);
+  CHECK(serial.baudrate_set_count == 0 && serial.parity_set_count == 0);
+
+  reset_sensor();
+  serial.baudrate_set_failure = true;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == -EIO);
+  CHECK(serial.parity_set_count == 0 && sensor.protocol.host_baudrate == 9600);
+
+  reset_sensor();
+  sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_115200;
+  serial.actual_baudrate = 115107;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+  CHECK(sensor.protocol.host_baudrate == 115107);
+
+  reset_sensor();
+  serial.parity_set_error = -EOPNOTSUPP;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == -EOPNOTSUPP);
+  CHECK(serial.baudrate_set_count == 1 && serial.parity_set_count == 1);
+  CHECK(sends == 0);
+}
+
 static void test_baudrate_management(void) {
   enum ssf_mems_baudrate baudrate = SSF_MEMS_BAUDRATE_MAX;
   unsigned int sends_before;
@@ -605,6 +788,10 @@ static void test_baudrate_management(void) {
   CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_DEFAULT) == 9600);
   CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_38400) == 38400);
   CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_MAX) == -EINVAL);
+  CHECK(ssf_mems_baudrate_from_value(9600, &baudrate) == 0 &&
+        baudrate == SSF_MEMS_BAUDRATE_9600);
+  CHECK(ssf_mems_baudrate_from_value(12345, &baudrate) == -EINVAL);
+  CHECK(ssf_mems_baudrate_from_value(9600, NULL) == -EINVAL);
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == 0);
   CHECK(baudrate == SSF_MEMS_BAUDRATE_9600);
   CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_9600);
@@ -680,6 +867,7 @@ int main(int argc, char **argv) {
   test_codecs();
   test_response_matching();
   test_requests();
+  test_serial_configuration();
   test_baudrate_management();
   test_sparse_features();
   cleanup_sensor();

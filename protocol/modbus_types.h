@@ -36,9 +36,10 @@ enum ssf_reg_access {
   SSF_REG_WRITE = BIT(1),
 };
 
-/* 一个寄存器是 U16，或是某个 U32 的高/低 16 位。 */
+/* 一个寄存器是 U16/S16，或是某个 U32 的高/低 16 位。 */
 enum ssf_reg_type {
   SSF_REG_U16,
+  SSF_REG_S16,
   SSF_REG_U32_HIGH,
   SSF_REG_U32_LOW,
 };
@@ -90,7 +91,7 @@ struct ssf_reg_desc {
   u16 display_reg;                // 手册显示地址，如 40001
   u16 protocol_addr;              // 线上地址，如 40001 对应 0x0000
   unsigned int access;            // 读/写权限位
-  enum ssf_reg_type type;         // U16 或 U32 的高/低半字
+  enum ssf_reg_type type;         // U16/S16 或 U32 的高/低半字
   enum ssf_rx_format read_format; // 读取时预期的响应格式
   bool write_single;              // 是否允许用 0x06 单独写入
   size_t feature_offset;          // 在 ssf_mems_sensor_data 中的字段偏移

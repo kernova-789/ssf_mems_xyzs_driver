@@ -45,5 +45,8 @@ __pycache__/
 tmp/
 temp/
 
+#源码
+MEMS2.0/
+
 # 手册文件
 *.pdf

@@ -4,6 +4,7 @@
 #include "core.h"
 #include "protocol.h"
 #include "sensor_data.h"
+#include "ssf_mems_acquisition.h"
 
 #include <linux/bitmap.h>
 #include <linux/errno.h>
@@ -56,8 +57,8 @@ enum ssf_mems_iio_scale {
   SSF_MEMS_IIO_SCALE_ACCEL,
   SSF_MEMS_IIO_SCALE_VELOCITY,
   SSF_MEMS_IIO_SCALE_TEMPERATURE,
-  SSF_MEMS_IIO_SCALE_PRESSURE,
   SSF_MEMS_IIO_SCALE_CENTI,
+  SSF_MEMS_IIO_SCALE_DECI,
   SSF_MEMS_IIO_SCALE_UNITY,
 };
 
@@ -78,19 +79,19 @@ static const struct ssf_mems_iio_feature_desc
     ssf_mems_iio_feature_descs[SSF_MEMS_IIO_FEATURE_MAX] = {
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_X_HIGH_FREQ_ACC_RMS,
                           x.high_freq_acc_rms_x100,
-                          SSF_MEMS_IIO_SCALE_VELOCITY),
+                          SSF_MEMS_IIO_SCALE_ACCEL),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_X_LOW_FREQ_VELOCITY_RMS,
                           x.low_freq_velocity_rms_x100,
                           SSF_MEMS_IIO_SCALE_VELOCITY),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_Y_HIGH_FREQ_ACC_RMS,
                           y.high_freq_acc_rms_x100,
-                          SSF_MEMS_IIO_SCALE_VELOCITY),
+                          SSF_MEMS_IIO_SCALE_ACCEL),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_Y_LOW_FREQ_VELOCITY_RMS,
                           y.low_freq_velocity_rms_x100,
                           SSF_MEMS_IIO_SCALE_VELOCITY),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_Z_HIGH_FREQ_ACC_RMS,
                           z.high_freq_acc_rms_x100,
-                          SSF_MEMS_IIO_SCALE_VELOCITY),
+                          SSF_MEMS_IIO_SCALE_ACCEL),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_Z_LOW_FREQ_VELOCITY_RMS,
                           z.low_freq_velocity_rms_x100,
                           SSF_MEMS_IIO_SCALE_VELOCITY),
@@ -129,19 +130,19 @@ static const struct ssf_mems_iio_feature_desc
                           SSF_MEMS_IIO_SCALE_VELOCITY),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_Z_VELOCITY_RMS, z.velocity_rms_x100,
                           SSF_MEMS_IIO_SCALE_VELOCITY),
-        SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SOUND_RMS, sound.rms_x100,
-                          SSF_MEMS_IIO_SCALE_PRESSURE),
-        SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SOUND_PEAK, sound.peak_x100,
-                          SSF_MEMS_IIO_SCALE_PRESSURE),
+        SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SOUND_RMS, sound.rms_db_x100,
+                          SSF_MEMS_IIO_SCALE_CENTI),
+        SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SOUND_PEAK, sound.peak_db_x100,
+                          SSF_MEMS_IIO_SCALE_CENTI),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SOUND_PEAK_TO_PEAK,
-                          sound.peak_to_peak_x100,
-                          SSF_MEMS_IIO_SCALE_PRESSURE),
+                          sound.peak_to_peak_db_x100,
+                          SSF_MEMS_IIO_SCALE_CENTI),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_ZERO_CROSSING_RATE,
-                          zero_crossing_rate_x100,
-                          SSF_MEMS_IIO_SCALE_CENTI),
+                          zero_crossing_rate_percent,
+                          SSF_MEMS_IIO_SCALE_UNITY),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SPECTRAL_CENTROID,
-                          spectral_centroid_x100,
-                          SSF_MEMS_IIO_SCALE_CENTI),
+                          spectral_centroid_hz_x10,
+                          SSF_MEMS_IIO_SCALE_DECI),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_SPECTRAL_FLUX, spectral_flux_x100,
                           SSF_MEMS_IIO_SCALE_CENTI),
         SSF_MEMS_IIO_DESC(SSF_MEMS_IIO_STARTUP_FLAGS, startup_flags,
@@ -175,15 +176,15 @@ static const struct ssf_mems_iio_feature_desc
   }
 
 static const struct iio_chan_spec ssf_mems_iio_channels[] = {
-    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_X, "high_freq_acc_rms",
+    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_ACCEL, IIO_MOD_X, "high_freq_rms",
                               SSF_MEMS_IIO_X_HIGH_FREQ_ACC_RMS),
     SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_X, "low_freq_rms",
                               SSF_MEMS_IIO_X_LOW_FREQ_VELOCITY_RMS),
-    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_Y, "high_freq_acc_rms",
+    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_ACCEL, IIO_MOD_Y, "high_freq_rms",
                               SSF_MEMS_IIO_Y_HIGH_FREQ_ACC_RMS),
     SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_Y, "low_freq_rms",
                               SSF_MEMS_IIO_Y_LOW_FREQ_VELOCITY_RMS),
-    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_Z, "high_freq_acc_rms",
+    SSF_MEMS_IIO_AXIS_CHANNEL(IIO_ACCEL, IIO_MOD_Z, "high_freq_rms",
                               SSF_MEMS_IIO_Z_HIGH_FREQ_ACC_RMS),
     SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_Z, "low_freq_rms",
                               SSF_MEMS_IIO_Z_LOW_FREQ_VELOCITY_RMS),
@@ -193,7 +194,7 @@ static const struct iio_chan_spec ssf_mems_iio_channels[] = {
         .scan_index = SSF_MEMS_IIO_TEMPERATURE,
         .scan_type =
             {
-                .sign = 'u',
+                .sign = 's',
                 .realbits = 16,
                 .storagebits = 16,
                 .endianness = IIO_CPU,
@@ -231,22 +232,22 @@ static const struct iio_chan_spec ssf_mems_iio_channels[] = {
                               SSF_MEMS_IIO_Y_VELOCITY_RMS),
     SSF_MEMS_IIO_AXIS_CHANNEL(IIO_VELOCITY, IIO_MOD_Z, "rms",
                               SSF_MEMS_IIO_Z_VELOCITY_RMS),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_PRESSURE, 0, "sound_rms",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 0, "sound_rms_db",
                                SSF_MEMS_IIO_SOUND_RMS),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_PRESSURE, 1, "sound_peak",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 1, "sound_peak_db",
                                SSF_MEMS_IIO_SOUND_PEAK),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_PRESSURE, 2, "sound_peak_to_peak",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 2, "sound_peak_to_peak_db",
                                SSF_MEMS_IIO_SOUND_PEAK_TO_PEAK),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 0, "zero_crossing_rate_percent",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 3, "zero_crossing_rate_percent",
                                SSF_MEMS_IIO_ZERO_CROSSING_RATE),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 1, "spectral_centroid_hz",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 4, "spectral_centroid_hz",
                                SSF_MEMS_IIO_SPECTRAL_CENTROID),
-    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 2, "spectral_flux_pa2",
+    SSF_MEMS_IIO_NAMED_CHANNEL(IIO_COUNT, 5, "spectral_flux",
                                SSF_MEMS_IIO_SPECTRAL_FLUX),
     {
         .type = IIO_COUNT,
         .indexed = 1,
-        .channel = 3,
+        .channel = 6,
         .extend_name = "startup_flags",
         .address = SSF_MEMS_IIO_STARTUP_FLAGS,
         .scan_index = SSF_MEMS_IIO_STARTUP_FLAGS,
@@ -268,6 +269,7 @@ static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
                                      int *value) {
   const struct ssf_mems_iio_feature_desc *desc;
   struct ssf_mems_sensor_data features;
+  s16 signed_value16;
   u16 value16;
   int ret;
 
@@ -281,7 +283,12 @@ static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
 
   if (desc->width == sizeof(u16)) {
     memcpy(&value16, (u8 *)&features + desc->offset, sizeof(value16));
-    *value = value16;
+    if (chan->scan_type.sign == 's') {
+      memcpy(&signed_value16, &value16, sizeof(signed_value16));
+      *value = signed_value16;
+    } else {
+      *value = value16;
+    }
   } else if (desc->width == sizeof(u8)) {
     *value = *((u8 *)&features + desc->offset);
   } else {
@@ -290,7 +297,7 @@ static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
   return 0;
 }
 
-/* 按 IIO ABI 单位返回寄存器 x100 数据的比例。 */
+/* 按 IIO ABI 或通道名明示的单位返回寄存器比例。 */
 static int ssf_mems_iio_read_scale(const struct iio_chan_spec *chan, int *val,
                                    int *val2) {
   const struct ssf_mems_iio_feature_desc *desc;
@@ -315,14 +322,13 @@ static int ssf_mems_iio_read_scale(const struct iio_chan_spec *chan, int *val,
     *val = 10;
     *val2 = 0;
     return IIO_VAL_INT;
-  case SSF_MEMS_IIO_SCALE_PRESSURE:
-    /* IIO 压力单位是 kPa：0.01 Pa -> 0.00001 kPa。 */
-    *val = 0;
-    *val2 = 10;
-    return IIO_VAL_INT_PLUS_MICRO;
   case SSF_MEMS_IIO_SCALE_CENTI:
     *val = 0;
     *val2 = 10000;
+    return IIO_VAL_INT_PLUS_MICRO;
+  case SSF_MEMS_IIO_SCALE_DECI:
+    *val = 0;
+    *val2 = 100000;
     return IIO_VAL_INT_PLUS_MICRO;
   case SSF_MEMS_IIO_SCALE_UNITY:
     *val = 1;
@@ -360,7 +366,7 @@ static ssize_t ssf_mems_iio_baudrate_show(struct device *dev,
   int value;
   int ret;
 
-  ret = ssf_mems_protocol_get_baudrate(state->data->serdev, &baudrate, 0);
+  ret = ssf_mems_acquisition_get_baudrate(state->data, &baudrate);
   if (ret)
     return ret;
   value = ssf_mems_baudrate_to_value(baudrate);
@@ -392,7 +398,7 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
     return -EINVAL;
   baudrate = i;
 
-  ret = ssf_mems_protocol_set_baudrate(state->data->serdev, baudrate, 0);
+  ret = ssf_mems_acquisition_set_baudrate(state->data, baudrate);
   if (ret)
     return ret;
   return len;
@@ -400,6 +406,34 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
 
 static IIO_DEVICE_ATTR(sensor_baudrate, 0644, ssf_mems_iio_baudrate_show,
                        ssf_mems_iio_baudrate_store, 0);
+
+static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
+                                          struct device_attribute *attr,
+                                          char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct iio_dev_attr *iio_attr = to_iio_dev_attr(attr);
+  struct ssf_mems_acquisition_status status;
+
+  ssf_mems_acquisition_get_status(state->data, &status);
+  switch (iio_attr->address) {
+  case 0:
+    return sysfs_emit(buf, "%u\n", status.online);
+  case 1:
+    return sysfs_emit(buf, "%u\n", status.interval_ms);
+  case 2:
+    if (!status.have_sample)
+      return -ENODATA;
+    return sysfs_emit(buf, "%u\n", status.sample_age_ms);
+  default:
+    return -EINVAL;
+  }
+}
+
+static IIO_DEVICE_ATTR(sensor_online, 0444, ssf_mems_iio_acquisition_show, NULL, 0);
+static IIO_DEVICE_ATTR(sensor_poll_interval_ms, 0444,
+                       ssf_mems_iio_acquisition_show, NULL, 1);
+static IIO_DEVICE_ATTR(sensor_sample_age_ms, 0444,
+                       ssf_mems_iio_acquisition_show, NULL, 2);
 static IIO_CONST_ATTR(
     sensor_baudrate_available,
     "2400 4800 9600 19200 38400 57600 115200 128000 230400 256000 "
@@ -407,6 +441,9 @@ static IIO_CONST_ATTR(
 
 static struct attribute *ssf_mems_iio_attributes[] = {
     &iio_dev_attr_sensor_baudrate.dev_attr.attr,
+    &iio_dev_attr_sensor_online.dev_attr.attr,
+    &iio_dev_attr_sensor_poll_interval_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_sample_age_ms.dev_attr.attr,
     &iio_const_attr_sensor_baudrate_available.dev_attr.attr,
     NULL,
 };
