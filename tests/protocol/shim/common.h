@@ -14,19 +14,29 @@ typedef uint8_t u8;
 typedef int16_t s16;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef int64_t s64;
 #define BIT(n) (1UL << (n))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define GFP_KERNEL 0
 #define ERESTARTSYS 512
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(v, value) ((v) = (value))
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
 
+#ifdef SSF_TEST_REAL_MUTEX
+#include <pthread.h>
+struct mutex { pthread_mutex_t native; };
+#else
 struct mutex { int unused; };
+#endif
 typedef struct { int unused; } wait_queue_head_t;
 typedef int spinlock_t;
 typedef struct { int counter; } atomic_t;
 struct work_struct { void (*fn)(struct work_struct *); };
+struct delayed_work { struct work_struct work; unsigned long delay; bool pending; };
 struct device {
   bool has_slave_id, has_current_speed, has_parity;
   u32 slave_id, current_speed;
@@ -34,6 +44,9 @@ struct device {
   int slave_id_read_error, current_speed_read_error, parity_read_error;
   unsigned int info_count;
   char last_info[256];
+  bool has_raw_duration, has_feature_duration;
+  u32 raw_duration_ms, feature_duration_ms;
+  int duration_read_error;
 };
 enum serdev_parity {
   SERDEV_PARITY_NONE,
@@ -47,6 +60,7 @@ struct serdev_device {
   unsigned int baudrate_set_count;
   unsigned int actual_baudrate;
   bool baudrate_set_failure;
+  unsigned int rejected_baudrate; /* 仅拒绝指定速率，用于验证启动回退。 */
   enum serdev_parity parity;
   unsigned int parity_set_count;
   int parity_set_error;
@@ -60,23 +74,37 @@ struct ssf_mems_xyzs_data;
 extern bool test_allocation_failure;
 extern long test_wait_result;
 extern unsigned int test_queue_count, test_cancel_count, test_wake_count;
+extern unsigned int test_delayed_queue_count, test_delayed_cancel_count;
+long test_wait_timeout(unsigned long timeout);
+#ifdef SSF_TEST_REAL_MUTEX
+#define mutex_init(p) pthread_mutex_init(&(p)->native, NULL)
+#define mutex_lock(p) pthread_mutex_lock(&(p)->native)
+#define mutex_unlock(p) pthread_mutex_unlock(&(p)->native)
+#else
 #define mutex_init(p) ((p)->unused = 0)
 #define mutex_lock(p) ((void)(p))
 #define mutex_unlock(p) ((void)(p))
+#endif
 #define spin_lock_init(p) (*(p) = 0)
 #define spin_lock_irqsave(p, flags) do { (void)(p); (flags) = 0; } while (0)
 #define spin_unlock_irqrestore(p, flags) ((void)(p), (void)(flags))
 #define init_waitqueue_head(p) ((void)(p))
 #define wake_up_interruptible(p) ((void)(p), test_wake_count++)
 #define INIT_WORK(p, f) ((p)->fn = (f))
+#define INIT_DELAYED_WORK(p, f) ((p)->work.fn = (f), (p)->pending = false)
+#define mod_delayed_work(wq, p, ticks) ((void)(wq), (p)->delay = (ticks), (p)->pending = true, test_delayed_queue_count++)
+#define cancel_delayed_work_sync(p) ((p)->pending = false, test_delayed_cancel_count++)
 #define cancel_work_sync(p) ((void)(p), test_cancel_count++)
 #define queue_work(wq, work) ((void)(wq), (void)(work), test_queue_count++)
 #define system_wq NULL
 #define msecs_to_jiffies(ms) (ms)
-#define wait_event_interruptible_timeout(q, condition, timeout) ((void)(q), (void)(timeout), (condition) ? 1L : test_wait_result)
+#define wait_event_interruptible_timeout(q, condition, timeout) ((void)(q), (condition) ? 1L : test_wait_timeout(timeout))
 #define dev_err(dev, ...) ((void)(dev))
 #define dev_warn(dev, ...) ((void)(dev))
+#define dev_err_ratelimited(dev, ...) dev_err(dev, __VA_ARGS__)
+#define dev_warn_ratelimited(dev, ...) dev_warn(dev, __VA_ARGS__)
 #define dev_dbg(dev, ...) ((void)(dev))
+#define pr_info(...) ((void)snprintf(NULL, 0, __VA_ARGS__))
 #define dev_info(dev, ...) ((dev)->info_count++, \
                            (void)snprintf((dev)->last_info, \
                                          sizeof((dev)->last_info), __VA_ARGS__))
@@ -116,6 +144,7 @@ static inline void kfifo_free(struct kfifo *fifo) {
 static inline void kfifo_reset(struct kfifo *fifo) {
   fifo->head = fifo->tail = fifo->count = 0;
 }
+static inline bool kfifo_is_empty(struct kfifo *fifo) { return !fifo->count; }
 static inline unsigned int kfifo_in(struct kfifo *fifo, const u8 *buf, size_t size) {
   size_t i;
   for (i = 0; i < size && fifo->count < fifo->capacity; i++) {
@@ -137,7 +166,7 @@ static inline unsigned int kfifo_out_spinlocked(struct kfifo *fifo, u8 *buf, siz
 static inline unsigned int
 serdev_device_set_baudrate(struct serdev_device *s, unsigned int baudrate) {
   s->baudrate_set_count++;
-  if (s->baudrate_set_failure)
+  if (s->baudrate_set_failure || baudrate == s->rejected_baudrate)
     return 0;
   s->baudrate = s->actual_baudrate ? s->actual_baudrate : baudrate;
   return s->baudrate;
@@ -170,6 +199,18 @@ static inline bool device_property_present(struct device *dev,
 
 static inline int device_property_read_u32(struct device *dev,
                                            const char *name, u32 *value) {
+  if (!strcmp(name, "sange-cbm,raw-duration-ms") && dev->has_raw_duration) {
+    if (dev->duration_read_error)
+      return dev->duration_read_error;
+    *value = dev->raw_duration_ms;
+    return 0;
+  }
+  if (!strcmp(name, "sange-cbm,feature-duration-ms") && dev->has_feature_duration) {
+    if (dev->duration_read_error)
+      return dev->duration_read_error;
+    *value = dev->feature_duration_ms;
+    return 0;
+  }
   if (!strcmp(name, "sange-cbm,slave-id") && dev->has_slave_id) {
     if (dev->slave_id_read_error)
       return dev->slave_id_read_error;

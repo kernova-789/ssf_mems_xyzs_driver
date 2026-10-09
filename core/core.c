@@ -33,7 +33,9 @@ ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
   return (ssf_mems_receive_ret_t)ret;
 }
 
-static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {}
+static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {
+  serdev_device_write_wakeup(serdev);
+}
 
 static const struct serdev_device_ops ssf_mems_xyzs_ops = {
     .receive_buf = ssf_mems_xyzs_ops_receive_buf,
@@ -45,24 +47,24 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   int ret;
 
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
-  if (!data)
+  if (data == NULL)
     return -ENOMEM;
 
   data->serdev = serdev;
 
   ret = ssf_mems_protocol_init(data);
-  if (ret) {
+  if (ret != 0) {
     dev_err(&serdev->dev, "failed to initialize protocol configuration: %d\n",
             ret);
     return ret;
   }
 
   ret = ssf_mems_modbus_request_init(data);
-  if (ret)
+  if (ret != 0)
     return ret;
 
   ret = ssf_mems_modbus_receive_init(data, ssf_mems_protocol_handle_frame, data);
-  if (ret) {
+  if (ret != 0) {
     dev_err(&serdev->dev, "failed to initialize Modbus receive state: %d\n", ret);
     goto err_request;
   }
@@ -71,27 +73,27 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   serdev_device_set_client_ops(serdev, &ssf_mems_xyzs_ops);
 
   ret = devm_serdev_device_open(&serdev->dev, serdev);
-  if (ret)
+  if (ret != 0)
     goto err_receive;
 
   ret = ssf_mems_protocol_configure_serial(data);
-  if (ret) {
+  if (ret != 0) {
     dev_err(&serdev->dev, "failed to configure serial parameters: %d\n", ret);
     goto err_receive;
   }
 
   ret = ssf_mems_acquisition_init(data);
-  if (ret)
+  if (ret != 0)
     goto err_receive;
 
   ret = ssf_mems_iio_register(data);
-  if (ret) {
+  if (ret != 0) {
     dev_err(&serdev->dev, "failed to register IIO device: %d\n", ret);
     goto err_receive;
   }
 
   ret = ssf_mems_acquisition_start(data);
-  if (ret) {
+  if (ret != 0) {
     dev_err(&serdev->dev, "failed to start sensor acquisition: %d\n", ret);
     goto err_iio;
   }

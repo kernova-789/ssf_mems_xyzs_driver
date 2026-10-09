@@ -18,19 +18,23 @@ VARIANTS = {
     "delete_all_features": set(range(40001, 40030)),
     "delete_config": {40050},
     "delete_work_parameter": {40064},
+    "delete_save_register": {40110},
+    "delete_raw_start": {40058},
+    "delete_raw_stop": {40059},
     "reverse_table": set(),
 }
-MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol")
+MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream")
 HEADERS = (
     "sensor_data.h", "modbus_types.h", "modbus.h", "modbus_table.h",
     "modbus_request.h", "modbus_receive.h", "protocol.h", "core.h",
-    "ssf_mems_acquisition.h", "acquisition_policy.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h",
 )
 ALLOWED_DEPENDENCIES = {
     "modbus": set(),
-    "modbus_request": {"modbus"},
-    "modbus_receive": {"modbus"},
-    "protocol": {"modbus", "modbus_request", "modbus_receive"},
+    "modbus_request": {"modbus", "modbus_receive"},
+    "modbus_receive": {"modbus", "raw_stream"},
+    "protocol": {"modbus", "modbus_request", "modbus_receive", "raw_stream"},
+    "raw_stream": {"modbus", "iio"},
 }
 
 def check_module_dependencies(objects):
@@ -48,7 +52,7 @@ def check_module_dependencies(objects):
             symbol = line.split()[-1]
             if not symbol.startswith("ssf_"):
                 continue
-            owner = owners.get(symbol)
+            owner = "iio" if symbol == "ssf_mems_iio_publish_raw" else owners.get(symbol)
             if owner not in ALLOWED_DEPENDENCIES[module]:
                 raise AssertionError(f"Invalid dependency: {module} -> {symbol} ({owner})")
 
@@ -85,6 +89,7 @@ def main():
                 "-I" + str(TEST_DIR / "shim"), "-I" + str(project / "protocol"),
                 "-I" + str(project / "core"),
                 "-I" + str(project / "acquisition"),
+                "-I" + str(ROOT / "iio"),
             ]
             # Headers must provide their own prerequisites, not rely on include order.
             for header in HEADERS:

@@ -24,11 +24,11 @@ int ssf_mems_modbus_tx_frame_len(const struct ssf_modbus_frame_desc *frame,
                                u16 reg_count) {
   size_t len;
 
-  if (!frame)
+  if (frame == NULL)
     return -EINVAL;
   if (frame->tx_format == SSF_TX_NONE)
     return -EOPNOTSUPP;
-  if (!reg_count || reg_count > frame->max_reg_count)
+  if (reg_count == 0 || reg_count > frame->max_reg_count)
     return -EINVAL;
 
   len = frame->tx_base_len + (size_t)frame->tx_bytes_per_reg * reg_count;
@@ -42,10 +42,10 @@ int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame,
                                u8 byte_count) {
   size_t len;
 
-  if (!frame)
+  if (frame == NULL)
     return -EINVAL;
-  if (frame->rx_bytes_per_reg &&
-      (!byte_count || byte_count % frame->rx_bytes_per_reg ||
+  if (frame->rx_bytes_per_reg != 0 &&
+      (byte_count == 0 || byte_count % frame->rx_bytes_per_reg != 0 ||
        byte_count / frame->rx_bytes_per_reg > frame->max_reg_count))
     return -EMSGSIZE;
 
@@ -75,7 +75,7 @@ int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
   u16 crc;
   u16 i;
 
-  if (!transfer || !transfer->frame || !buf)
+  if (transfer == NULL || transfer->frame == NULL || buf == NULL)
     return -EINVAL;
   frame = transfer->frame;
   len = ssf_mems_modbus_tx_frame_len(frame, transfer->reg_count);
@@ -88,7 +88,7 @@ int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
       frame->quantity_offset + 2 > len - SSF_MEMS_MODBUS_CRC_LEN)
     return -EINVAL;
   if (frame->tx_format != SSF_TX_READ_REGS &&
-      (!values || values_count < transfer->reg_count))
+      (values == NULL || values_count < transfer->reg_count))
     return -EINVAL;
 
   memset(buf, 0, len);
@@ -118,7 +118,7 @@ int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
 int ssf_mems_modbus_check_crc(const u8 *buf, size_t len) {
   u16 received;
 
-  if (!buf)
+  if (buf == NULL)
     return -EINVAL;
   if (len < 2 + SSF_MEMS_MODBUS_CRC_LEN)
     return -EMSGSIZE;
@@ -138,7 +138,7 @@ int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
   int ret;
   u16 i;
 
-  if (!transfer || !transfer->frame || !buf)
+  if (transfer == NULL || transfer->frame == NULL || buf == NULL)
     return -EINVAL;
   if (len < 2)
     return -EMSGSIZE;
@@ -148,9 +148,9 @@ int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
     return -ENOMSG;
 
   rx = ssf_mems_modbus_find_rx_frame(buf[1]);
-  if (!rx)
+  if (rx == NULL)
     return -ENOMSG;
-  if (rx->rx_bytes_per_reg) {
+  if (rx->rx_bytes_per_reg != 0) {
     if (len <= rx->rx_byte_count_offset)
       return -EMSGSIZE;
     byte_count = buf[rx->rx_byte_count_offset];
@@ -159,7 +159,7 @@ int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
   if (expected_len < 0 || len != expected_len)
     return -EMSGSIZE;
   ret = ssf_mems_modbus_check_crc(buf, len);
-  if (ret)
+  if (ret != 0)
     return ret;
   if (rx->rx_format == SSF_RX_EXCEPTION)
     return -EREMOTEIO;
@@ -167,7 +167,7 @@ int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
   if (rx->rx_format == SSF_RX_HOLDING_REGS) {
     if (byte_count != transfer->reg_count * rx->rx_bytes_per_reg)
       return -ENOMSG;
-    if (!values || values_count < transfer->reg_count)
+    if (values == NULL || values_count < transfer->reg_count)
       return -EFAULT;
     if (rx->rx_bytes_per_reg != sizeof(u16) ||
         rx->rx_data_offset + byte_count != len - SSF_MEMS_MODBUS_CRC_LEN)

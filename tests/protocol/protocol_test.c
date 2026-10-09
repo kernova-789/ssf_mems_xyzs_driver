@@ -4,10 +4,26 @@
 #include "modbus_request.h"
 #include "modbus_receive.h"
 #include "protocol.h"
+#include <linux/jiffies.h>
 
 bool test_allocation_failure;
 long test_wait_result;
 unsigned int test_queue_count, test_cancel_count, test_wake_count;
+unsigned int test_delayed_queue_count, test_delayed_cancel_count;
+unsigned long jiffies;
+static void (*wait_hook)(unsigned long timeout);
+static bool wait_returns_early; /* 新的时序用例允许唤醒发生在 timeout 之前。 */
+
+long test_wait_timeout(unsigned long timeout) {
+  unsigned long end = jiffies + timeout;
+  if (wait_hook)
+    wait_hook(timeout);
+  if (wait_returns_early == true && test_wait_result > 0)
+    return test_wait_result;
+  if (time_before(jiffies, end))
+    jiffies = end;
+  return test_wait_result;
+}
 
 static struct ssf_mems_xyzs_data sensor;
 static struct serdev_device serial;
@@ -24,13 +40,77 @@ static bool saw_block_description;
 static bool sensor_initialized;
 static bool enforce_sensor_baudrate;
 static bool invalid_baudrate_value;
+static bool wrong_baudrate_value;
 static enum ssf_mems_baudrate sensor_baudrate;
+static enum ssf_mems_baudrate staged_baudrate;
+static unsigned long sensor_reboot_until;
+static unsigned int sensor_extra_boot_ms;
+static bool verification_never_replies;
+static unsigned int reboots, sleep_count, slept_ms;
+static void (*sleep_hook)(void);
+static unsigned int special_reply_send;
+static int special_reply_mode;
+static bool emulate_settings, ignore_setting_writes;
+static u16 setting_registers[121];
+struct tx_event {
+  u8 function;
+  u16 address, value;
+  unsigned int baudrate;
+  unsigned long sent_at;
+};
+static struct tx_event tx_events[256];
+static unsigned int raw_published;
+static struct ssf_mems_raw_sample raw_last;
+static int raw_publish_error;
+static bool emulate_raw_mode;
+static unsigned int raw_wait_action;
+static unsigned int ignored_raw_stops; /* 模拟停止命令在链路/固件中丢失。 */
+static bool raw_sensor_running; /* 模拟私有流尚未停止，而非普通配置改变。 */
+static enum ssf_mems_baudrate raw_restore_baudrate; /* 停流后返回的普通配置。 */
+static unsigned long late_raw_packet_at; /* 首包前卸载时，固件稍后才开始输出。 */
+static u32 drain_sequence; /* 排空包使用独立序号，验证统计不会污染有效段。 */
+static unsigned int raw_gap_waits; /* 记录停止前等待包间空档的次数。 */
+static bool raw_gap_partial; /* 模拟唤醒时下一包已经收到一个字节。 */
 
 enum { REPLY_NORMAL, REPLY_EXCEPTION, REPLY_BAD_CRC, REPLY_WRONG_COUNT, REPLY_NONE, REPLY_MISMATCH_THEN_NORMAL };
 #define CHECK(expr) do { checks++; if (!(expr)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); abort(); } } while (0)
 #define NO_SEND(expr, error) do { unsigned int before = sends; CHECK((expr) == (error)); CHECK(sends == before); } while (0)
 
+/* 记录生产解析器交给 IIO 的样本，而不复制解码实现。 */
+int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
+                            const struct ssf_mems_raw_sample *sample) {
+  CHECK(data == &sensor);
+  raw_published++;
+  raw_last = *sample;
+  return raw_publish_error;
+}
+
+void test_msleep(unsigned int ms) {
+  CHECK(!sensor.modbus_req.pending && !sensor.modbus_req.busy);
+  sleep_count++;
+  slept_ms += ms;
+  if (sleep_hook)
+    sleep_hook();
+  jiffies += ms;
+}
+
+static void apply_sensor_write(u16 address, u16 value) {
+  if (emulate_settings && !ignore_setting_writes)
+    setting_registers[address] = value;
+  if (address == 101 && value < SSF_MEMS_BAUDRATE_MAX) {
+    staged_baudrate = value;
+  } else if (address == 109 && value == 1) {
+    CHECK(staged_baudrate < SSF_MEMS_BAUDRATE_MAX);
+    sensor_baudrate = staged_baudrate;
+    sensor_reboot_until = jiffies + SSF_MEMS_SENSOR_REBOOT_DELAY_MS +
+                          sensor_extra_boot_ms;
+    reboots++;
+  }
+}
+
 static u16 wire_value(u16 address) {
+  if (emulate_settings)
+    return setting_registers[address];
   return address == 28 ? 0xfffd : 0x2200 + address;
 }
 
@@ -82,6 +162,7 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
   struct ssf_mems_xyzs_data *data = s->drvdata;
   size_t len, offset;
   u16 address, count, i;
+  int mode;
 
   CHECK(size <= sizeof(last_tx));
   s->write_timeout = timeout;
@@ -91,6 +172,10 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
   CHECK(ssf_mems_modbus_check_crc(buf, size) == 0);
   address = ((u16)buf[2] << 8) | buf[3];
   count = ((u16)buf[4] << 8) | buf[5];
+  CHECK(sends <= ARRAY_SIZE(tx_events));
+  tx_events[sends - 1] = (struct tx_event){buf[1], address, count,
+                                         s->baudrate, jiffies};
+  mode = sends == special_reply_send ? special_reply_mode : response_mode;
   if (buf[1] == 3) {
     CHECK(read_runs < ARRAY_SIZE(read_starts));
     read_starts[read_runs] = address;
@@ -102,13 +187,35 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     return -EIO;
   if (forced_send_result != -1)
     return forced_send_result;
+  if (emulate_raw_mode && buf[1] == 3 && address == 57) {
+    CHECK(count == 1 && s->baudrate == 9600);
+    sensor_baudrate = SSF_MEMS_BAUDRATE_1000000;
+    raw_sensor_running = true;
+    return size; /* 启动命令没有普通 Modbus 应答。 */
+  }
+  if (emulate_raw_mode && buf[1] == 6 && address == 58) {
+    CHECK(count == 1 && s->baudrate == 1000000);
+    if (ignored_raw_stops != 0) {
+      ignored_raw_stops--;
+      return size;
+    }
+    sensor_baudrate = raw_restore_baudrate;
+    raw_sensor_running = false;
+    return size; /* 不依赖停止应答，恢复后再读寄存器确认。 */
+  }
   if (enforce_sensor_baudrate &&
-      s->baudrate != (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate))
+      (time_before(jiffies, sensor_reboot_until) ||
+       s->baudrate != (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate)))
     return size;
-  if (response_mode == REPLY_NONE)
+  if (verification_never_replies && reboots && buf[1] == 3 && address == 101)
     return size;
+  if (mode == REPLY_NONE) {
+    if (enforce_sensor_baudrate && buf[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE)
+      apply_sensor_write(address, count);
+    return size;
+  }
 
-  if (response_mode == REPLY_MISMATCH_THEN_NORMAL) {
+  if (mode == REPLY_MISMATCH_THEN_NORMAL) {
     u8 unmatched[] = {1, 6, 0, 100, 0x12, 0x34, 0, 0};
     CHECK(data->modbus_req.pending && data->modbus_req.busy);
     finish_crc(unmatched, sizeof(unmatched));
@@ -117,12 +224,12 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
 
   response[0] = buf[0];
   response[1] = buf[1];
-  if (response_mode == REPLY_EXCEPTION) {
+  if (mode == REPLY_EXCEPTION) {
     response[1] |= 0x80;
     response[2] = 2;
     len = 5;
   } else if (buf[1] == 3) {
-    if (response_mode == REPLY_WRONG_COUNT)
+    if (mode == REPLY_WRONG_COUNT)
       count--;
     response[2] = count * 2;
     len = 5 + count * 2;
@@ -131,7 +238,9 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
 
       if (enforce_sensor_baudrate && address + i == 101)
         value = invalid_baudrate_value ? SSF_MEMS_BAUDRATE_MAX
-                                       : sensor_baudrate;
+                : wrong_baudrate_value ? SSF_MEMS_BAUDRATE_57600
+                : staged_baudrate < SSF_MEMS_BAUDRATE_MAX ? staged_baudrate
+                                                        : sensor_baudrate;
       else
         value = wire_value(address + i);
       response[3 + i * 2] = value >> 8;
@@ -142,7 +251,7 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     len = 8;
   }
   finish_crc(response, len);
-  if (response_mode == REPLY_BAD_CRC)
+  if (mode == REPLY_BAD_CRC)
     response[len - 1] ^= 0x40;
 
   /* Feed real FIFO/candidate-parser code in chunks that split headers and CRC. */
@@ -158,10 +267,9 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     CHECK(data->modbus_req.busy);
     CHECK(ssf_mems_modbus_read_reg(s, 40121, &ignored, 0) == -EBUSY);
   }
-  if (enforce_sensor_baudrate && response_mode != REPLY_EXCEPTION &&
-      buf[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE && address == 101 &&
-      count < SSF_MEMS_BAUDRATE_MAX)
-    sensor_baudrate = count;
+  if ((enforce_sensor_baudrate || emulate_settings) && mode != REPLY_EXCEPTION &&
+      buf[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE)
+    apply_sensor_write(address, count);
   return size;
 }
 
@@ -175,6 +283,9 @@ static void cleanup_sensor(void) {
 
 static void reset_sensor(void) {
   cleanup_sensor();
+  jiffies = 0;
+  wait_hook = NULL;
+  wait_returns_early = false;
   memset(&sensor, 0, sizeof(sensor));
   memset(&serial, 0, sizeof(serial));
   serial.drvdata = &sensor;
@@ -192,9 +303,30 @@ static void reset_sensor(void) {
   fail_on_send = 0;
   check_busy_handoff = saw_block_description = test_allocation_failure = false;
   enforce_sensor_baudrate = invalid_baudrate_value = false;
+  wrong_baudrate_value = false;
+  emulate_settings = ignore_setting_writes = false;
+  memset(setting_registers, 0, sizeof(setting_registers));
   sensor_baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
+  staged_baudrate = SSF_MEMS_BAUDRATE_MAX;
+  sensor_reboot_until = 0;
+  sensor_extra_boot_ms = 0;
+  verification_never_replies = false;
+  reboots = sleep_count = slept_ms = special_reply_send = 0;
+  sleep_hook = NULL;
   test_wait_result = 0;
+  raw_published = 0;
+  raw_publish_error = 0;
+  emulate_raw_mode = false;
+  raw_wait_action = 0;
+  ignored_raw_stops = 0;
+  raw_sensor_running = false;
+  raw_restore_baudrate = SSF_MEMS_BAUDRATE_9600;
+  late_raw_packet_at = 0;
+  drain_sequence = 1000;
+  raw_gap_waits = 0;
+  raw_gap_partial = false;
   test_queue_count = test_cancel_count = test_wake_count = 0;
+  test_delayed_queue_count = test_delayed_cancel_count = 0;
 }
 
 static void test_initialization_and_cleanup(void) {
@@ -574,7 +706,8 @@ static void test_requests(void) {
     NO_SEND(ssf_mems_protocol_write_work_parameters(&serial, values, 126, 0), -ENOENT);
   }
 
-  NO_SEND(ssf_mems_modbus_read(&serial, 40059, 1, values, 126, 0), -EACCES);
+  NO_SEND(ssf_mems_modbus_read(&serial, 40059, 1, values, 126, 0),
+          ssf_mems_modbus_find_reg(40059) == NULL ? -ENOENT : -EACCES);
   NO_SEND(ssf_mems_modbus_read(&serial, 40054, 1, values, 126, 0), -EOPNOTSUPP);
   NO_SEND(ssf_mems_modbus_read(&serial, 40103, 2, values, 126, 0), -ENOENT);
   NO_SEND(ssf_mems_modbus_write_regs(&serial, 40121, 1, values, 126, 0), -EACCES);
@@ -693,7 +826,14 @@ static void test_serial_configuration(void) {
   reset_startup_configuration();
   serial.dev.has_current_speed = true;
   serial.dev.current_speed = 12345;
-  CHECK(ssf_mems_protocol_init(&sensor) == -EINVAL);
+  CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT &&
+        sensor.protocol.host_baudrate == 9600);
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0 && serial.baudrate == 9600);
+  CHECK(sends == 0);
+  serial.dev.current_speed = 0;
+  CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  CHECK(sensor.protocol.host_baudrate == 9600);
 
   reset_startup_configuration();
   serial.dev.has_parity = true;
@@ -772,6 +912,15 @@ static void test_serial_configuration(void) {
   CHECK(sensor.protocol.host_baudrate == 115107);
 
   reset_sensor();
+  sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_57600;
+  serial.rejected_baudrate = 57600;
+  CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT &&
+        sensor.protocol.host_baudrate == 9600 && serial.baudrate == 9600);
+  CHECK(serial.baudrate_set_count == 2 && sends == 0);
+  CHECK(strstr(serial.dev.last_info, "using default baud rate 9600") != NULL);
+
+  reset_sensor();
   serial.parity_set_error = -EOPNOTSUPP;
   CHECK(ssf_mems_protocol_configure_serial(&sensor) == -EOPNOTSUPP);
   CHECK(serial.baudrate_set_count == 1 && serial.parity_set_count == 1);
@@ -798,6 +947,13 @@ static void test_baudrate_management(void) {
   CHECK(serial.baudrate == 9600 && serial.baudrate_set_count == 0);
   CHECK(sends == 1);
 
+  if (!ssf_mems_modbus_find_reg(40110)) {
+    NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 0),
+            -ENOENT);
+    CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_MAX && !reboots);
+    return;
+  }
+
   reset_sensor();
   enforce_sensor_baudrate = true;
   sensor_baudrate = SSF_MEMS_BAUDRATE_38400;
@@ -812,12 +968,23 @@ static void test_baudrate_management(void) {
   sends_before = sends;
   CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200,
                                        0) == 0);
-  CHECK(sends == sends_before + 1);
+  CHECK(sends == sends_before + 3);
   CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
   CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200);
   CHECK(serial.baudrate == 115200);
-  CHECK(last_tx[1] == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE && last_tx[3] == 101);
-  CHECK(last_tx[4] == 0 && last_tx[5] == SSF_MEMS_BAUDRATE_115200);
+  CHECK(tx_events[sends_before].function == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE &&
+        tx_events[sends_before].address == 101 &&
+        tx_events[sends_before].value == SSF_MEMS_BAUDRATE_115200 &&
+        tx_events[sends_before].baudrate == 38400);
+  CHECK(tx_events[sends_before + 1].function == SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE &&
+        tx_events[sends_before + 1].address == 109 &&
+        tx_events[sends_before + 1].value == 1 &&
+        tx_events[sends_before + 1].baudrate == 38400);
+  CHECK(tx_events[sends_before + 2].function == SSF_MEMS_MODBUS_FUNC_READ &&
+        tx_events[sends_before + 2].baudrate == 115200);
+  CHECK(tx_events[sends_before + 2].sent_at >=
+        tx_events[sends_before + 1].sent_at + SSF_MEMS_SENSOR_REBOOT_DELAY_MS);
+  CHECK(sleep_count == 1 && slept_ms == SSF_MEMS_SENSOR_REBOOT_DELAY_MS && reboots == 1);
 
   sends_before = sends;
   NO_SEND(ssf_mems_protocol_set_baudrate(
@@ -859,6 +1026,701 @@ static void test_baudrate_management(void) {
   NO_SEND(ssf_mems_protocol_get_baudrate(&serial, NULL, 0), -EINVAL);
 }
 
+static void shutdown_during_reboot(void) {
+  CHECK(serial.baudrate == 9600 && sends == 2);
+  ssf_mems_modbus_request_remove(&sensor);
+}
+
+static void shutdown_during_verification_retry(void) {
+  if (sends > 2)
+    ssf_mems_modbus_request_remove(&sensor);
+}
+
+static void test_baudrate_reboot(void) {
+  enum ssf_mems_baudrate found;
+  unsigned long before;
+  size_t i;
+  const int uncertain_modes[] = {REPLY_NONE, REPLY_BAD_CRC};
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
+  if (!ssf_mems_modbus_find_reg(40110)) {
+    NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50),
+            -ENOENT);
+    return;
+  }
+
+  /* 普通写 40102 只暂存；读取接口不得据此宣布速率已切换。 */
+  CHECK(ssf_mems_modbus_write_reg(&serial, 40102, SSF_MEMS_BAUDRATE_115200, 50) == 0);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_9600 && !reboots);
+  CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200 && serial.baudrate == 9600);
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+
+  /* 40102 已暂存但它的应答丢失：不得继续保存或提前切换主机。 */
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  special_reply_send = 1;
+  special_reply_mode = REPLY_NONE;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -ETIMEDOUT);
+  CHECK(sends == 1 && !reboots && !sleep_count && serial.baudrate == 9600);
+  CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200);
+  special_reply_send = 0;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor.protocol.valid = true;
+  before = jiffies;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_2400, 50) == 0);
+  CHECK(!sensor.protocol.valid && jiffies >= before + SSF_MEMS_SENSOR_REBOOT_DELAY_MS);
+  CHECK(sends == 3 && reboots == 1 && sensor_baudrate == SSF_MEMS_BAUDRATE_2400);
+  CHECK(tx_events[0].baudrate == 9600 && tx_events[1].baudrate == 9600);
+  CHECK(tx_events[1].address == 109 && tx_events[1].value == 1);
+  CHECK(tx_events[2].baudrate == 2400 &&
+        tx_events[2].sent_at >= sensor_reboot_until);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  special_reply_send = 2;
+  special_reply_mode = REPLY_EXCEPTION;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -EREMOTEIO);
+  CHECK(sends == 2 && !reboots && !sleep_count && serial.baudrate == 9600);
+  CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+
+  /* 丢失/损坏保存回显：设备可能已重启，但接口必须报错并保留静默期。 */
+  for (i = 0; i < ARRAY_SIZE(uncertain_modes); i++) {
+    reset_sensor();
+    enforce_sensor_baudrate = true;
+    special_reply_send = 2;
+    special_reply_mode = uncertain_modes[i];
+    CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -ETIMEDOUT);
+    CHECK(sends == 2 && reboots == 1 && sleep_count == 1);
+    CHECK(jiffies >= sensor_reboot_until && serial.baudrate == 9600);
+    CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT);
+    special_reply_send = 0;
+    CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+    CHECK(found == SSF_MEMS_BAUDRATE_115200 && serial.baudrate == 115200);
+    CHECK(reboots == 1); /* 恢复只读，不自动重发保存命令。 */
+  }
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  special_reply_send = 3;
+  special_reply_mode = REPLY_NONE;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == 0);
+  CHECK(sends == 4 && reboots == 1 && sleep_count == 2);
+  CHECK(serial.baudrate == 115200 && sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(tx_events[3].function == 3 && tx_events[3].address == 101);
+
+  /* 实际启动时间比最小静默期长：只读重试到可通信，不再保存/重启。 */
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_115200;
+  sensor.protocol.host_baudrate = serial.baudrate = 115200;
+  sensor_extra_boot_ms = 2500;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_9600, 200) == 0);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_9600 && serial.baudrate == 9600);
+  CHECK(reboots == 1 && sends > 3 && sends <= 2 + SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS);
+  CHECK(tx_events[sends - 1].sent_at >= sensor_reboot_until);
+  CHECK(tx_events[2].sent_at < sensor_reboot_until);
+  for (i = 2; i < sends; i++)
+    CHECK(tx_events[i].function == 3 && tx_events[i].address == 101 &&
+          tx_events[i].baudrate == 9600);
+
+  /* 一直无应答必须有限结束，不能将超时或目标 UART 设置当成成功。 */
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  verification_never_replies = true;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -ETIMEDOUT);
+  CHECK(sends == 2 + SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS && reboots == 1);
+  CHECK(sleep_count == SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS && !sensor.protocol.valid);
+  CHECK(serial.baudrate == 115200 && sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_115200);
+  for (i = 2; i < sends; i++)
+    CHECK(tx_events[i].function == 3 && tx_events[i].address == 101);
+
+  /* 合法异常应答不代表启动尚未完成，不进行重试。 */
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  special_reply_send = 3;
+  special_reply_mode = REPLY_EXCEPTION;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -EREMOTEIO);
+  CHECK(sends == 3 && reboots == 1 && sleep_count == 1);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  verification_never_replies = true;
+  sleep_hook = shutdown_during_verification_retry;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -ENODEV);
+  CHECK(sends == 3 && reboots == 1 && sleep_count == 2);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  invalid_baudrate_value = true;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -EPROTO);
+  CHECK(sends == 3 && serial.baudrate == 115200 && reboots == 1);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  wrong_baudrate_value = true;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -EPROTO);
+  CHECK(sends == 3 && serial.baudrate == 115200 && reboots == 1);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  serial.baudrate_set_failure = true;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -EIO);
+  CHECK(sends == 2 && sleep_count == 1 && sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(serial.baudrate == 9600);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sleep_hook = shutdown_during_reboot;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == -ENODEV);
+  CHECK(sends == 2 && serial.baudrate_set_count == 0 && sleep_count == 1);
+}
+
+static void feed_bytes(const u8 *bytes, size_t len) {
+  CHECK(ssf_mems_rx_push(&serial, bytes, len) == (ssize_t)len);
+  sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+}
+
+/* 旧请求 40102 和新请求 40121 的应答形状完全相同。旧值不得写入新输出。 */
+static void deliver_late_response(unsigned long timeout) {
+  u8 late[] = {1, 3, 2, 0, 3, 0, 0};
+  unsigned int before = sends;
+
+  CHECK(sensor.modbus_req.busy && !sensor.modbus_req.pending);
+  CHECK(timeout > 10);
+  jiffies += timeout - 1;
+  finish_crc(late, sizeof(late));
+  feed_bytes(late, sizeof(late));
+  CHECK(sends == before && !sensor.modbus_req.pending);
+  wait_hook = NULL;
+}
+
+static void deliver_noise(unsigned long timeout) {
+  const u8 noise = 0xff;
+  CHECK(!sensor.modbus_req.pending);
+  jiffies += timeout;
+  feed_bytes(&noise, 1);
+}
+
+static void remove_during_guard(unsigned long timeout) {
+  (void)timeout;
+  ssf_mems_modbus_request_remove(&sensor);
+  wait_hook = NULL;
+}
+
+static void test_request_isolation(void) {
+  u16 value = 0xbeef;
+  unsigned long failed_at, before;
+  const u8 leftovers[] = {1, 3, 250, 1, 3, 250, 1, 3, 250, 1, 3, 250};
+
+  reset_sensor();
+  response_mode = REPLY_NONE;
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40102, &value, 40) == -ETIMEDOUT);
+  CHECK(value == 0xbeef);
+  failed_at = jiffies;
+  response_mode = REPLY_NORMAL;
+  wait_hook = deliver_late_response;
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40) == 0);
+  CHECK(value == wire_value(120) && sends == 2);
+  CHECK(jiffies >= failed_at + SSF_MEMS_MODBUS_RECOVERY_GUARD_MS + 3);
+  CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
+
+  reset_sensor();
+  forced_send_result = 3;
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40102, &value, 1500) == -EIO);
+  before = jiffies;
+  forced_send_result = -1;
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40) == 0);
+  CHECK(jiffies >= before + 1500 && value == wire_value(120));
+
+  reset_sensor();
+  feed_bytes(leftovers, sizeof(leftovers));
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40) == 0);
+  CHECK(value == wire_value(120));
+  check_released_slots(&sensor);
+
+  reset_sensor();
+  wait_hook = deliver_noise;
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40), -ETIMEDOUT);
+  CHECK(jiffies == SSF_MEMS_MODBUS_IDLE_WAIT_MS);
+  CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
+
+  reset_sensor();
+  sensor.modbus_req.quarantine_until = jiffies + 1000;
+  wait_hook = remove_during_guard;
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40), -ENODEV);
+  CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
+
+  reset_sensor();
+  test_wait_result = -ERESTARTSYS;
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40), -ERESTARTSYS);
+  CHECK(!sensor.modbus_req.busy);
+}
+
+static void test_receive_expiry(void) {
+  const u8 leftovers[] = {1, 3, 250, 1, 3, 250, 1, 3, 250, 1, 3, 250};
+  u8 response[] = {1, 3, 2, 0x12, 0x34, 0, 0};
+  struct callback_capture capture = {0};
+  unsigned long expiry;
+  size_t i;
+
+  reset_sensor();
+  sensor.modbus_rx.handler = capture_frame;
+  sensor.modbus_rx.handler_context = &capture;
+  finish_crc(response, sizeof(response));
+  feed_bytes(leftovers, sizeof(leftovers));
+  for (i = 0; i < ARRAY_SIZE(sensor.modbus_rx.frame); i++)
+    CHECK(atomic_read(&sensor.modbus_rx.frame[i].in_use) == SSF_MEMS_FRAME_SLOT_USED);
+  expiry = sensor.modbus_rx.expiry_work.delay;
+  jiffies = expiry - 1;
+  sensor.modbus_rx.expiry_work.work.fn(&sensor.modbus_rx.expiry_work.work);
+  CHECK(sensor.modbus_rx.frame[0].data != NULL);
+  jiffies = expiry;
+  sensor.modbus_rx.expiry_work.work.fn(&sensor.modbus_rx.expiry_work.work);
+  check_released_slots(&sensor);
+  feed_bytes(response, sizeof(response));
+  CHECK(capture.calls == 1 && capture.len == sizeof(response));
+
+  /* 即使定时任务尚未执行，新字节也会主动回收超过绝对寿命的候选帧。 */
+  ssf_mems_modbus_receive_flush(&sensor);
+  feed_bytes(leftovers, sizeof(leftovers));
+  jiffies += expiry;
+  feed_bytes(response, sizeof(response));
+  CHECK(capture.calls == 2);
+
+  /* 较低波特率按实际最长帧传输时间预留预算，分批交付的正常帧保留。 */
+  ssf_mems_modbus_receive_flush(&sensor);
+  sensor.protocol.host_baudrate = 2400;
+  feed_bytes(response, 3);
+  expiry = sensor.modbus_rx.expiry_work.delay;
+  CHECK(expiry >= 1067 + SSF_MEMS_RX_EXPIRY_MARGIN_MS);
+  jiffies += expiry - 1;
+  sensor.modbus_rx.expiry_work.work.fn(&sensor.modbus_rx.expiry_work.work);
+  feed_bytes(response + 3, sizeof(response) - 3);
+  CHECK(capture.calls == 3);
+  CHECK(memcmp(capture.bytes, response, sizeof(response)) == 0);
+}
+
+static void test_feature_settings(void) {
+  u16 value = 999;
+  unsigned int before;
+
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 0;
+  setting_registers[52] = 2;
+  setting_registers[69] = 0x03a5;
+  setting_registers[120] = 5100;
+  CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_FIRMWARE_VERSION,
+                                       &value, 0) == 0 && value == 5100);
+  CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
+                                       &value, 0) == 0 && value == 2);
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                        6, 0) == 0);
+  CHECK(setting_registers[51] == 6 && setting_registers[52] == 2);
+  CHECK(tx_events[sends - 2].function == 6 &&
+        tx_events[sends - 2].address == 51 && tx_events[sends - 2].value == 6);
+  before = sends;
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                        6, 0) == 0);
+  CHECK(sends == before + 1); /* 相同采样率只读一次，避免重复触发固件 Flash 保存。 */
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                        SSF_MEMS_SAMPLING_RATE_MAX_INDEX, 0) == 0);
+  CHECK(setting_registers[51] == 9 && setting_registers[52] == 2);
+  CHECK(tx_events[sends - 2].function == 6 &&
+        tx_events[sends - 2].address == 51 && tx_events[sends - 2].value == 9);
+  before = sends;
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                        SSF_MEMS_SAMPLING_RATE_MAX_INDEX, 0) == 0);
+  CHECK(sends == before + 1);
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE,
+                                        63, 0) == 0);
+  CHECK(setting_registers[69] == 0xffa5); /* 全开特征，但保留报警/关系/保留位。 */
+  CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE,
+                                       &value, 0) == 0 && value == 63);
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE,
+                                        0, 0) == 0);
+  CHECK(setting_registers[69] == 0x03a5);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE, 10, 0), -EINVAL);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, 64, 0), -EINVAL);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_PARAMETER_SWITCH, 0, 0), -EINVAL);
+  NO_SEND(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_MAX, &value, 0), -EINVAL);
+  CHECK(!reboots && !sleep_count);
+  ignore_setting_writes = true;
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                        6, 0) == -EIO);
+  response_mode = REPLY_EXCEPTION;
+  value = 999;
+  CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                       &value, 0) == -EREMOTEIO && value == 999);
+}
+
+/* 构造固件私有流测试包，包含负数和数据区内的帧头/尾标记。 */
+static void make_raw_packet(u8 *packet, u32 sequence) {
+  unsigned int i;
+  memset(packet, 0, SSF_MEMS_RAW_PACKET_BYTES);
+  packet[0] = 0x15;
+  packet[1] = sequence >> 24;
+  packet[2] = sequence >> 16;
+  packet[3] = sequence >> 8;
+  packet[4] = sequence;
+  for (i = 0; i < 64; i++) {
+    packet[5 + i * 6] = 0xff;
+    packet[6 + i * 6] = 0xfe; /* X = -2 */
+    packet[7 + i * 6] = 0x80; /* Y = -32768 */
+    packet[9 + i * 6] = 0x15;
+    packet[10 + i * 6] = 0x17; /* Z = 5399，不应误判成边界。 */
+  }
+  finish_crc(packet, 391);
+  packet[391] = 0x17;
+}
+
+/* 使用实际 FIFO/工作项分批交付流，不直接调用解码器。 */
+static void feed_raw_packet(u32 sequence) {
+  u8 packet[SSF_MEMS_RAW_PACKET_BYTES];
+  size_t offset;
+  make_raw_packet(packet, sequence);
+  for (offset = 0; offset < sizeof(packet); offset++) {
+    CHECK(ssf_mems_rx_push(&serial, packet + offset, 1) == 1);
+    sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+  }
+}
+
+/* 验证拆包、粘包、CRC、尾标记、丢字节恢复和序号回绕。 */
+static void test_raw_parser(void) {
+  u8 packet[SSF_MEMS_RAW_PACKET_BYTES];
+  size_t i;
+
+  reset_sensor();
+  sensor.raw.active = true;
+  sensor.raw.publishing = true;
+  feed_raw_packet(0xffffffffU);
+  feed_raw_packet(0);
+  CHECK(raw_published == 128 && sensor.raw.discontinuities == 0);
+  CHECK(raw_last.xyz[0] == -2 && raw_last.xyz[1] == -32768 && raw_last.xyz[2] == 5399);
+  CHECK(raw_last.packet_sequence == 0 && raw_last.sample_index == 63);
+  make_raw_packet(packet, 1);
+  packet[389] ^= 1;
+  CHECK(ssf_mems_rx_push(&serial, packet, sizeof(packet)) == sizeof(packet));
+  sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+  CHECK(raw_published == 128 && sensor.raw.crc_errors > 0);
+  feed_raw_packet(2);
+  CHECK(raw_published == 192 && sensor.raw.discontinuities == 1);
+  make_raw_packet(packet, 3);
+  packet[391] = 0;
+  for (i = 0; i < sizeof(packet); i++)
+    ssf_mems_raw_receive_byte(&sensor, packet[i]);
+  feed_raw_packet(4);
+  CHECK(raw_published == 256 && sensor.raw.discontinuities == 2);
+  raw_publish_error = -ENOSPC;
+  feed_raw_packet(5);
+  CHECK(sensor.raw.buffer_errors == 64 && sensor.raw.packets == 5);
+  sensor.raw.publishing = false;
+  feed_raw_packet(7);
+  CHECK(sensor.raw.packets == 5 && sensor.raw.discontinuities == 2);
+  CHECK(sensor.raw.drain_packets == 1 && sensor.raw.drain_discontinuities == 1);
+  make_raw_packet(packet, 8);
+  packet[389] ^= 1;
+  CHECK(ssf_mems_rx_push(&serial, packet, sizeof(packet)) == sizeof(packet));
+  sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+  CHECK(sensor.raw.drain_crc_errors > 0 && raw_published == 320);
+  sensor.raw.active = false;
+}
+
+/* 首次等待交付一个真实数据包；第二次等待模拟正常采集时段结束。 */
+static void raw_wait_hook(unsigned long timeout) {
+  if (sensor.raw.active == false) {
+    test_wait_result = 0; /* 普通请求发送前的帧间空闲等待。 */
+    return;
+  }
+  CHECK(sensor.raw.active && serial.baudrate == 1000000);
+  CHECK(!sensor.modbus_req.pending && !sensor.modbus_req.busy);
+  if (sensor.raw.publishing == false) {
+    raw_gap_waits++;
+    CHECK(timeout <= SSF_MEMS_RAW_STOP_GAP_WAIT_MS);
+    if (raw_sensor_running == true) {
+      feed_raw_packet(drain_sequence++);
+      if (raw_gap_partial == true && raw_gap_waits == 1)
+        ssf_mems_raw_receive_byte(&sensor, 0x15);
+      test_wait_result = 1;
+    } else {
+      test_wait_result = 0;
+    }
+    return;
+  }
+  if (sensor.raw.packets == 0) {
+    CHECK(timeout == SSF_MEMS_RAW_START_TIMEOUT_MS);
+    if (raw_wait_action == 4)
+      jiffies += 6000; /* 实测可能超过旧的 5 秒上限。 */
+    if (raw_wait_action == 5) {
+      sensor.acquisition.stopping = true;
+      ssf_mems_modbus_request_remove(&sensor);
+      late_raw_packet_at = jiffies + 2000;
+      test_wait_result = 1;
+      return;
+    }
+    feed_raw_packet(0);
+    test_wait_result = 1;
+  } else {
+    if (raw_wait_action == 1) {
+      CHECK(timeout == 1000); /* 连续一秒无包，应提前退出。 */
+    } else if (raw_wait_action == 2) {
+      sensor.acquisition.stopping = true;
+      sensor.modbus_req.shutting_down = true;
+    } else if (raw_wait_action == 3) {
+      test_wait_result = -ERESTARTSYS;
+      return;
+    } else {
+      CHECK(timeout == 100);
+      feed_raw_packet(1);
+    }
+    test_wait_result = 0;
+  }
+}
+
+/* 保持未停止的私有流，或在首包前卸载后交付迟到包。 */
+static void raw_recovery_sleep_hook(void) {
+  if (sensor.raw.active == false || serial.baudrate != 1000000)
+    return;
+  if (late_raw_packet_at != 0) {
+    if (time_before(jiffies, late_raw_packet_at) == true)
+      return;
+    late_raw_packet_at = 0;
+    feed_raw_packet(drain_sequence++);
+  } else if (raw_sensor_running == true && sensor.raw.publishing == false) {
+    feed_raw_packet(drain_sequence++);
+  }
+}
+
+/* 回归覆盖迟到启动、停止丢失、恢复门禁、卸载确认及临时 1 Mbaud 识别。 */
+static void test_raw_recovery(void) {
+  enum ssf_mems_baudrate found = SSF_MEMS_BAUDRATE_MAX;
+  unsigned int before, i;
+  u16 value;
+
+  reset_sensor();
+  if (ssf_mems_modbus_find_reg(40058) == NULL ||
+      ssf_mems_modbus_find_reg(40059) == NULL)
+    return;
+  emulate_settings = enforce_sensor_baudrate = emulate_raw_mode = true;
+  setting_registers[51] = 6;
+  wait_hook = raw_wait_hook;
+  wait_returns_early = true;
+  raw_wait_action = 4;
+  raw_gap_partial = true;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(sensor.raw.start_wait_ms == 6000 && sensor.raw.packets == 2);
+  CHECK(raw_gap_waits == 2 && raw_published == 128);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
+
+  reset_sensor();
+  emulate_settings = enforce_sensor_baudrate = emulate_raw_mode = true;
+  setting_registers[51] = 6;
+  wait_hook = raw_wait_hook;
+  sleep_hook = raw_recovery_sleep_hook;
+  wait_returns_early = true;
+  raw_wait_action = 5;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ENODEV);
+  CHECK(sensor.raw.packets == 0 && sensor.raw.drain_packets >= 1);
+  CHECK(raw_published == 0 && sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
+  CHECK(sends == 4 && tx_events[2].sent_at >= 2000);
+  CHECK(tx_events[3].address == 101 && sensor.modbus_req.shutting_down);
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40102, &value, 50), -ENODEV);
+
+  reset_sensor();
+  emulate_settings = enforce_sensor_baudrate = emulate_raw_mode = true;
+  setting_registers[51] = 6;
+  wait_hook = raw_wait_hook;
+  sleep_hook = raw_recovery_sleep_hook;
+  ignored_raw_stops = SSF_MEMS_RAW_STOP_ATTEMPTS;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ETIMEDOUT);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
+  CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_DEFAULT);
+  CHECK(sensor.raw.active && !sensor.raw.publishing && sensor.raw.drain_packets > 0);
+  CHECK(sensor.raw.packets == 2 && sensor.raw.discontinuities == 0);
+  CHECK(sensor.raw.stop_attempts == SSF_MEMS_RAW_STOP_ATTEMPTS && !reboots);
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40102, &value, 50), -EAGAIN);
+  NO_SEND(ssf_mems_modbus_write_reg(&serial, 40102, 6, 50), -EAGAIN);
+  if (ssf_mems_modbus_find_reg(40110) != NULL)
+    NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_57600, 50), -EAGAIN);
+  before = sends;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(ssf_mems_baudrate_to_value(found) == 9600 && serial.baudrate == 9600);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
+  CHECK(tx_events[before].address == 58); /* 先停止，不扫描或写 40102/40110。 */
+  for (i = before; i < sends; i++)
+    CHECK(tx_events[i].function == 3 || tx_events[i].address == 58);
+
+  before = sends;
+  CHECK(ssf_mems_protocol_recover_raw(&sensor) == 0 && sends == before);
+  CHECK(ssf_mems_protocol_recover_raw(NULL) == -EINVAL);
+  /* 模拟线程已离开收流函数、在恢复退避中卸载。 */
+  sensor.protocol.mode = SSF_MEMS_LINK_RAW_RECOVERING;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_1000000;
+  raw_sensor_running = true;
+  ssf_mems_modbus_request_remove(&sensor);
+  NO_SEND(ssf_mems_modbus_read_reg(&serial, 40102, &value, 50), -ENODEV);
+  CHECK(ssf_mems_protocol_recover_raw(&sensor) == 0);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
+  CHECK(sensor.modbus_req.shutting_down && serial.baudrate == 9600);
+  CHECK(tx_events[before].address == 58 && tx_events[before + 1].address == 101);
+
+  reset_sensor();
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  sensor_baudrate = sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_1000000;
+  staged_baudrate = SSF_MEMS_BAUDRATE_9600;
+  sensor.protocol.host_baudrate = serial.baudrate = 1000000;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(found == SSF_MEMS_BAUDRATE_9600 && serial.baudrate == 9600);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
+  CHECK(sends == 3 && tx_events[1].address == 58);
+
+  reset_sensor();
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_1000000;
+  staged_baudrate = raw_restore_baudrate = SSF_MEMS_BAUDRATE_57600;
+  raw_sensor_running = true;
+  sleep_hook = raw_recovery_sleep_hook;
+  /* 启动目标为 9600，但遗留流退出后实际是 57600；仅只读发现，不保存。 */
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(found == SSF_MEMS_BAUDRATE_57600 && serial.baudrate == 57600);
+  CHECK(sensor.raw.drain_packets > 0 && sensor.raw.packets == 0);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
+  CHECK(!sensor.protocol.raw_baudrate_unknown);
+  for (i = 0; i < sends; i++)
+    CHECK(tx_events[i].function == 3 || tx_events[i].address == 58);
+}
+
+/* 验证启动无 ACK、临时切速、停止和恢复验证，以及失败/卸载清理。 */
+static void test_raw_session(void) {
+  reset_sensor();
+  sensor.protocol.parity = SSF_MEMS_PARITY_EVEN;
+  NO_SEND(ssf_mems_protocol_collect_raw(&sensor, 100), -EOPNOTSUPP);
+  CHECK(ssf_mems_protocol_collect_raw(NULL, 100) == -EINVAL);
+  reset_sensor();
+  if (ssf_mems_modbus_find_reg(40058) == NULL ||
+      ssf_mems_modbus_find_reg(40059) == NULL) {
+    NO_SEND(ssf_mems_protocol_collect_raw(&sensor, 100), -ENOENT);
+    return;
+  }
+  emulate_settings = true;
+  setting_registers[51] = 9;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EOPNOTSUPP);
+  CHECK(sends == 1 && !sensor.raw.active);
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  wait_hook = raw_wait_hook;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(raw_published == 128 && sensor.raw.packets == 2 && !sensor.raw.active);
+  CHECK(serial.baudrate == 9600 && sensor.protocol.host_baudrate == 9600);
+  CHECK(sends == 4 && tx_events[0].address == 51 && tx_events[1].address == 57);
+  CHECK(tx_events[2].address == 58 && tx_events[2].baudrate == 1000000);
+  CHECK(tx_events[3].address == 101 && tx_events[3].baudrate == 9600);
+  CHECK(!sensor.protocol.valid);
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  /* 不交付首包，应超时退出，但仍停止并恢复。 */
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ETIMEDOUT);
+  CHECK(serial.baudrate == 9600 && !sensor.raw.active && sends == 4);
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  wait_hook = raw_wait_hook;
+  raw_wait_action = 1;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 5000) == -ETIMEDOUT);
+  CHECK(serial.baudrate == 9600 && !sensor.raw.active && sends == 4);
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  wait_hook = raw_wait_hook;
+  raw_wait_action = 2;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ENODEV);
+  CHECK(serial.baudrate == 9600 && !sensor.raw.active && sends == 4);
+  CHECK(tx_events[2].address == 58); /* 请求模块关闭后仍执行流停止。 */
+  CHECK(tx_events[3].address == 101); /* 卸载时也确认普通通信，而非仅发送成功。 */
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  wait_hook = raw_wait_hook;
+  raw_wait_action = 3;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ERESTARTSYS);
+  CHECK(serial.baudrate == 9600 && !sensor.raw.active && sends == 4);
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[51] = 6;
+  enforce_sensor_baudrate = emulate_raw_mode = true;
+  wait_hook = raw_wait_hook;
+  fail_on_send = 3; /* 第一次停止发送失败，必须重试停止而非误发普通读。 */
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(sends == 5 && tx_events[2].address == 58 && tx_events[3].address == 58);
+  CHECK(serial.baudrate == 9600 && !sensor.raw.active);
+}
+
+/* 联合验证真实属性解析、首帧速率、枚举扫描及保存重启，不只检查目标变量。 */
+static void test_startup_baudrate_matching(void) {
+  static const struct {
+    bool has_speed;
+    u32 speed;
+    enum ssf_mems_baudrate sensor_rate;
+    unsigned int expected_target;
+  } cases[] = {
+      {false, 0, SSF_MEMS_BAUDRATE_9600, 9600},
+      {true, 0, SSF_MEMS_BAUDRATE_9600, 9600},
+      {true, 12345, SSF_MEMS_BAUDRATE_57600, 9600},
+      {true, 57600, SSF_MEMS_BAUDRATE_9600, 57600},
+      {true, 115200, SSF_MEMS_BAUDRATE_115200, 115200},
+      {true, 115200, SSF_MEMS_BAUDRATE_57600, 115200},
+  };
+  unsigned int i;
+
+  for (i = 0; i < ARRAY_SIZE(cases); i++) {
+    enum ssf_mems_baudrate found, target;
+    unsigned int before;
+
+    reset_sensor();
+    serial.dev.has_current_speed = cases[i].has_speed;
+    serial.dev.current_speed = cases[i].speed;
+    CHECK(ssf_mems_protocol_init(&sensor) == 0);
+    CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
+    target = sensor.protocol.baudrate;
+    CHECK((unsigned int)ssf_mems_baudrate_to_value(target) == cases[i].expected_target);
+    CHECK(sends == 0); /* 启动属性和主机 UART 配置不会发送 Modbus。 */
+    sensor_baudrate = cases[i].sensor_rate;
+    enforce_sensor_baudrate = true;
+    CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 200) == 0);
+    CHECK(tx_events[0].baudrate == cases[i].expected_target);
+    CHECK(ssf_mems_baudrate_to_value(found) == ssf_mems_baudrate_to_value(cases[i].sensor_rate));
+    before = sends;
+    if ((unsigned int)ssf_mems_baudrate_to_value(found) != cases[i].expected_target) {
+      if (ssf_mems_modbus_find_reg(40110) == NULL) {
+        NO_SEND(ssf_mems_protocol_set_baudrate(&serial, target, 200), -ENOENT);
+        continue;
+      }
+      CHECK(ssf_mems_protocol_set_baudrate(&serial, target, 200) == 0);
+      CHECK(sends == before + 3 && reboots == 1);
+    } else {
+      CHECK(reboots == 0 && sends == 1);
+    }
+    CHECK(serial.baudrate == cases[i].expected_target);
+    CHECK((unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate) == cases[i].expected_target);
+  }
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   test_initialization_and_cleanup();
@@ -869,7 +1731,15 @@ int main(int argc, char **argv) {
   test_requests();
   test_serial_configuration();
   test_baudrate_management();
+  test_baudrate_reboot();
+  test_request_isolation();
+  test_receive_expiry();
   test_sparse_features();
+  test_feature_settings();
+  test_raw_parser();
+  test_raw_session();
+  test_raw_recovery();
+  test_startup_baudrate_matching();
   cleanup_sensor();
   printf("PASS %-23s %u checks\n", argv[1], checks);
   return 0;

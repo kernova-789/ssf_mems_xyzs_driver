@@ -4,12 +4,13 @@
 #include <linux/types.h>
 
 struct ssf_mems_sensor_data;
+struct ssf_mems_raw_sample;
 struct ssf_mems_xyzs_data;
 
 /* 创建并注册 IIO 设备；返回 0 或负 errno。 */
 int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data);
 
-/* 先从 IIO 子系统注销再释放设备；未注册时直接返回。 */
+/* 注销 IIO 并释放 buffer；IIO 对象由 devm 回收，未注册时直接返回。 */
 void ssf_mems_iio_unregister(struct ssf_mems_xyzs_data *data);
 
 /*
@@ -20,3 +21,8 @@ void ssf_mems_iio_unregister(struct ssf_mems_xyzs_data *data);
 int ssf_mems_iio_publish_features(
     struct ssf_mems_xyzs_data *data,
     const struct ssf_mems_sensor_data *features, s64 timestamp_ns);
+
+/* 向独立原始 IIO buffer 发布 XYZ、包号及包内序号；时间戳为主机接收时间。
+ * 未启用 buffer 时不推送；调用者须在注销 IIO 前停止接收生产者。 */
+int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
+                            const struct ssf_mems_raw_sample *sample);

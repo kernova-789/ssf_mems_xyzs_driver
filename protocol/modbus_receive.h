@@ -2,6 +2,7 @@
 
 #include <linux/atomic.h>
 #include <linux/kfifo.h>
+#include <linux/mutex.h>
 #include <linux/serdev.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -13,10 +14,11 @@ struct ssf_modbus_frame_desc;
 /* 帧仅在同步回调期间有效，context 必须存活到接收清理结束，不得保存缓冲区或等待需要同一接收工作项处理的响应；返回 0 已处理，负值处理失败。 */
 typedef int (*ssf_mems_frame_handler_t)(void *context, const u8 *buf, size_t len);
 
-#define SSF_MEMS_RX_FIFO_SIZE 1024U
+#define SSF_MEMS_RX_FIFO_SIZE 16384U /* 容纳 1 Mbaud 连续流的调度抖动。 */
 #define SSF_MEMS_FRAME_SLOT_NUM 4
 #define SSF_MEMS_FRAME_SLOT_FREE 0
 #define SSF_MEMS_FRAME_SLOT_USED 1
+#define SSF_MEMS_RX_EXPIRY_MARGIN_MS 100U
 
 enum ssf_mems_rx_state {
   SSF_MEMS_RX_IDLE,
@@ -45,6 +47,7 @@ struct ssf_mems_frame_slot {
   u8 slave_id;
   u8 function;
   const struct ssf_modbus_frame_desc *frame_desc; // 来自表的响应长度和布局描述
+  unsigned long started; // 候选帧创建时刻，寿命预算由当前波特率决定
 
   atomic_t in_use;
 };
@@ -54,8 +57,11 @@ struct ssf_mems_modbus_receive_state {
   struct kfifo fifo;                 // 尚未解析的接收字节流
   spinlock_t fifo_lock;              // 保护 FIFO 读写和关闭状态
   struct work_struct work;           // 从 FIFO 中分离完整帧的工作项
+  struct delayed_work expiry_work;   // 清理长期未完成的候选帧
+  struct mutex parse_lock;           // 串行化解析、过期清理和 flush
+  unsigned long last_rx;             // 最近接收字节的时间，由 fifo_lock 保护
   bool shutting_down;                // 关闭后禁止入队和调度新工作
-  bool flushing;                     // 串口参数切换时丢弃旧速率的字节
+  bool flushing;                     // 清理残留帧期间丢弃字节
   ssf_mems_frame_handler_t handler;  // 收到数据并组帧成功后自动调用这个函数指针并交出帧
   void *handler_context;             // 函数指针的上下文
   struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM]; // 候选帧上下文
@@ -68,8 +74,12 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
 /* 清理已初始化的接收状态；无返回值，停止入队/工作项并释放 FIFO 和候选帧缓冲区，空指针直接退出。 */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
 
-/* 清空 FIFO 和未完成的候选帧；串口波特率切换前调用，空指针或已关闭时直接返回。 */
+/* 清空 FIFO 和未完成候选帧；发送准备及波特率切换时调用，不得持请求锁。
+ * 空指针或已关闭时直接返回。 */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
+
+/* 最近串口接收活动，用于发送前检测空闲；包括 flush 期间被丢弃的字节。 */
+unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data);
 
 /* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);

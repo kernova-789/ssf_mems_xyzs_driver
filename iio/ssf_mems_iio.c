@@ -153,26 +153,26 @@ static const struct ssf_mems_iio_feature_desc
   {                                                                          \
       .type = (_type), .modified = 1, .channel2 = (_modifier),               \
       .extend_name = (_name), .address = (_feature),                         \
-      .scan_index = (_feature),                                               \
+      .scan_index = (_feature),                                              \
       .scan_type = {.sign = 'u',                                             \
-                    .realbits = 16,                                           \
-                    .storagebits = 16,                                        \
-                    .endianness = IIO_CPU},                                   \
+                    .realbits = 16,                                          \
+                    .storagebits = 16,                                       \
+                    .endianness = IIO_CPU},                                  \
       .info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |                         \
-                            BIT(IIO_CHAN_INFO_SCALE),                         \
+                            BIT(IIO_CHAN_INFO_SCALE),                        \
   }
 
 #define SSF_MEMS_IIO_NAMED_CHANNEL(_type, _channel, _name, _feature)         \
   {                                                                          \
       .type = (_type), .indexed = 1, .channel = (_channel),                  \
       .extend_name = (_name), .address = (_feature),                         \
-      .scan_index = (_feature),                                               \
+      .scan_index = (_feature),                                              \
       .scan_type = {.sign = 'u',                                             \
-                    .realbits = 16,                                           \
-                    .storagebits = 16,                                        \
-                    .endianness = IIO_CPU},                                   \
+                    .realbits = 16,                                          \
+                    .storagebits = 16,                                       \
+                    .endianness = IIO_CPU},                                  \
       .info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |                         \
-                            BIT(IIO_CHAN_INFO_SCALE),                         \
+                            BIT(IIO_CHAN_INFO_SCALE),                        \
   }
 
 static const struct iio_chan_spec ssf_mems_iio_channels[] = {
@@ -278,7 +278,7 @@ static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
   desc = &ssf_mems_iio_feature_descs[chan->address];
 
   ret = ssf_mems_protocol_get_features(state->data->serdev, &features);
-  if (ret)
+  if (ret != 0)
     return ret;
 
   if (desc->width == sizeof(u16)) {
@@ -347,7 +347,7 @@ static int ssf_mems_iio_read_raw(struct iio_dev *indio_dev,
   switch (mask) {
   case IIO_CHAN_INFO_RAW:
     ret = ssf_mems_iio_read_feature(state, chan, val);
-    if (ret)
+    if (ret != 0)
       return ret;
     return IIO_VAL_INT;
   case IIO_CHAN_INFO_SCALE:
@@ -367,7 +367,7 @@ static ssize_t ssf_mems_iio_baudrate_show(struct device *dev,
   int ret;
 
   ret = ssf_mems_acquisition_get_baudrate(state->data, &baudrate);
-  if (ret)
+  if (ret != 0)
     return ret;
   value = ssf_mems_baudrate_to_value(baudrate);
   if (value < 0)
@@ -386,7 +386,7 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
   int ret;
 
   ret = kstrtouint(buf, 0, &value);
-  if (ret)
+  if (ret != 0)
     return ret;
 
   /* 数值 9600 对应显式 9600 枚举，而不是“默认”别名。 */
@@ -399,13 +399,79 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
   baudrate = i;
 
   ret = ssf_mems_acquisition_set_baudrate(state->data, baudrate);
-  if (ret)
+  if (ret != 0)
     return ret;
   return len;
 }
 
 static IIO_DEVICE_ATTR(sensor_baudrate, 0644, ssf_mems_iio_baudrate_show,
                        ssf_mems_iio_baudrate_store, 0);
+
+static const char *const ssf_mems_sampling_frequencies[] = {
+    "533.34", "888.9", "1066.68", "1333.35", "2666.7",
+    "2963", "5333.4", "8889", "13333.5", "26667",
+};
+
+static ssize_t ssf_mems_iio_setting_show(struct device *dev,
+                                        struct device_attribute *attr,
+                                        char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned long address = to_iio_dev_attr(attr)->address;
+  enum ssf_mems_sensor_setting setting = address == SSF_MEMS_SETTING_MAX ?
+      SSF_MEMS_SETTING_SAMPLING_RATE : address;
+  u16 value;
+  int ret;
+
+  ret = ssf_mems_acquisition_read_setting(state->data, setting, &value);
+  if (ret != 0)
+    return ret;
+  if (address == SSF_MEMS_SETTING_MAX) {
+    if (value >= ARRAY_SIZE(ssf_mems_sampling_frequencies))
+      return -EINVAL;
+    return sysfs_emit(buf, "%s\n", ssf_mems_sampling_frequencies[value]);
+  }
+  if (setting == SSF_MEMS_SETTING_PARAMETER_SWITCH)
+    return sysfs_emit(buf, "0x%04x\n", value);
+  return sysfs_emit(buf, "%u\n", value);
+}
+
+static ssize_t ssf_mems_iio_setting_store(struct device *dev,
+                                         struct device_attribute *attr,
+                                         const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned int value;
+  int ret;
+
+  ret = kstrtouint(buf, 0, &value);
+  if (ret != 0)
+    return ret;
+  if (value > 0xffff)
+    return -EINVAL;
+  ret = ssf_mems_acquisition_write_setting(
+      state->data, to_iio_dev_attr(attr)->address, value);
+  if (ret != 0)
+    return ret;
+  return len;
+}
+
+static IIO_DEVICE_ATTR(sensor_sampling_rate_index, 0644,
+                       ssf_mems_iio_setting_show, ssf_mems_iio_setting_store,
+                       SSF_MEMS_SETTING_SAMPLING_RATE);
+static IIO_DEVICE_ATTR(sensor_sampling_frequency, 0444,
+                       ssf_mems_iio_setting_show, NULL, SSF_MEMS_SETTING_MAX);
+static IIO_DEVICE_ATTR(sensor_sampling_length_index, 0444,
+                       ssf_mems_iio_setting_show, NULL,
+                       SSF_MEMS_SETTING_SAMPLING_LENGTH);
+static IIO_DEVICE_ATTR(sensor_parameter_switch, 0444,
+                       ssf_mems_iio_setting_show, NULL,
+                       SSF_MEMS_SETTING_PARAMETER_SWITCH);
+static IIO_DEVICE_ATTR(sensor_feature_enable, 0644,
+                       ssf_mems_iio_setting_show, ssf_mems_iio_setting_store,
+                       SSF_MEMS_SETTING_FEATURE_ENABLE);
+static IIO_DEVICE_ATTR(sensor_firmware_version, 0444,
+                       ssf_mems_iio_setting_show, NULL,
+                       SSF_MEMS_SETTING_FIRMWARE_VERSION);
+static IIO_CONST_ATTR(sensor_sampling_rate_index_available, "0 1 2 3 4 5 6 7 8 9");
 
 static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
                                           struct device_attribute *attr,
@@ -421,7 +487,7 @@ static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
   case 1:
     return sysfs_emit(buf, "%u\n", status.interval_ms);
   case 2:
-    if (!status.have_sample)
+    if (status.have_sample == false)
       return -ENODATA;
     return sysfs_emit(buf, "%u\n", status.sample_age_ms);
   default:
@@ -445,6 +511,13 @@ static struct attribute *ssf_mems_iio_attributes[] = {
     &iio_dev_attr_sensor_poll_interval_ms.dev_attr.attr,
     &iio_dev_attr_sensor_sample_age_ms.dev_attr.attr,
     &iio_const_attr_sensor_baudrate_available.dev_attr.attr,
+    &iio_dev_attr_sensor_sampling_rate_index.dev_attr.attr,
+    &iio_dev_attr_sensor_sampling_frequency.dev_attr.attr,
+    &iio_dev_attr_sensor_sampling_length_index.dev_attr.attr,
+    &iio_dev_attr_sensor_parameter_switch.dev_attr.attr,
+    &iio_dev_attr_sensor_feature_enable.dev_attr.attr,
+    &iio_dev_attr_sensor_firmware_version.dev_attr.attr,
+    &iio_const_attr_sensor_sampling_rate_index_available.dev_attr.attr,
     NULL,
 };
 
@@ -473,9 +546,9 @@ static int ssf_mems_iio_push_buffer(
   size_t offset = 0;
   unsigned int bit;
 
-  if (!iio_buffer_enabled(indio_dev))
+  if (iio_buffer_enabled(indio_dev) == false)
     return 0;
-  if (!indio_dev->active_scan_mask)
+  if (indio_dev->active_scan_mask == NULL)
     return -EINVAL;
   if (indio_dev->scan_bytes > sizeof(scan))
     return -EOVERFLOW;
@@ -492,7 +565,7 @@ static int ssf_mems_iio_push_buffer(
     offset += desc->width;
   }
 
-  if (!timestamp_ns)
+  if (timestamp_ns == 0)
     timestamp_ns = iio_get_time_ns(indio_dev);
   return iio_push_to_buffers_with_timestamp(indio_dev, scan, timestamp_ns);
 }
@@ -502,31 +575,38 @@ int ssf_mems_iio_publish_features(
     const struct ssf_mems_sensor_data *features, s64 timestamp_ns) {
   int ret;
 
-  if (!data || !features)
+  if (data == NULL || features == NULL)
     return -EINVAL;
 
   ret = ssf_mems_protocol_store_features(data, features);
-  if (ret)
+  if (ret != 0)
     return ret;
-  if (!data->indio_dev)
+  if (data->indio_dev == NULL)
     return -ENODEV;
 
-  return ssf_mems_iio_push_buffer(data->indio_dev, features, timestamp_ns);
+  /* IIO 配置 buffer/扫描掩码时同样持有 mlock。覆盖检查、打包和推送整个
+   * 步骤，防止中途关闭 buffer 或释放 active_scan_mask。采集停止后才注销
+   * IIO；这里不获取 info_exist_lock，也不在 buffer 回调中获取采集锁。 */
+  mutex_lock(&data->indio_dev->mlock);
+  ret = ssf_mems_iio_push_buffer(data->indio_dev, features, timestamp_ns);
+  mutex_unlock(&data->indio_dev->mlock);
+  return ret;
 }
 
-int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
+/* 注册原有特征设备；由统一注册入口负责原始设备失败时的回滚。 */
+static int ssf_mems_iio_register_features(struct ssf_mems_xyzs_data *data) {
   struct iio_buffer *buffer;
   struct ssf_mems_iio_state *state;
   struct iio_dev *indio_dev;
   int ret;
 
-  if (!data || !data->serdev)
+  if (data == NULL || data->serdev == NULL)
     return -EINVAL;
-  if (data->indio_dev)
+  if (data->indio_dev != NULL)
     return -EBUSY;
 
-  indio_dev = iio_device_alloc(&data->serdev->dev, sizeof(*state));
-  if (!indio_dev)
+  indio_dev = devm_iio_device_alloc(&data->serdev->dev, sizeof(*state));
+  if (indio_dev == NULL)
     return -ENOMEM;
 
   state = iio_priv(indio_dev);
@@ -539,16 +619,14 @@ int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
   indio_dev->setup_ops = &ssf_mems_iio_buffer_ops;
 
   buffer = iio_kfifo_allocate();
-  if (!buffer) {
-    iio_device_free(indio_dev);
+  if (buffer == NULL) {
     return -ENOMEM;
   }
   iio_device_attach_buffer(indio_dev, buffer);
 
   ret = iio_device_register(indio_dev);
-  if (ret) {
+  if (ret != 0) {
     iio_kfifo_free(indio_dev->buffer);
-    iio_device_free(indio_dev);
     return ret;
   }
 
@@ -556,12 +634,220 @@ int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
   return 0;
 }
 
+/* 一个原始扫描字段的内存布局；无需复制带有填充字节的整个结构体。 */
+struct ssf_mems_raw_field {
+  size_t offset; /* 字段在 ssf_mems_raw_sample 中的字节偏移。 */
+  size_t width; /* 字段的存储字节数，也是 IIO 扫描对齐宽度。 */
+};
+
+static const struct ssf_mems_raw_field ssf_mems_raw_fields[] = {
+    {offsetof(struct ssf_mems_raw_sample, xyz[0]), sizeof(s16)},
+    {offsetof(struct ssf_mems_raw_sample, xyz[1]), sizeof(s16)},
+    {offsetof(struct ssf_mems_raw_sample, xyz[2]), sizeof(s16)},
+    {offsetof(struct ssf_mems_raw_sample, packet_sequence), sizeof(u32)},
+    {offsetof(struct ssf_mems_raw_sample, sample_index), sizeof(u16)},
+};
+
+#define SSF_MEMS_RAW_AXIS(_axis, _index)                                    \
+  {.type = IIO_ACCEL, .modified = 1, .channel2 = (_axis),                    \
+   .scan_index = (_index), .info_mask_separate = BIT(IIO_CHAN_INFO_SCALE),   \
+   .scan_type = {.sign = 's', .realbits = 16, .storagebits = 16,              \
+                 .endianness = IIO_CPU}}
+
+static const struct iio_chan_spec ssf_mems_raw_channels[] = {
+    SSF_MEMS_RAW_AXIS(IIO_MOD_X, 0),
+    SSF_MEMS_RAW_AXIS(IIO_MOD_Y, 1),
+    SSF_MEMS_RAW_AXIS(IIO_MOD_Z, 2),
+    {.type = IIO_COUNT, .indexed = 1, .channel = 0,
+     .extend_name = "packet_sequence", .scan_index = 3,
+     .scan_type = {.sign = 'u', .realbits = 32, .storagebits = 32,
+                   .endianness = IIO_CPU}},
+    {.type = IIO_COUNT, .indexed = 1, .channel = 1,
+     .extend_name = "sample_index", .scan_index = 4,
+     .scan_type = {.sign = 'u', .realbits = 16, .storagebits = 16,
+                   .endianness = IIO_CPU}},
+    IIO_CHAN_SOFT_TIMESTAMP(5),
+};
+
+/* 原始 ADC 单位为 16/32768 g，IIO 加速度 scale 使用 m/s²，九位小数。 */
+static int ssf_mems_raw_read_scale(struct iio_dev *indio_dev,
+                                   const struct iio_chan_spec *chan,
+                                   int *val, int *val2, long mask) {
+  if (chan->type != IIO_ACCEL || mask != IIO_CHAN_INFO_SCALE)
+    return -EINVAL;
+  *val = 0;
+  *val2 = 4788403; /* 9.80665 * 16 / 32768，四舍五入到纳米单位。 */
+  return IIO_VAL_INT_PLUS_NANO;
+}
+
+/* 读取最近一轮原始采集统计；不会发送任何串口命令。 */
+static ssize_t ssf_mems_raw_status_show(struct device *dev,
+                                       struct device_attribute *attr,
+                                       char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_raw_state *raw = &state->data->raw;
+  unsigned int value;
+
+  switch (to_iio_dev_attr(attr)->address) {
+  case 0: value = READ_ONCE(raw->active); break;
+  case 1: value = READ_ONCE(raw->packets); break;
+  case 2: value = READ_ONCE(raw->discontinuities); break;
+  case 3: value = READ_ONCE(raw->crc_errors); break;
+  case 4: value = READ_ONCE(raw->buffer_errors); break;
+  case 5:
+    if (READ_ONCE(raw->packets) == 0 && READ_ONCE(raw->active) == false)
+      return -ENODATA;
+    value = READ_ONCE(raw->sampling_rate_index);
+    if (value >= ARRAY_SIZE(ssf_mems_sampling_frequencies))
+      return -ENODATA;
+    return sysfs_emit(buf, "%s\n", ssf_mems_sampling_frequencies[value]);
+  case 6: value = READ_ONCE(raw->drain_packets); break;
+  case 7: value = READ_ONCE(raw->drain_discontinuities); break;
+  case 8: value = READ_ONCE(raw->drain_crc_errors); break;
+  case 9: value = READ_ONCE(raw->start_wait_ms); break;
+  case 10: value = READ_ONCE(raw->stop_attempts); break;
+  case 11: value = READ_ONCE(state->data->protocol.mode); break;
+  case 12: value = READ_ONCE(raw->publishing); break;
+  default: return -EINVAL;
+  }
+  return sysfs_emit(buf, "%u\n", value);
+}
+
+static IIO_DEVICE_ATTR(raw_active, 0444, ssf_mems_raw_status_show, NULL, 0);
+static IIO_DEVICE_ATTR(raw_packets, 0444, ssf_mems_raw_status_show, NULL, 1);
+static IIO_DEVICE_ATTR(raw_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL, 2);
+static IIO_DEVICE_ATTR(raw_crc_errors, 0444, ssf_mems_raw_status_show, NULL, 3);
+static IIO_DEVICE_ATTR(raw_buffer_drops, 0444, ssf_mems_raw_status_show, NULL, 4);
+static IIO_DEVICE_ATTR(raw_sampling_frequency, 0444,
+                       ssf_mems_raw_status_show, NULL, 5);
+/* 有效采集和排空分开观测；这些属性只读，不触发串口请求。 */
+static IIO_DEVICE_ATTR(raw_drain_packets, 0444, ssf_mems_raw_status_show, NULL, 6);
+static IIO_DEVICE_ATTR(raw_drain_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL, 7);
+static IIO_DEVICE_ATTR(raw_drain_crc_errors, 0444, ssf_mems_raw_status_show, NULL, 8);
+static IIO_DEVICE_ATTR(raw_start_wait_ms, 0444, ssf_mems_raw_status_show, NULL, 9);
+static IIO_DEVICE_ATTR(raw_stop_attempts, 0444, ssf_mems_raw_status_show, NULL, 10);
+static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL, 11);
+static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL, 12);
+
+static struct attribute *ssf_mems_raw_attributes[] = {
+    &iio_dev_attr_raw_active.dev_attr.attr,
+    &iio_dev_attr_raw_packets.dev_attr.attr,
+    &iio_dev_attr_raw_sequence_gaps.dev_attr.attr,
+    &iio_dev_attr_raw_crc_errors.dev_attr.attr,
+    &iio_dev_attr_raw_buffer_drops.dev_attr.attr,
+    &iio_dev_attr_raw_sampling_frequency.dev_attr.attr,
+    &iio_dev_attr_raw_drain_packets.dev_attr.attr,
+    &iio_dev_attr_raw_drain_sequence_gaps.dev_attr.attr,
+    &iio_dev_attr_raw_drain_crc_errors.dev_attr.attr,
+    &iio_dev_attr_raw_start_wait_ms.dev_attr.attr,
+    &iio_dev_attr_raw_stop_attempts.dev_attr.attr,
+    &iio_dev_attr_raw_link_mode.dev_attr.attr,
+    &iio_dev_attr_raw_publishing.dev_attr.attr,
+    NULL,
+};
+
+static const struct attribute_group ssf_mems_raw_attribute_group = {
+    .attrs = ssf_mems_raw_attributes,
+};
+
+static const struct iio_info ssf_mems_raw_info = {
+    .attrs = &ssf_mems_raw_attribute_group,
+    .read_raw = ssf_mems_raw_read_scale,
+};
+
+/* 按 active_scan_mask 打包原始字段；与 buffer 重配置共享 mlock。 */
+int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
+                            const struct ssf_mems_raw_sample *sample) {
+  u8 scan[24] __aligned(sizeof(s64)) = {0};
+  struct iio_dev *indio_dev;
+  unsigned int bit;
+  size_t offset = 0;
+  int ret = 0;
+
+  if (data == NULL || sample == NULL)
+    return -EINVAL;
+  indio_dev = data->raw_indio_dev;
+  if (indio_dev == NULL)
+    return -ENODEV;
+  mutex_lock(&indio_dev->mlock);
+  if (iio_buffer_enabled(indio_dev) == false)
+    goto out;
+  if (indio_dev->active_scan_mask == NULL || indio_dev->scan_bytes > sizeof(scan)) {
+    ret = -EINVAL;
+    goto out;
+  }
+  for_each_set_bit(bit, indio_dev->active_scan_mask,
+                   ARRAY_SIZE(ssf_mems_raw_fields)) {
+    const struct ssf_mems_raw_field *field = &ssf_mems_raw_fields[bit];
+
+    offset = ALIGN(offset, field->width);
+    memcpy(scan + offset, (const u8 *)sample + field->offset, field->width);
+    offset += field->width;
+  }
+  ret = iio_push_to_buffers_with_timestamp(indio_dev, scan,
+                                           iio_get_time_ns(indio_dev));
+out:
+  mutex_unlock(&indio_dev->mlock);
+  return ret;
+}
+
+/* 注册独立的原始数据 IIO 设备，保持原有特征扫描 ABI 不变。 */
+static int ssf_mems_iio_register_raw(struct ssf_mems_xyzs_data *data) {
+  struct ssf_mems_iio_state *state;
+  struct iio_dev *indio_dev;
+  struct iio_buffer *buffer;
+  int ret;
+
+  indio_dev = devm_iio_device_alloc(&data->serdev->dev, sizeof(*state));
+  if (indio_dev == NULL)
+    return -ENOMEM;
+  state = iio_priv(indio_dev);
+  state->data = data;
+  indio_dev->name = "ssf_mems_xyzs_raw";
+  indio_dev->info = &ssf_mems_raw_info;
+  indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_SOFTWARE;
+  indio_dev->channels = ssf_mems_raw_channels;
+  indio_dev->num_channels = ARRAY_SIZE(ssf_mems_raw_channels);
+  indio_dev->setup_ops = &ssf_mems_iio_buffer_ops;
+  buffer = iio_kfifo_allocate();
+  if (buffer == NULL)
+    return -ENOMEM;
+  iio_device_attach_buffer(indio_dev, buffer);
+  ret = iio_device_register(indio_dev);
+  if (ret != 0) {
+    iio_kfifo_free(buffer);
+    return ret;
+  }
+  data->raw_indio_dev = indio_dev;
+  return 0;
+}
+
+/* 两个 IIO 设备必须全部注册成功；失败时撤销已注册设备。 */
+int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
+  int ret = ssf_mems_iio_register_features(data);
+
+  if (ret != 0)
+    return ret;
+  ret = ssf_mems_iio_register_raw(data);
+  if (ret != 0)
+    ssf_mems_iio_unregister(data);
+  return ret;
+}
+
 void ssf_mems_iio_unregister(struct ssf_mems_xyzs_data *data) {
-  if (!data || !data->indio_dev)
+  if (data == NULL)
+    return;
+
+  if (data->raw_indio_dev != NULL) {
+    iio_device_unregister(data->raw_indio_dev);
+    iio_kfifo_free(data->raw_indio_dev->buffer);
+    data->raw_indio_dev = NULL;
+  }
+  if (data->indio_dev == NULL)
     return;
 
   iio_device_unregister(data->indio_dev);
   iio_kfifo_free(data->indio_dev->buffer);
-  iio_device_free(data->indio_dev);
+  /* IIO 对象由 serdev 设备的 devres 在解绑或 probe 失败时释放。 */
   data->indio_dev = NULL;
 }

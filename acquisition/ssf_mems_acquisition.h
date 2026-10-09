@@ -15,8 +15,10 @@ enum ssf_mems_acquisition_phase {
   SSF_MEMS_ACQ_STARTUP,
   SSF_MEMS_ACQ_MATCH,
   SSF_MEMS_ACQ_SWITCH,
+  SSF_MEMS_ACQ_CONFIGURE,
   SSF_MEMS_ACQ_VERIFY,
   SSF_MEMS_ACQ_POLL,
+  SSF_MEMS_ACQ_RAW, /* 独占串口采集连续原始 XYZ，结束后回到特征轮询。 */
   SSF_MEMS_ACQ_BACKOFF,
   SSF_MEMS_ACQ_STOPPED,
 };
@@ -31,10 +33,13 @@ struct ssf_mems_acquisition_state {
   bool online;
   bool have_sample;
   enum ssf_mems_acquisition_phase phase;
-  enum ssf_mems_baudrate target_baudrate;
+  enum ssf_mems_baudrate target_baudrate; /* 启动配置/手动设置的目标，不被扫描覆盖。 */
   unsigned int retry_ms;
   unsigned long last_sample;
   struct ssf_mems_acquisition_policy policy;
+  unsigned int raw_duration_ms; /* 每轮原始采集时长；0 表示只采集特征。 */
+  unsigned int feature_duration_ms; /* 每轮特征轮询时长，不含原始模式退出时间。 */
+  unsigned long feature_until; /* 本轮特征采集结束的 jiffies 时刻。 */
 };
 
 struct ssf_mems_acquisition_status {
@@ -47,7 +52,8 @@ struct ssf_mems_acquisition_status {
 /* init 在注册 IIO 前调用，start 在 IIO 注册成功后调用。 */
 int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data);
 int ssf_mems_acquisition_start(struct ssf_mems_xyzs_data *data);
-/* 调用前关闭请求模块以唤醒在途请求；返回后才允许释放 IIO/接收资源。 */
+/* 调用前关闭请求模块以唤醒在途请求；线程退出后仍清理未确认的私有流，
+ * 返回后才允许释放 IIO/接收资源。 */
 void ssf_mems_acquisition_stop(struct ssf_mems_xyzs_data *data);
 int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *data,
                                     enum ssf_mems_baudrate *baudrate);
@@ -56,3 +62,9 @@ int ssf_mems_acquisition_set_baudrate(struct ssf_mems_xyzs_data *data,
                                     enum ssf_mems_baudrate baudrate);
 void ssf_mems_acquisition_get_status(
     struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_status *status);
+int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
+                                     enum ssf_mems_sensor_setting setting,
+                                     u16 *value);
+int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
+                                      enum ssf_mems_sensor_setting setting,
+                                      u16 value);

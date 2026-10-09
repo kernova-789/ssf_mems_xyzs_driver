@@ -4,9 +4,11 @@
 #include <linux/types.h>
 #include "sensor_data.h"
 
-/* 调试初值集中在这里；周期指相邻两轮读取的开始时间间隔。 */
-#define SSF_MEMS_POLL_INITIAL_MS 100U
-#define SSF_MEMS_POLL_MIN_MS 20U
+/* 传感器约每 4.4~4.8 s 更新一批，固定每 1 s 读一次。
+ * 周期指相邻两轮读取的开始时间间隔；相同上下限使自适应调速不改变周期。
+ * 调速算法保留，后续需要自适应时可重新设置范围。 */
+#define SSF_MEMS_POLL_INITIAL_MS 1000U
+#define SSF_MEMS_POLL_MIN_MS 1000U
 #define SSF_MEMS_POLL_MAX_MS 1000U
 #define SSF_MEMS_POLL_WINDOW 32U
 #define SSF_MEMS_POLL_PROBE_MS 30000U

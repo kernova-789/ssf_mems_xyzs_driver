@@ -446,7 +446,7 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
         .protocol_addr = 0x0039,
         .access = SSF_REG_READ,
         .type = SSF_REG_U16,
-        .read_format = SSF_RX_RAW_AXIS,
+        .read_format = SSF_RX_RAW_XYZ,
         .name = "start_xyz_continuous",
     },
     {
@@ -546,6 +546,8 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
         .access = SSF_REG_READ | SSF_REG_WRITE,
         .type = SSF_REG_U16,
         .read_format = SSF_RX_HOLDING_REGS,
+        /* MEMS2.0 makeMasterResp_6 支持单寄存器配置，无需重写整个工作块。 */
+        .write_single = true,
         .name = "parameter_switch",
     },
     {
@@ -584,6 +586,15 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
         .read_format = SSF_RX_HOLDING_REGS,
         .write_single = true,
         .name = "parity",
+    },
+    {
+        /* 固件 regHold[109]：写 1 保存 40101～40105 并重启。 */
+        .display_reg = 40110,
+        .protocol_addr = 0x006D,
+        .access = SSF_REG_WRITE,
+        .type = SSF_REG_U16,
+        .write_single = true,
+        .name = "save_config_and_reboot",
     },
     {
         .display_reg = 40121,
@@ -645,7 +656,7 @@ ssf_mems_modbus_find_rx_frame(u8 function) {
   size_t i;
 
   normal = ssf_mems_modbus_find_frame(function & ~SSF_MEMS_MODBUS_EXCEPTION_FLAG);
-  if (!normal || !(function & SSF_MEMS_MODBUS_EXCEPTION_FLAG))
+  if (normal == NULL || (function & SSF_MEMS_MODBUS_EXCEPTION_FLAG) == 0)
     return normal;
 
   for (i = 0; i < SSF_FRAME_TABLE_SIZE; i++) {

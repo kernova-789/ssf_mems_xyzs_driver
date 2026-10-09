@@ -60,16 +60,16 @@ void ssf_mems_acquisition_policy_sample(
   policy->link_failures = 0;
   policy->last_contact = now;
   policy->max_read_ms = max(policy->max_read_ms, read_ms);
-  if (policy->have_previous) {
+  if (policy->have_previous == true) {
     policy->comparisons++;
-    if (ssf_mems_sample_equal(&policy->previous, sample))
+    if (ssf_mems_sample_equal(&policy->previous, sample) == true)
       policy->repeats++;
   }
   policy->previous = *sample;
   policy->have_previous = true;
 
   /* 静止场景定期小幅提速试探，避免长期停留在最低轮询频率。 */
-  if (time_after_eq(now, policy->next_probe)) {
+  if (time_after_eq(now, policy->next_probe) == true) {
     if (policy->max_read_ms <= policy->interval_ms / 2U)
       ssf_mems_poll_faster(policy);
     policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);

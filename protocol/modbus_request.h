@@ -16,6 +16,7 @@ struct ssf_mems_modbus_request_state {
   bool busy;               // 保持占用直到等待者取走最终结果
   bool pending;            // 是否有请求正在等待
   bool shutting_down;      // 驱动是否正在关闭
+  unsigned long quarantine_until; // 超时/部分发送后，在此时间前不发送新请求
   u8 slave_id;             // 当前请求的从机地址
   struct ssf_modbus_transfer transfer; // 保存当前实际请求的帧/块/地址描述
   u16 *values;             // 当前请求的结果缓冲区
@@ -27,6 +28,9 @@ struct ssf_mems_modbus_request_state {
 #define SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS 1000U
 #define SSF_MEMS_MODBUS_MIN_WRITE_TIMEOUT_MS 100U
 #define SSF_MEMS_MODBUS_WRITE_MARGIN_MS 100U
+/* 无事务编号的 RTU 只能在已知最大响应延迟内隔离旧应答，实测后可调整。 */
+#define SSF_MEMS_MODBUS_RECOVERY_GUARD_MS 1000U
+#define SSF_MEMS_MODBUS_IDLE_WAIT_MS 1000U
 
 /* 返回 0 请求描述已生成，-EINVAL 参数/范围错误，-ENOENT 地址未入表，-EACCES 权限不足，-EOPNOTSUPP 格式不支持。 */
 int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
@@ -59,6 +63,11 @@ int ssf_mems_modbus_read_reg(struct serdev_device *serdev, u16 display_reg,
 int ssf_mems_modbus_read_reg_locked(struct serdev_device *serdev,
                                     u16 display_reg, u16 *value,
                                     unsigned int timeout_ms);
+/* 仅供协议层持 bus_lock 做只读恢复确认；允许恢复模式及请求关闭后的读取。
+ * 不重新开放普通请求，接收模块必须仍存活；用于收流退出和卸载清理。 */
+int ssf_mems_modbus_read_reg_recovery_locked(struct serdev_device *serdev,
+                                             u16 display_reg, u16 *value,
+                                             unsigned int timeout_ms);
 /* 以 0x06 写入 write_single 为真的可写寄存器；返回 0 成功，-EOPNOTSUPP 表项不支持 0x06；其余校验、发送、响应和等待错误同 ssf_mems_modbus_write_regs()。 */
 int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
                               u16 value, unsigned int timeout_ms);

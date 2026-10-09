@@ -59,7 +59,7 @@ enum ssf_rx_format {
   SSF_RX_WRITE_MULTI_ACK,
   SSF_RX_EXCEPTION,
   SSF_RX_RAW_AXIS, /* 私有原始轴数据，通用读取接口不支持。 */
-  SSF_RX_RAW_XYZ, /* 私有 0x15 数据，接收策略仍待实现。 */
+  SSF_RX_RAW_XYZ, /* 私有 0x15 XYZ 流，由独立流解析器处理。 */
 };
 
 /* 块数据是作为普通寄存器数组，还是映射到传感器特征结构体。 */

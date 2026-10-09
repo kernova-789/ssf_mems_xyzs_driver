@@ -2,6 +2,7 @@
 #include "core.h"
 #include "modbus.h"
 #include "modbus_table.h"
+#include "modbus_receive.h"
 
 #include <linux/errno.h>
 #include <linux/jiffies.h>
@@ -18,32 +19,32 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
   unsigned int access;
   u16 i;
 
-  if (!transfer || !reg_count ||
+  if (transfer == NULL || reg_count == 0 ||
       (u32)display_reg + reg_count > 0x10000U)
     return -EINVAL;
 
   frame = ssf_mems_modbus_find_frame(function);
-  if (!frame)
+  if (frame == NULL)
     return -EOPNOTSUPP;
   if (reg_count > frame->max_reg_count)
     return -EINVAL;
 
   access = frame->tx_format == SSF_TX_READ_REGS ? SSF_REG_READ : SSF_REG_WRITE;
-  if (block) {
+  if (block != NULL) {
     if (block->function != function || block->rx_format != frame->rx_format ||
         block->direction != (access == SSF_REG_READ ? SSF_CMD_READ : SSF_CMD_WRITE))
       return -EOPNOTSUPP;
-    if (!block->reg_count || (u32)block->start_display_reg + block->reg_count > 0x10000U ||
+    if (block->reg_count == 0 || (u32)block->start_display_reg + block->reg_count > 0x10000U ||
         display_reg < block->start_display_reg ||
         (u32)display_reg + reg_count > (u32)block->start_display_reg + block->reg_count)
       return -EINVAL;
-    if (!block->sparse_read &&
+    if (block->sparse_read == false &&
         (display_reg != block->start_display_reg || reg_count != block->reg_count))
       return -EINVAL;
   }
 
   first = ssf_mems_modbus_find_reg(display_reg);
-  if (!first)
+  if (first == NULL)
     return -ENOENT;
   if ((u32)first->protocol_addr + reg_count > 0x10000U)
     return -EINVAL;
@@ -51,15 +52,15 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
   for (i = 0; i < reg_count; i++) {
     const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(display_reg + i);
 
-    if (!reg)
+    if (reg == NULL)
       return -ENOENT;
-    if (!(reg->access & access))
+    if ((reg->access & access) == 0)
       return -EACCES;
     if (reg->protocol_addr != (u32)first->protocol_addr + i)
       return -EINVAL;
     if (access == SSF_REG_READ && reg->read_format != frame->rx_format)
       return -EOPNOTSUPP;
-    if (frame->tx_format == SSF_TX_WRITE_SINGLE && !reg->write_single)
+    if (frame->tx_format == SSF_TX_WRITE_SINGLE && reg->write_single == false)
       return -EOPNOTSUPP;
   }
 
@@ -81,7 +82,7 @@ ssf_mems_modbus_write_timeout_ms(const struct ssf_mems_xyzs_data *data,
   unsigned int wire_ms;
   unsigned long long bit_ms;
 
-  if (!baudrate)
+  if (baudrate == 0)
     baudrate = 9600;
   bit_ms = (unsigned long long)len * bits_per_char * 1000U;
   wire_ms = (bit_ms + baudrate - 1) / baudrate;
@@ -107,7 +108,7 @@ static int ssf_mems_modbus_send_request(
   if (len < 0)
     return len;
   buf = kmalloc(len, GFP_KERNEL);
-  if (!buf)
+  if (buf == NULL)
     return -ENOMEM;
 
   ret = ssf_mems_modbus_build_request(transfer, slave_id, values, values_count, buf, len);
@@ -136,7 +137,7 @@ out:
 int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_request_state *req;
 
-  if (!data)
+  if (data == NULL)
     return -EINVAL;
   req = &data->modbus_req;
   mutex_init(&req->lock);
@@ -144,6 +145,7 @@ int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
   req->busy = false;
   req->pending = false;
   req->shutting_down = false;
+  req->quarantine_until = jiffies;
   req->slave_id = 0;
   memset(&req->transfer, 0, sizeof(req->transfer));
   req->values = NULL;
@@ -157,7 +159,7 @@ int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
 void ssf_mems_modbus_request_remove(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_request_state *req;
 
-  if (!data)
+  if (data == NULL)
     return;
   req = &data->modbus_req;
   mutex_lock(&req->lock);
@@ -191,7 +193,7 @@ static int ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *re
   wait_ret = wait_event_interruptible_timeout(req->waitq, !READ_ONCE(req->pending),
                                                msecs_to_jiffies(timeout_ms));
   mutex_lock(&req->lock);
-  if (!req->pending) {
+  if (req->pending == false) {
     ret = req->status;
   } else {
     ret = wait_ret == 0 ? -ETIMEDOUT : -ERESTARTSYS;
@@ -202,35 +204,107 @@ static int ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *re
   return ret;
 }
 
+static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_xyzs_data *data) {
+  unsigned int baudrate = READ_ONCE(data->protocol.host_baudrate);
+  unsigned int bits = READ_ONCE(data->protocol.parity) == SSF_MEMS_PARITY_NONE ? 35U : 39U;
+
+  if (baudrate == 0)
+    baudrate = 9600;
+  return msecs_to_jiffies(max(2U, DIV_ROUND_UP(bits * 1000U, baudrate)));
+}
+
+/* 调用者持 bus_lock、保留 busy，但不持 req.lock。旧应答在 pending=false
+ * 期间只会被丢弃。等待可由卸载中断，连续噪声也不会无限阻塞。 */
+static int ssf_mems_modbus_prepare_request(struct ssf_mems_xyzs_data *data,
+                                           bool recovery_read) {
+  struct ssf_mems_modbus_request_state *req = &data->modbus_req;
+  unsigned long silent = ssf_mems_modbus_silent_ticks(data);
+  unsigned long now = jiffies;
+  unsigned long deadline = time_after(req->quarantine_until, now) ?
+                               req->quarantine_until : now;
+
+  deadline += msecs_to_jiffies(SSF_MEMS_MODBUS_IDLE_WAIT_MS);
+  for (;;) {
+    unsigned long quiet_until;
+    unsigned long remaining = 0;
+    long wait_ret;
+
+    if (READ_ONCE(req->shutting_down) == true && recovery_read == false)
+      return -ENODEV;
+    now = jiffies;
+    quiet_until = ssf_mems_modbus_receive_last_activity(data) + silent;
+    if (time_before(now, req->quarantine_until) == true)
+      remaining = req->quarantine_until - now;
+    if (time_before(now, quiet_until) == true)
+      remaining = max(remaining, quiet_until - now);
+    if (remaining == 0) {
+      /* 绝不能持 req.lock 同步取消接收工作项，回调会获取该锁。 */
+      ssf_mems_modbus_receive_flush(data);
+      if (time_after_eq(jiffies,
+                        ssf_mems_modbus_receive_last_activity(data) + silent) == true)
+        return READ_ONCE(req->shutting_down) == true && recovery_read == false ?
+                   -ENODEV : 0;
+    }
+    now = jiffies;
+    if (time_after_eq(now, deadline) == true)
+      return -ETIMEDOUT;
+    if (remaining == 0)
+      remaining = silent;
+    remaining = min(remaining, deadline - now);
+    wait_ret = wait_event_interruptible_timeout(
+        req->waitq, READ_ONCE(req->shutting_down) == true &&
+                        recovery_read == false, remaining);
+    if (wait_ret < 0)
+      return -ERESTARTSYS;
+  }
+}
+
 /* 执行已校验请求；返回 0 成功，-EINVAL 空设备，-ENODEV 无驱动数据/关闭中，-EBUSY 请求占用；其他负值来自发送、响应或等待。 */
 static int ssf_mems_modbus_execute(struct serdev_device *serdev,
                                   const struct ssf_modbus_transfer *transfer,
                                   const u16 *tx_values, size_t tx_values_count,
                                   u16 *rx_values, size_t rx_values_count,
                                   unsigned int timeout_ms,
-                                  bool bus_locked) {
+                                  bool bus_locked, bool recovery_read) {
   struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_request_state *req;
   int ret;
 
-  if (!serdev)
+  if (serdev == NULL)
     return -EINVAL;
   data = serdev_device_get_drvdata(serdev);
-  if (!data)
+  if (data == NULL)
     return -ENODEV;
-  if (!timeout_ms)
+  if (timeout_ms == 0)
     timeout_ms = SSF_MEMS_MODBUS_DEFAULT_TIMEOUT_MS;
-  if (!bus_locked)
+  if (bus_locked == false)
     mutex_lock(&data->protocol.bus_lock);
 
   req = &data->modbus_req;
   mutex_lock(&req->lock);
-  if (req->shutting_down) {
+  if (req->shutting_down == true && recovery_read == false) {
     ret = -ENODEV;
     goto out_unlock;
   }
-  if (req->busy) {
+  /* 未确认退出私有流时，只有专用只读恢复接口可以使用总线。
+   * 关闭优先返回 -ENODEV，不能让卸载期间的普通调用误以为只需稍后重试。 */
+  if (data->protocol.mode != SSF_MEMS_LINK_MODBUS && recovery_read == false) {
+    ret = -EAGAIN;
+    goto out_unlock;
+  }
+  if (req->busy == true) {
     ret = -EBUSY;
+    goto out_unlock;
+  }
+
+  req->busy = true;
+  mutex_unlock(&req->lock);
+  ret = ssf_mems_modbus_prepare_request(data, recovery_read);
+  mutex_lock(&req->lock);
+  if (ret != 0 || (req->shutting_down == true && recovery_read == false)) {
+    if (ret == 0)
+      ret = -ENODEV;
+    req->busy = false;
     goto out_unlock;
   }
 
@@ -240,23 +314,27 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
   req->values_count = rx_values_count;
   req->write_value = transfer->frame->tx_format == SSF_TX_WRITE_SINGLE ? tx_values[0] : 0;
   req->status = -ETIMEDOUT;
-  req->busy = true;
   req->pending = true;
 
   ret = ssf_mems_modbus_send_request(data, &req->transfer, req->slave_id,
                                      tx_values, tx_values_count);
-  if (ret) {
+  if (ret != 0) {
     ssf_mems_modbus_finish_request(req, ret);
     req->busy = false;
-    goto out_unlock;
+    mutex_unlock(&req->lock);
+  } else {
+    ret = ssf_mems_modbus_wait_request(req, timeout_ms);
   }
-  ret = ssf_mems_modbus_wait_request(req, timeout_ms);
+  /* bus_lock 保证这里及下一次 prepare 的 guard 不会被其他请求覆盖。 */
+  if (ret != 0 && ret != -EREMOTEIO && ret != -ENOMEM && ret != -ENODEV)
+    req->quarantine_until = jiffies + msecs_to_jiffies(
+        max(SSF_MEMS_MODBUS_RECOVERY_GUARD_MS, timeout_ms));
   goto out_bus_unlock;
 
 out_unlock:
   mutex_unlock(&req->lock);
 out_bus_unlock:
-  if (!bus_locked)
+  if (bus_locked == false)
     mutex_unlock(&data->protocol.bus_lock);
   return ret;
 }
@@ -269,14 +347,14 @@ static int ssf_mems_modbus_read_block_range_common(
   struct ssf_modbus_transfer transfer;
   int ret;
 
-  if (!serdev || !values || values_count < reg_count)
+  if (serdev == NULL || values == NULL || values_count < reg_count)
     return -EINVAL;
   ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_READ, display_reg,
                                      reg_count, block, &transfer);
-  if (ret)
+  if (ret != 0)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, NULL, 0, values,
-                                 values_count, timeout_ms, bus_locked);
+                                 values_count, timeout_ms, bus_locked, false);
 }
 
 int ssf_mems_modbus_read_block_range(struct serdev_device *serdev,
@@ -319,6 +397,23 @@ int ssf_mems_modbus_read_reg_locked(struct serdev_device *serdev,
       serdev, NULL, display_reg, 1, value, 1, timeout_ms, true);
 }
 
+/* 退出原始流时仍需确认普通应答，不能因 shutting_down 而省略确认。 */
+int ssf_mems_modbus_read_reg_recovery_locked(struct serdev_device *serdev,
+                                             u16 display_reg, u16 *value,
+                                             unsigned int timeout_ms) {
+  struct ssf_modbus_transfer transfer;
+  int ret;
+
+  if (serdev == NULL || value == NULL)
+    return -EINVAL;
+  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_READ, display_reg,
+                                     1, NULL, &transfer);
+  if (ret != 0)
+    return ret;
+  return ssf_mems_modbus_execute(serdev, &transfer, NULL, 0, value, 1,
+                                 timeout_ms, true, true);
+}
+
 /* 返回 0 单寄存器写入成功，-EOPNOTSUPP 表项不支持 0x06；其余校验、发送、响应和等待错误同多寄存器写入。 */
 static int ssf_mems_modbus_write_reg_common(struct serdev_device *serdev,
                                             u16 display_reg, u16 value,
@@ -327,14 +422,14 @@ static int ssf_mems_modbus_write_reg_common(struct serdev_device *serdev,
   struct ssf_modbus_transfer transfer;
   int ret;
 
-  if (!serdev)
+  if (serdev == NULL)
     return -EINVAL;
   ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
                                      display_reg, 1, NULL, &transfer);
-  if (ret)
+  if (ret != 0)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, &value, 1, NULL, 0,
-                                 timeout_ms, bus_locked);
+                                 timeout_ms, bus_locked, false);
 }
 
 int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
@@ -357,14 +452,14 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
   struct ssf_modbus_transfer transfer;
   int ret;
 
-  if (!serdev || !values || values_count < reg_count)
+  if (serdev == NULL || values == NULL || values_count < reg_count)
     return -EINVAL;
   ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_MULTI,
                                      display_reg, reg_count, NULL, &transfer);
-  if (ret)
+  if (ret != 0)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, values, values_count,
-                                 NULL, 0, timeout_ms, false);
+                                 NULL, 0, timeout_ms, false, false);
 }
 
 /* 按表中块描述执行写入；返回 0 成功，-EINVAL 参数/范围错误，-EOPNOTSUPP 不是可写块或格式不支持；其他负值同连续写入。 */
@@ -375,16 +470,16 @@ static int ssf_mems_modbus_write_block_common(
   struct ssf_modbus_transfer transfer;
   int ret;
 
-  if (!serdev || !block || !values || values_count < block->reg_count)
+  if (serdev == NULL || block == NULL || values == NULL || values_count < block->reg_count)
     return -EINVAL;
   if (block->direction != SSF_CMD_WRITE)
     return -EOPNOTSUPP;
   ret = ssf_mems_modbus_plan_request(block->function, block->start_display_reg,
                                      block->reg_count, block, &transfer);
-  if (ret)
+  if (ret != 0)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, values, values_count,
-                                 NULL, 0, timeout_ms, bus_locked);
+                                 NULL, 0, timeout_ms, bus_locked, false);
 }
 
 int ssf_mems_modbus_write_block(struct serdev_device *serdev,
@@ -408,11 +503,11 @@ bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
   struct ssf_mems_modbus_request_state *req;
   int ret;
 
-  if (!data || !buf)
+  if (data == NULL || buf == NULL)
     return false;
   req = &data->modbus_req;
   mutex_lock(&req->lock);
-  if (!req->pending) {
+  if (req->pending == false) {
     mutex_unlock(&req->lock);
     return false;
   }
