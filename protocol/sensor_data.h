@@ -6,7 +6,7 @@
 #define SSF_MEMS_CENTI_SCALE 100U
 #define SSF_MEMS_DECI_SCALE 10U
 
-/* 连续模式输出的一个同步 XYZ 样本，保留有符号 ADC 计数。 */
+/* 定长批次输出的一个同步 XYZ 样本，保留有符号 ADC 计数。 */
 struct ssf_mems_raw_sample {
   s16 xyz[3]; /* 固件定义的 X、Y、Z，满量程 ±16 g。 */
   u32 packet_sequence; /* 传感器包号；每包包含 64 个样本，可用于识别丢包。 */

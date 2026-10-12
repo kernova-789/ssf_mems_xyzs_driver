@@ -21,6 +21,7 @@ VARIANTS = {
     "delete_save_register": {40110},
     "delete_raw_start": {40058},
     "delete_raw_stop": {40059},
+    "delete_finite_start": {40060},
     "reverse_table": set(),
 }
 MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream")

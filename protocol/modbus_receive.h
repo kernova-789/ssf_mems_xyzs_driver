@@ -14,7 +14,7 @@ struct ssf_modbus_frame_desc;
 /* 帧仅在同步回调期间有效，context 必须存活到接收清理结束，不得保存缓冲区或等待需要同一接收工作项处理的响应；返回 0 已处理，负值处理失败。 */
 typedef int (*ssf_mems_frame_handler_t)(void *context, const u8 *buf, size_t len);
 
-#define SSF_MEMS_RX_FIFO_SIZE 16384U /* 容纳 1 Mbaud 连续流的调度抖动。 */
+#define SSF_MEMS_RX_FIFO_SIZE 16384U /* 容纳定长批次上传时的接收调度抖动。 */
 #define SSF_MEMS_FRAME_SLOT_NUM 4
 #define SSF_MEMS_FRAME_SLOT_FREE 0
 #define SSF_MEMS_FRAME_SLOT_USED 1

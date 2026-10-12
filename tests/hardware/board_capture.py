@@ -54,6 +54,8 @@ poller = select.poll()
 start = time.monotonic()
 next_status = start
 last_active = None
+finite = (devices['ssf_mems_xyzs_raw'] / 'raw_batch_samples').exists()
+stats['finite_batch_samples'] = 1024 if finite else None
 try:
     for name, device in devices.items():
         assert (device / 'buffer/enable').read_text().strip() == '0', device
@@ -71,7 +73,13 @@ try:
         streams[fd] = dict(name=name, size=size, output=stream, pending=b'')
     print('capture started', json.dumps({k: v['scan_bytes'] for k, v in stats.items()
                                          if isinstance(v, dict)}, ensure_ascii=False), flush=True)
-    while time.monotonic() - start < duration:
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= duration and (not finite or last_raw is None or
+                                    last_raw[:2] == (15, 63)):
+            break
+        if elapsed >= duration + 30:
+            raise RuntimeError('finite capture could not finish at a batch boundary')
         for fd, events in poller.poll(100):
             assert events & (select.POLLERR | select.POLLHUP | select.POLLNVAL) == 0, events
             stream = streams[fd]
@@ -104,7 +112,9 @@ try:
                         expected = ((old_seq + (old_index == 63)) & 0xffffffff,
                                     (old_index + 1) % 64)
                         if (sequence, index) != expected:
-                            if sequence == 0 and index == 0 and timestamp - old_timestamp > 1000000000:
+                            if sequence == 0 and index == 0 and (
+                                    (finite and (old_seq, old_index) == (15, 63)) or
+                                    (not finite and timestamp - old_timestamp > 1000000000)):
                                 stats['raw_sessions'] += 1
                             else:
                                 stats['sequence_breaks'] += 1
@@ -128,6 +138,12 @@ try:
                        'raw_start_wait_ms', 'raw_stop_attempts',
                        'raw_link_mode', 'raw_publishing')}
             values['elapsed'] = round(now - start, 3)
+            # 累计交付数用于检查整轮是否持续推进，不触发额外串口请求。
+            values['raw_records'] = stats['raw_records']
+            values['feature_records'] = stats['feature_records']
+            if finite:
+                values.update({name: int((raw / name).read_text()) for name in
+                               ('raw_batches', 'raw_batch_packets', 'raw_ignored_bytes')})
             stats['raw_status'].append(values)
             if (values['raw_active'], values['raw_link_mode'], values['raw_publishing']) != last_active:
                 stats['phase_changes'].append(values)

@@ -80,6 +80,10 @@ int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
                                u16 reg_count, const u16 *values,
                                size_t values_count, unsigned int timeout_ms);
+/* 同 write_regs，但调用者已持 protocol.bus_lock；仅配置指定范围。 */
+int ssf_mems_modbus_write_regs_locked(
+    struct serdev_device *serdev, u16 display_reg, u16 reg_count,
+    const u16 *values, size_t values_count, unsigned int timeout_ms);
 /* 按块描述执行写入，保留功能码/响应格式/方向和固定范围校验；返回 0 成功，-EINVAL 参数错误，-EOPNOTSUPP 不是可写块或格式不支持；其余负值同 ssf_mems_modbus_write_regs()。 */
 int ssf_mems_modbus_write_block(struct serdev_device *serdev,
                                 const struct ssf_block_cmd_desc *block,

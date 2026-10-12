@@ -18,7 +18,7 @@ enum ssf_mems_acquisition_phase {
   SSF_MEMS_ACQ_CONFIGURE,
   SSF_MEMS_ACQ_VERIFY,
   SSF_MEMS_ACQ_POLL,
-  SSF_MEMS_ACQ_RAW, /* 独占串口采集连续原始 XYZ，结束后回到特征轮询。 */
+  SSF_MEMS_ACQ_RAW, /* 独占串口采集定长 XYZ 批次，完成窗口后回到特征轮询。 */
   SSF_MEMS_ACQ_BACKOFF,
   SSF_MEMS_ACQ_STOPPED,
 };
@@ -37,7 +37,7 @@ struct ssf_mems_acquisition_state {
   unsigned int retry_ms;
   unsigned long last_sample;
   struct ssf_mems_acquisition_policy policy;
-  unsigned int raw_duration_ms; /* 每轮原始采集时长；0 表示只采集特征。 */
+  unsigned int raw_duration_ms; /* 每轮定长批采集窗口；收完在途批次，0 表示仅特征。 */
   unsigned int feature_duration_ms; /* 每轮特征轮询时长，不含原始模式退出时间。 */
   unsigned long feature_until; /* 本轮特征采集结束的 jiffies 时刻。 */
 };

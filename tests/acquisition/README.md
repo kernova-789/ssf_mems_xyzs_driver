@@ -15,7 +15,7 @@ low-baud response budgets, thread creation failure and shutdown guards.
 Sensor-setting cases check offline/shutdown rejection, request timeouts,
 cache invalidation after successful writes or lost acknowledgments, and resetting
 the polling policy after a successful configuration change.
-Connection cases check device-tree-derived targets and the 9600 baud / index 6 defaults, downgrading a
+Connection cases check device-tree-derived startup hints and the 128000 baud / index 6 operational defaults, downgrading a
 sensor that still holds the former maximum settings, configuring
 sampling after baud verification and before publishing, skipping already-matching
 settings, retrying a lost sampling acknowledgment without repeating the write,

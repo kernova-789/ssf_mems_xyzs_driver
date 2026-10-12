@@ -61,17 +61,15 @@ int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
                                    u16 value, unsigned int timeout_ms);
 
 /* 保存应答后禁止发送的重启等待时间；按实机最长启动时间调整。 */
-#define SSF_MEMS_SENSOR_REBOOT_DELAY_MS 1000U
+#define SSF_MEMS_SENSOR_REBOOT_DELAY_MS 8000U
 /* 保存已确认后，新速率下仅重试读取验证，不重发 Flash 保存命令。
  * 两次请求仍受请求层的超时隔离约束；仅 -ETIMEDOUT 允许重试。 */
 #define SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS 8U
 #define SSF_MEMS_BAUDRATE_VERIFY_RETRY_MS 100U
 
-/* 固件先结束特征计算再切速；首包预算不计入有效采集时长。 */
+/* 固件先完成当前特征计算，再进行定长采集和上传。 */
 #define SSF_MEMS_RAW_START_TIMEOUT_MS 15000U
-#define SSF_MEMS_RAW_STOP_ATTEMPTS 6U /* 每轮恢复最多发送六次停止命令。 */
 #define SSF_MEMS_RAW_QUIET_MS 300U /* 覆盖最低采样率约 120 ms 的包间隔。 */
-#define SSF_MEMS_RAW_STOP_GAP_WAIT_MS 300U /* RS485 停止前等待下一完整包的上限。 */
 
 /* 总线业务模式与接收格式分开：恢复未确认时不能发普通业务请求。 */
 enum ssf_mems_link_mode {
@@ -88,12 +86,11 @@ struct ssf_mems_protocol_state {
   bool valid;                           // 是否已有有效缓存
 
   struct mutex bus_lock;                // 公共 Modbus/serdev 总线锁
-  enum ssf_mems_baudrate baudrate;      // 普通通信速率；不随私有流临时切到 1 Mbaud
+  enum ssf_mems_baudrate baudrate;      // 当前通信速率；定长数据与 Modbus 共用
   enum ssf_mems_parity parity;          // 当前主机校验位，数值与 40103 一致
   unsigned int host_baudrate;           // 控制器实际波特率，用于计算发送超时
   enum ssf_mems_link_mode mode; /* bus_lock 保护的业务模式，不随解析格式切换。 */
-  unsigned long raw_start_until; /* 启动可能尚未生效的期限，防止过早确认停止。 */
-  bool raw_baudrate_unknown; /* 加载时发现遗留私有流，尚不知道退出后的普通速率。 */
+  unsigned long raw_start_until; /* 当前批次的最晚收尾时间，含启动和线上传输预算。 */
 };
 
 /* 初始化协议状态和手册默认参数，再用启动属性覆盖；缺失或读取失败时
@@ -107,12 +104,12 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data);
  * 回退到 9600。不写 40102/40103 或保存寄存器。 */
 int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data);
 
-/* 独占总线采集一段连续 XYZ：40058 启动，临时 1 Mbaud，40059 停止，
- * 恢复配置速率并验证。调用者持采集锁；退出/停止时仍执行停止和串口恢复。
- * duration_ms 从收到首包开始计时；奇偶校验或采样索引 >8 时不支持。 */
+/* 独占总线，在 duration_ms 窗口内逐批读取 1024 组 XYZ；至少完成一批。
+ * 40060 启动，保持工作波特率；窗口到期/卸载时等待在途批次自然结束。
+ * 不发送连续模式启停命令。调用者持采集锁；当前支持无校验、采样索引 0..8。 */
 int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
                                  unsigned int duration_ms);
-/* 仅在恢复未确认时重试停止；用于后台已退避时的卸载清理。
+/* 仅在恢复未确认时等待定长上传结束并只读验证；不切速、不写 Flash。
  * 调用前停止采集线程，接收状态仍须存活；普通模式下不发送任何帧。 */
 int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data);
 

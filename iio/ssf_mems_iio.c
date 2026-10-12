@@ -708,6 +708,10 @@ static ssize_t ssf_mems_raw_status_show(struct device *dev,
   case 10: value = READ_ONCE(raw->stop_attempts); break;
   case 11: value = READ_ONCE(state->data->protocol.mode); break;
   case 12: value = READ_ONCE(raw->publishing); break;
+  case 13: value = READ_ONCE(raw->batches); break;
+  case 14: value = READ_ONCE(raw->batch_packets); break;
+  case 15: value = SSF_MEMS_RAW_BATCH_SAMPLES; break;
+  case 16: value = READ_ONCE(raw->ignored_bytes); break;
   default: return -EINVAL;
   }
   return sysfs_emit(buf, "%u\n", value);
@@ -728,6 +732,11 @@ static IIO_DEVICE_ATTR(raw_start_wait_ms, 0444, ssf_mems_raw_status_show, NULL, 
 static IIO_DEVICE_ATTR(raw_stop_attempts, 0444, ssf_mems_raw_status_show, NULL, 10);
 static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL, 11);
 static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL, 12);
+/* 定长批次状态只读；包号在每批 1024 组 XYZ 后从零重新开始。 */
+static IIO_DEVICE_ATTR(raw_batches, 0444, ssf_mems_raw_status_show, NULL, 13);
+static IIO_DEVICE_ATTR(raw_batch_packets, 0444, ssf_mems_raw_status_show, NULL, 14);
+static IIO_DEVICE_ATTR(raw_batch_samples, 0444, ssf_mems_raw_status_show, NULL, 15);
+static IIO_DEVICE_ATTR(raw_ignored_bytes, 0444, ssf_mems_raw_status_show, NULL, 16);
 
 static struct attribute *ssf_mems_raw_attributes[] = {
     &iio_dev_attr_raw_active.dev_attr.attr,
@@ -743,6 +752,10 @@ static struct attribute *ssf_mems_raw_attributes[] = {
     &iio_dev_attr_raw_stop_attempts.dev_attr.attr,
     &iio_dev_attr_raw_link_mode.dev_attr.attr,
     &iio_dev_attr_raw_publishing.dev_attr.attr,
+    &iio_dev_attr_raw_batches.dev_attr.attr,
+    &iio_dev_attr_raw_batch_packets.dev_attr.attr,
+    &iio_dev_attr_raw_batch_samples.dev_attr.attr,
+    &iio_dev_attr_raw_ignored_bytes.dev_attr.attr,
     NULL,
 };
 

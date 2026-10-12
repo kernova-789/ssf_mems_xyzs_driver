@@ -60,7 +60,7 @@ The IIO device also provides:
 
 - `sensor_baudrate`: read to confirm the active communication rate using 40102,
   or write a numeric baud rate to stage 40102, save/reboot via 40110=1, wait
-  1000 ms, switch the host UART and verify the new rate. Verification retries
+  8000 ms, switch the host UART and verify the new rate. Verification retries
   timed-out reads up to eight times without repeating save writes. The sysfs
   write may therefore take several seconds. A successful write also
   changes the recovery target. The reboot wait holds the bus lock and is tunable
@@ -90,8 +90,8 @@ reports XYZ motor-run detection at a 0.06 g DC-removed peak threshold, rather
 than acquisition enable state.
 
 After registration, a background thread waits one second, matches the sensor's
-baud rate, uses `current-speed` as the target rate (9600 if missing, unreadable
-or unsupported), sets sampling-rate
+baud rate, uses `current-speed` only as a startup hint (9600 if missing, unreadable
+or unsupported), applies the operational target of 128000, sets sampling-rate
 index 6 (5333.4 Hz), and verifies a complete feature read. Matching baud rates
 and unchanged sampling settings skip writes. If the initial target rate does
 not respond, discovery finds the active rate before saving/rebooting the sensor
@@ -164,9 +164,11 @@ obj-$(CONFIG_SSF_SENSOR) += ssf_sensor/
 When building in-tree, the same top-level Makefile is evaluated by Kbuild and
 the `CONFIG_SSF_SENSOR` symbol controls whether the module is included.
 
-# 连续原始采集
+# 定长原始采集
 
-支持连续原始 XYZ 与特征轮询交替运行，默认各 5 秒。原始流在独立 IIO
+支持 1024 点定长原始 XYZ 批次与特征轮询交替运行，窗口默认各 5 秒，
+窗口到期收完在途批次；两种通信保持 128000，不再临时切到 1 Mbaud。
+批次之间有采样时间间隙，不是全时连续波形。原始数据在独立 IIO
 设备 `ssf_mems_xyzs_raw` 中提供，原有特征设备 ABI 不变；暂不计算 FFT。
 设备树时段配置、私有协议限制和 buffer 读取方法见
-[连续原始采集说明](protocol/RAW_CAPTURE.md)。
+[定长原始采集说明](protocol/RAW_CAPTURE.md)。

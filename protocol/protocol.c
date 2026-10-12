@@ -108,7 +108,6 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   state->parity = SSF_MEMS_PARITY_NONE;
   state->mode = SSF_MEMS_LINK_MODBUS;
   state->raw_start_until = jiffies;
-  state->raw_baudrate_unknown = false;
   mutex_init(&state->lock);
   mutex_init(&state->bus_lock);
   memset(&state->features, 0, sizeof(state->features));
@@ -523,24 +522,21 @@ static int ssf_mems_protocol_set_host_parity(struct ssf_mems_xyzs_data *data,
   return serdev_device_set_parity(data->serdev, host_parity);
 }
 
-/* 连续流启停没有可靠的普通 Modbus 应答；持 bus_lock 直接发送完整命令。
- * 仅用于这里的私有模式控制，不登记普通请求，也不会等待错误格式的响应。 */
-static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data,
-                                        bool start) {
+/* 40060 的 FC03 是定长触发命令，无普通应答；只接收后续私有 XYZ 包。
+ * 持 bus_lock 发送，避免普通请求执行器错误地等待 Modbus 回包。 */
+static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data) {
   struct ssf_modbus_transfer transfer = {0};
-  const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(start ? 40058 : 40059);
-  u16 value = 1;
+  const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(40060);
   u8 frame[8];
   int len, ret;
 
   if (reg == NULL)
     return -ENOENT;
-  transfer.frame = ssf_mems_modbus_find_frame(start ?
-      SSF_MEMS_MODBUS_FUNC_READ : SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE);
+  transfer.frame = ssf_mems_modbus_find_frame(SSF_MEMS_MODBUS_FUNC_READ);
   transfer.protocol_addr = reg->protocol_addr;
   transfer.reg_count = 1;
   len = ssf_mems_modbus_build_request(&transfer, data->slave_id,
-                                      &value, 1, frame, sizeof(frame));
+                                      NULL, 0, frame, sizeof(frame));
   if (len < 0)
     return len;
   ret = serdev_device_write(data->serdev, frame, len, msecs_to_jiffies(200));
@@ -550,7 +546,7 @@ static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data,
   return ret == len ? 0 : -EIO;
 }
 
-/* 丢弃旧串口参数下的半包，再在解析锁下切换接收格式，避免与回调竞争。 */
+/* 排空旧格式的候选帧，再在解析锁下切换接收器；不改变 UART 波特率。 */
 static void ssf_mems_protocol_raw_receiver(struct ssf_mems_xyzs_data *data,
                                           bool active) {
   if (READ_ONCE(data->raw.active) == active)
@@ -562,14 +558,13 @@ static void ssf_mems_protocol_raw_receiver(struct ssf_mems_xyzs_data *data,
   mutex_unlock(&data->modbus_rx.parse_lock);
 }
 
-/* 停止条件包含卸载；即使收到停止请求，后续仍必须发送停止命令恢复传感器。 */
+/* 卸载只阻止下一批，并停止发布；已经发送的有限批次仍必须收尾。 */
 static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_xyzs_data *data) {
   return READ_ONCE(data->acquisition.stopping) == true ||
          READ_ONCE(data->modbus_req.shutting_down) == true;
 }
 
-/* 等待接收真正安静，而非固定延时后直接切速；连续输出时有界返回失败。
- * 保持接收器工作，以便排空统计和后续停止重试判断。 */
+/* 保持解析器运行，确认最后一个串口字节后至少安静 300 ms。 */
 static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_xyzs_data *data) {
   unsigned long began = jiffies;
   unsigned long deadline = began + msecs_to_jiffies(1000);
@@ -587,152 +582,45 @@ static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_xyzs_data *data) {
   return false;
 }
 
-/* RS485 为半双工：尽量在完整包结束后发送停止，减少与传感器发包碰撞。
- * 非实时调度不能保证绝不碰撞；无新包、被信号打断时有界退回停止重试。 */
-static void ssf_mems_protocol_raw_stop_gap(struct ssf_mems_xyzs_data *data) {
+/* 批次自然结束后只读确认 Modbus；异常/卸载也不发送 40059 或保存命令。
+ * 未见末包时等满原始启动/上传预算，不能把首包前的安静误判为已经结束。
+ * 只读验证失败则保留恢复门禁，禁止立即开始新批次或写入参数。 */
+static int ssf_mems_protocol_raw_finish(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
-  unsigned long deadline = jiffies +
-      msecs_to_jiffies(SSF_MEMS_RAW_STOP_GAP_WAIT_MS);
-
-  if (READ_ONCE(raw->stream_seen) == false)
-    return;
-  for (;;) {
-    unsigned long now = jiffies;
-    u32 drained = READ_ONCE(raw->drain_packets);
-    unsigned long remaining;
-    bool between_packets;
-    long waited;
-
-    if (time_after_eq(now, deadline) == true)
-      return;
-    remaining = deadline - now;
-    waited = wait_event_interruptible_timeout(
-        raw->waitq, READ_ONCE(raw->drain_packets) != drained, remaining);
-    if (waited <= 0)
-      return;
-    mutex_lock(&data->modbus_rx.parse_lock);
-    between_packets = raw->used == 0;
-    mutex_unlock(&data->modbus_rx.parse_lock);
-    if (between_packets == true)
-      return;
-  }
-}
-
-/* 重新加载时可能继承上一版留下的私有流；停止后只读发现普通速率。
- * 只有该场景允许扫描，且必须先观察到 1 Mbaud 停流后的安静窗口。 */
-static int ssf_mems_protocol_raw_find_ordinary(struct ssf_mems_xyzs_data *data) {
-  enum ssf_mems_baudrate initial = data->protocol.baudrate;
-  unsigned int i;
   u16 reported;
-  int ret = -ETIMEDOUT;
-
-  for (i = SSF_MEMS_BAUDRATE_2400; i < SSF_MEMS_BAUDRATE_MAX; i++) {
-    if (ssf_mems_baudrates_table[i] == ssf_mems_baudrates_table[initial])
-      continue;
-    ret = ssf_mems_protocol_set_host_baudrate(data, i);
-    if (ret != 0)
-      return ret;
-    ssf_mems_modbus_receive_flush(data);
-    msleep(20);
-    ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, 40102,
-                                                  &reported, 300);
-    if (ret != 0)
-      continue;
-    if (reported >= SSF_MEMS_BAUDRATE_MAX ||
-        (i == SSF_MEMS_BAUDRATE_1000000 &&
-         ssf_mems_baudrates_table[reported] != 1000000)) {
-      ret = -EPROTO;
-      continue;
-    }
-    if (ssf_mems_protocol_raw_quiet(data) == false) {
-      ret = -ETIMEDOUT;
-      continue;
-    }
-    data->protocol.baudrate = ssf_mems_baudrates_table[reported] ==
-                                      ssf_mems_baudrates_table[i] ? reported : i;
-    return 0;
-  }
-  return ret;
-}
-
-/* 停止不依赖可能丢失的回显；必须同时满足私有流安静、普通读回成功。
- * 恢复失败保留 RECOVERING 和普通配置速率，禁止误扫描/保存临时 1 Mbaud。
- * 卸载时也用专用只读请求确认，不重新开放普通业务请求。 */
-static int ssf_mems_protocol_raw_stop(struct ssf_mems_xyzs_data *data) {
-  struct ssf_mems_raw_state *raw = &data->raw;
-  unsigned int attempt;
-  bool scanned = false;
-  u16 baudrate;
-  int ret = -EIO;
+  int ret;
 
   WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_RECOVERING);
   mutex_lock(&data->modbus_rx.parse_lock);
   WRITE_ONCE(raw->publishing, false);
-  raw->have_sequence = false; /* 排空单独计数，不延续有效采集的包号边界。 */
   mutex_unlock(&data->modbus_rx.parse_lock);
-  ret = ssf_mems_protocol_set_host_baudrate(data, SSF_MEMS_BAUDRATE_1000000);
-  if (ret != 0)
-    return ret;
-  ssf_mems_protocol_raw_receiver(data, true);
-  /* 启动命令可能还在固件任务中排队。过早在普通速率读到应答不能证明取消，
-   * 尤其卸载发生在首包之前；先等到有效私有包或原启动期限结束。 */
-  while (READ_ONCE(raw->stream_seen) == false &&
-         time_before(jiffies, data->protocol.raw_start_until) == true)
+  while (READ_ONCE(raw->batch_done) == false &&
+         time_before(jiffies, data->protocol.raw_start_until) == true) {
     msleep(20);
-
-  for (attempt = 0; attempt < SSF_MEMS_RAW_STOP_ATTEMPTS; attempt++) {
-    ret = ssf_mems_protocol_set_host_baudrate(data, SSF_MEMS_BAUDRATE_1000000);
-    if (ret != 0)
-      break;
-    ssf_mems_protocol_raw_receiver(data, true);
-    ssf_mems_protocol_raw_stop_gap(data);
-    WRITE_ONCE(raw->stop_attempts, raw->stop_attempts + 1U);
-    ret = ssf_mems_protocol_raw_command(data, false);
-    if (ret != 0) {
-      msleep(100);
-      continue;
-    }
-    if (ssf_mems_protocol_raw_quiet(data) == false) {
-      ret = -ETIMEDOUT;
-      continue;
-    }
-    ret = ssf_mems_protocol_set_host_baudrate(data, data->protocol.baudrate);
-    if (ret != 0)
-      break;
-    ssf_mems_protocol_raw_receiver(data, false);
-    msleep(20);
-    ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, 40102,
-                                                  &baudrate, 300);
-    if (ret == 0 && baudrate >= SSF_MEMS_BAUDRATE_MAX)
-      ret = -EPROTO;
-    if (ret == 0 && ssf_mems_protocol_raw_quiet(data) == true) {
-      data->protocol.raw_baudrate_unknown = false;
-      WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_MODBUS);
-      return 0;
-    }
-    if (ret != 0 && data->protocol.raw_baudrate_unknown == true &&
-        scanned == false) {
-      scanned = true;
-      ret = ssf_mems_protocol_raw_find_ordinary(data);
-      if (ret == 0) {
-        data->protocol.raw_baudrate_unknown = false;
-        WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_MODBUS);
-        return 0;
-      }
-    }
-    if (ret == 0)
-      ret = -ETIMEDOUT;
   }
-  /* 继续按私有包排空，不能让未停止的原始流污染普通候选帧解析器。 */
-  ssf_mems_protocol_set_host_baudrate(data, SSF_MEMS_BAUDRATE_1000000);
-  ssf_mems_protocol_raw_receiver(data, true);
-  dev_warn_ratelimited(&data->serdev->dev,
-                       "raw stop unconfirmed: %d; preserving ordinary baud %d, retrying recovery without Flash save\n",
-                       ret, ssf_mems_baudrate_to_value(data->protocol.baudrate));
+  if (ssf_mems_protocol_raw_quiet(data) == false)
+    return -ETIMEDOUT;
+  mutex_lock(&data->modbus_rx.parse_lock);
+  if (raw->used != 0)
+    WRITE_ONCE(raw->drain_crc_errors, raw->drain_crc_errors + 1U);
+  mutex_unlock(&data->modbus_rx.parse_lock);
+  ssf_mems_protocol_raw_receiver(data, false);
+  ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, 40102,
+                                                &reported, 500);
+  if (ret == 0 && reported >= SSF_MEMS_BAUDRATE_MAX)
+    ret = -EPROTO;
+  if (ret == 0) {
+    WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_MODBUS);
+  } else {
+    ssf_mems_protocol_raw_receiver(data, true);
+    dev_warn_ratelimited(&data->serdev->dev,
+                         "finite batch completion unconfirmed: %d; read-only recovery, no stop/reset\n",
+                         ret);
+  }
   return ret;
 }
 
-/* 线程可能已经退出原始函数并处于退避；卸载仍不能遗漏未确认的私有流。 */
+/* 后台退避或卸载时收尾未确认批次；普通模式下不发送任何命令。 */
 int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
   int ret = 0;
 
@@ -740,20 +628,47 @@ int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
     return -EINVAL;
   mutex_lock(&data->protocol.bus_lock);
   if (data->protocol.mode != SSF_MEMS_LINK_MODBUS)
-    ret = ssf_mems_protocol_raw_stop(data);
+    ret = ssf_mems_protocol_raw_finish(data);
   mutex_unlock(&data->protocol.bus_lock);
   return ret;
 }
 
-/* 一轮连续采集始终独占 bus_lock；IIO/sysfs 的普通请求不会插入私有数据流。 */
+/* 只配置 40061/40062 为零（固件默认 1024），不覆盖其余工作参数。
+ * 普通请求模式下读、必要时写、再读回；长度寄存器本身不触发 Flash 保存。 */
+static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
+  const u16 zero[2] = {0, 0};
+  u16 high, low;
+  int ret;
+
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40061, &high, 500);
+  if (ret != 0)
+    return ret;
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40062, &low, 500);
+  if (ret != 0 || (high == 0 && low == 0))
+    return ret;
+  ret = ssf_mems_modbus_write_regs_locked(data->serdev, 40061, 2,
+                                          zero, ARRAY_SIZE(zero), 500);
+  if (ret != 0)
+    return ret;
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40061, &high, 500);
+  if (ret != 0)
+    return ret;
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40062, &low, 500);
+  if (ret == 0 && (high != 0 || low != 0))
+    ret = -EIO;
+  return ret;
+}
+
+/* 窗口内重复完整的 1024 点批次，窗口到期不截断在途批次；全程独占总线。
+ * 首包最长等 15 秒，整批额外保留线上时间和两秒余量；速率低也不误超时。 */
 int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
                                  unsigned int duration_ms) {
   struct ssf_mems_raw_state *raw;
+  unsigned long window_until, started;
+  unsigned int batch_ms;
   u16 sampling_index;
-  int ret, stop_ret;
+  int ret, finish_ret;
   long waited;
-  unsigned long deadline, last_data, started;
-  u32 seen_packets;
 
   if (data == NULL || data->serdev == NULL || duration_ms == 0)
     return -EINVAL;
@@ -762,13 +677,11 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
   raw = &data->raw;
   mutex_lock(&data->protocol.bus_lock);
   if (data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
-    ret = ssf_mems_protocol_raw_stop(data);
+    ret = ssf_mems_protocol_raw_finish(data);
     if (ret != 0)
       goto out;
   }
-  /* 启动前确认停止命令也存在，避免进入无法退出的私有模式。 */
-  if (ssf_mems_modbus_find_reg(40058) == NULL ||
-      ssf_mems_modbus_find_reg(40059) == NULL) {
+  if (ssf_mems_modbus_find_reg(40060) == NULL) {
     ret = -ENOENT;
     goto out;
   }
@@ -779,15 +692,15 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
     ret = -EOPNOTSUPP;
     goto out;
   }
+  ret = ssf_mems_protocol_raw_length(data);
+  if (ret != 0)
+    goto out;
   if (ssf_mems_protocol_raw_stopping(data) == true) {
     ret = -ENODEV;
     goto out;
   }
   ssf_mems_protocol_invalidate_features(data);
-  ssf_mems_protocol_raw_receiver(data, false);
   mutex_lock(&data->modbus_rx.parse_lock);
-  raw->have_sequence = false;
-  WRITE_ONCE(raw->stream_seen, false);
   WRITE_ONCE(raw->packets, 0);
   WRITE_ONCE(raw->discontinuities, 0);
   WRITE_ONCE(raw->crc_errors, 0);
@@ -795,84 +708,82 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
   WRITE_ONCE(raw->drain_packets, 0);
   WRITE_ONCE(raw->drain_discontinuities, 0);
   WRITE_ONCE(raw->drain_crc_errors, 0);
+  WRITE_ONCE(raw->batches, 0);
+  WRITE_ONCE(raw->ignored_bytes, 0);
   WRITE_ONCE(raw->start_wait_ms, 0);
   WRITE_ONCE(raw->stop_attempts, 0);
   WRITE_ONCE(raw->sampling_rate_index, sampling_index);
-  WRITE_ONCE(raw->publishing, true);
-  WRITE_ONCE(raw->active, true);
   mutex_unlock(&data->modbus_rx.parse_lock);
-  /* 低波特率也至少留出 3.5 个 8N1 字符的 RTU 空闲时间。 */
-  msleep(max(5U, DIV_ROUND_UP(35000U,
-                             max(1U, data->protocol.host_baudrate))));
-  WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STARTING);
-  data->protocol.raw_baudrate_unknown = false;
-  started = jiffies;
-  data->protocol.raw_start_until =
-      started + msecs_to_jiffies(SSF_MEMS_RAW_START_TIMEOUT_MS);
-  ret = ssf_mems_protocol_raw_command(data, true);
-  /* 即使启动发送不完整也尝试停止，避免传感器可能已经进入连续模式。 */
-  if (ret != 0)
-    goto stop;
-  ret = ssf_mems_protocol_set_host_baudrate(data, SSF_MEMS_BAUDRATE_1000000);
-  if (ret != 0)
-    goto stop;
-  if (data->protocol.host_baudrate != 1000000U) {
-    ret = -EIO;
-    goto stop;
-  }
-  /* 固件会先结束当前任务，再等待 150 ms 切速；首包等待不计入采集时长。 */
-  waited = wait_event_interruptible_timeout(
-      raw->waitq, READ_ONCE(raw->packets) != 0 ||
-                      ssf_mems_protocol_raw_stopping(data) == true,
-      msecs_to_jiffies(SSF_MEMS_RAW_START_TIMEOUT_MS));
-  WRITE_ONCE(raw->start_wait_ms, jiffies_to_msecs(jiffies - started));
-  if (waited <= 0) {
-    ret = waited < 0 ? (int)waited : -ETIMEDOUT;
-    goto stop;
-  }
-  if (ssf_mems_protocol_raw_stopping(data) == true) {
-    ret = -ENODEV;
-    goto stop;
-  }
-  WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STREAMING);
-  last_data = jiffies;
-  deadline = jiffies + msecs_to_jiffies(duration_ms);
-  seen_packets = READ_ONCE(raw->packets);
-  while (ssf_mems_protocol_raw_stopping(data) == false) {
-    unsigned long now = jiffies;
-
-    if (time_after_eq(now, deadline) == true)
-      break;
-    waited = wait_event_interruptible_timeout(
-        raw->waitq, ssf_mems_protocol_raw_stopping(data) == true ||
-                        READ_ONCE(raw->packets) != seen_packets,
-        min(deadline - now, msecs_to_jiffies(1000)));
-    if (waited < 0) {
-      ret = (int)waited;
+  batch_ms = SSF_MEMS_RAW_START_TIMEOUT_MS + 2000U +
+      DIV_ROUND_UP(SSF_MEMS_RAW_BATCH_PACKETS * SSF_MEMS_RAW_PACKET_BYTES * 10000U,
+                   max(1U, data->protocol.host_baudrate));
+  window_until = jiffies + msecs_to_jiffies(duration_ms);
+  do {
+    ssf_mems_protocol_raw_receiver(data, true);
+    mutex_lock(&data->modbus_rx.parse_lock);
+    raw->have_sequence = false;
+    raw->next_sequence = 0;
+    WRITE_ONCE(raw->batch_packets, 0);
+    WRITE_ONCE(raw->batch_done, false);
+    WRITE_ONCE(raw->stream_seen, false);
+    WRITE_ONCE(raw->publishing, true);
+    mutex_unlock(&data->modbus_rx.parse_lock);
+    msleep(max(5U, DIV_ROUND_UP(35000U,
+                               max(1U, data->protocol.host_baudrate))));
+    if (ssf_mems_protocol_raw_stopping(data) == true) {
+      WRITE_ONCE(raw->publishing, false);
+      ssf_mems_protocol_raw_receiver(data, false);
+      ret = -ENODEV;
       break;
     }
-    if (READ_ONCE(raw->packets) != seen_packets) {
-      seen_packets = READ_ONCE(raw->packets);
-      last_data = jiffies;
-    } else if (time_after_eq(jiffies, last_data + msecs_to_jiffies(1000)) == true) {
-      ret = -ETIMEDOUT;
-      break;
+    WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STARTING);
+    started = jiffies;
+    data->protocol.raw_start_until = started + msecs_to_jiffies(batch_ms);
+    ret = ssf_mems_protocol_raw_command(data);
+    if (ret == 0) {
+      waited = wait_event_interruptible_timeout(
+          raw->waitq, READ_ONCE(raw->batch_packets) != 0 ||
+                          ssf_mems_protocol_raw_stopping(data) == true,
+          msecs_to_jiffies(SSF_MEMS_RAW_START_TIMEOUT_MS));
+      WRITE_ONCE(raw->start_wait_ms, jiffies_to_msecs(jiffies - started));
+      if (waited <= 0)
+        ret = waited < 0 ? (int)waited : -ETIMEDOUT;
     }
-  }
-stop:
-  mutex_lock(&data->modbus_rx.parse_lock);
-  WRITE_ONCE(raw->publishing, false);
-  mutex_unlock(&data->modbus_rx.parse_lock);
-  stop_ret = ssf_mems_protocol_raw_stop(data);
-  if (stop_ret != 0)
-    ret = stop_ret;
-  if (ret == 0 && ssf_mems_protocol_raw_stopping(data) == true)
-    ret = -ENODEV;
+    if (ret == 0 && ssf_mems_protocol_raw_stopping(data) == false &&
+        READ_ONCE(raw->batch_done) == false) {
+      WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STREAMING);
+      waited = wait_event_interruptible_timeout(
+          raw->waitq, READ_ONCE(raw->batch_done) == true ||
+                          ssf_mems_protocol_raw_stopping(data) == true,
+          time_before(jiffies, data->protocol.raw_start_until) == true ?
+              data->protocol.raw_start_until - jiffies : 1UL);
+      if (waited <= 0)
+        ret = waited < 0 ? (int)waited : -ETIMEDOUT;
+    }
+    if (ret != 0 || ssf_mems_protocol_raw_stopping(data) == true)
+      WRITE_ONCE(raw->publishing, false);
+    finish_ret = ssf_mems_protocol_raw_finish(data);
+    if (finish_ret != 0)
+      ret = finish_ret;
+    if (ret == 0 && (raw->batch_packets != SSF_MEMS_RAW_BATCH_PACKETS ||
+                    raw->discontinuities != 0 || raw->crc_errors != 0 ||
+                    raw->drain_discontinuities != 0 || raw->drain_crc_errors != 0 ||
+                    raw->ignored_bytes != 0))
+      ret = -EILSEQ;
+    if (ret == 0 && raw->buffer_errors != 0)
+      ret = -ENOSPC;
+    if (ret == 0)
+      WRITE_ONCE(raw->batches, raw->batches + 1U);
+    if (ssf_mems_protocol_raw_stopping(data) == true)
+      ret = -ENODEV;
+    if (ret != 0)
+      break;
+  } while (time_before(jiffies, window_until) == true);
   dev_info(&data->serdev->dev,
-           "raw capture: %u packets, %u sequence gaps, %u bad candidates, %u IIO drops; drain %u/%u/%u, start %u ms, stop attempts %u, status %d\n",
-           raw->packets, raw->discontinuities, raw->crc_errors,
+           "finite raw capture: %u batches, %u packets, %u sequence gaps, %u bad candidates, %u IIO drops; drain %u/%u/%u, ignored %u, start %u ms, status %d\n",
+           raw->batches, raw->packets, raw->discontinuities, raw->crc_errors,
            raw->buffer_errors, raw->drain_packets, raw->drain_discontinuities,
-           raw->drain_crc_errors, raw->start_wait_ms, raw->stop_attempts, ret);
+           raw->drain_crc_errors, raw->ignored_bytes, raw->start_wait_ms, ret);
 out:
   mutex_unlock(&data->protocol.bus_lock);
   return ret;
@@ -973,59 +884,20 @@ static int ssf_mems_protocol_verify_baudrate_after_reboot(
   return -ETIMEDOUT;
 }
 
-/* 1 Mbaud 的应答可能来自私有流；寄存器仍指向较低普通速率时先停止，
- * 不能用候选速率覆盖普通配置再触发一次 Flash 保存/重启。 */
+/* 普通读回证明候选速率可通信；暂存寄存器不一定已经生效。
+ * 旧连续模式遗留的 1 Mbaud 不属于定长协议，拒绝自动保存或反复停流。 */
 static int ssf_mems_protocol_accept_baudrate(
     struct ssf_mems_xyzs_data *data, enum ssf_mems_baudrate candidate,
     enum ssf_mems_baudrate reported, enum ssf_mems_baudrate *accepted) {
-  int ret;
-
   if (candidate == SSF_MEMS_BAUDRATE_1000000 &&
       ssf_mems_baudrates_table[reported] != 1000000) {
-    if (data->protocol.parity != SSF_MEMS_PARITY_NONE)
-      return -EPROTO;
-    data->protocol.baudrate = reported;
-    data->protocol.raw_baudrate_unknown = false;
-    data->protocol.raw_start_until = jiffies;
-    dev_info(&data->serdev->dev,
-             "temporary raw baud detected: host 1000000, register %d; stopping without Flash save\n",
-             ssf_mems_baudrates_table[reported]);
-    ret = ssf_mems_protocol_raw_stop(data);
-    if (ret != 0)
-      return ret;
-    *accepted = reported;
-    return 0;
+    dev_warn(&data->serdev->dev,
+             "possible legacy continuous mode at 1000000; refusing automatic save/reset\n");
+    return -EPROTO;
   }
   *accepted = ssf_mems_baudrates_table[reported] ==
                       ssf_mems_baudrates_table[candidate] ? reported : candidate;
   return 0;
-}
-
-/* 在扫描到 1 Mbaud 时先被动识别有效私有包，避免等普通应答或误保存。
- * 返回 1 已识别并恢复，0 未见私有包，负数为恢复失败；不发送启动命令。 */
-static int ssf_mems_protocol_detect_leftover_raw(struct ssf_mems_xyzs_data *data) {
-  bool seen;
-  int ret;
-
-  if (data->protocol.host_baudrate != 1000000 ||
-      data->protocol.parity != SSF_MEMS_PARITY_NONE)
-    return 0;
-  mutex_lock(&data->modbus_rx.parse_lock);
-  WRITE_ONCE(data->raw.publishing, false);
-  WRITE_ONCE(data->raw.stream_seen, false);
-  mutex_unlock(&data->modbus_rx.parse_lock);
-  ssf_mems_protocol_raw_receiver(data, true);
-  msleep(400); /* 最低采样率也足以观察多个包间隔。 */
-  seen = READ_ONCE(data->raw.stream_seen);
-  ssf_mems_protocol_raw_receiver(data, false);
-  if (seen == false)
-    return 0;
-  data->protocol.raw_baudrate_unknown = true;
-  data->protocol.raw_start_until = jiffies;
-  dev_info(&data->serdev->dev,
-           "leftover private raw stream detected at 1000000; recovering without Flash save\n");
-  ret = ssf_mems_protocol_raw_stop(data);
-  return ret == 0 ? 1 : ret;
 }
 
 /* 固件先暂存 40102；40110=1 的旧速率回显后保存并重启才真正生效。 */
@@ -1144,22 +1016,13 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
 
   mutex_lock(&state->bus_lock);
   if (state->mode != SSF_MEMS_LINK_MODBUS) {
-    ret = ssf_mems_protocol_raw_stop(data);
+    ret = ssf_mems_protocol_raw_finish(data);
     if (ret != 0)
       goto out_unlock;
   }
   initial = state->baudrate;
   if ((unsigned int)initial >= SSF_MEMS_BAUDRATE_MAX) {
     ret = -EINVAL;
-    goto out_unlock;
-  }
-
-  ret = ssf_mems_protocol_detect_leftover_raw(data);
-  if (ret != 0) {
-    if (ret == 1) {
-      *baudrate = state->baudrate;
-      ret = 0;
-    }
     goto out_unlock;
   }
 
@@ -1187,20 +1050,11 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
     if (ret != 0)
       goto restore_initial;
 
-    ret = ssf_mems_protocol_detect_leftover_raw(data);
-    if (ret != 0) {
-      if (ret == 1) {
-        *baudrate = state->baudrate;
-        ret = 0;
-      }
-      goto out_unlock;
-    }
-
     ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
     if (ret == 0) {
       ret = ssf_mems_protocol_accept_baudrate(data, candidate, found, &found);
       if (ret != 0)
-        goto out_unlock;
+        goto restore_initial;
       state->baudrate = found;
       *baudrate = found;
       ssf_mems_modbus_receive_flush(data);

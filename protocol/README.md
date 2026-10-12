@@ -39,7 +39,7 @@ RTU 读取应答不携带寄存器地址或事务编号，因此这依赖传感�
 - `modbus_rx` / `ssf_mems_modbus_receive_init(data, handler, context)`：接收 FIFO、自旋锁、解析互斥量、解析/过期工作项、候选帧及完整帧回调。
 - `acquisition` / `ssf_mems_acquisition_init(data)`：独立采集模块的线程、等待队列、调速统计和连接状态，在 IIO 注册前初始化、注册成功后启动。
 
-`ssf_mems_protocol_init()` 先设置手册默认值（从站地址 1、9600、无校验），再调用私有的 `ssf_mems_protocol_parse_properties()` 解析从站地址、`current-speed` 和 `sange-cbm,parity`。属性缺失或读取失败时，逐项记录 info 日志并保留该项默认值，继续解析其他属性；不受支持的 `current-speed` 同样回退到 9600，从站地址/校验位非法仍报错。`current-speed` 同时决定初次匹配速率和匹配后的目标速率；主机控制器拒绝非默认启动速率时也回退到 9600。调用 init 前必须设置有效的 `data->serdev`，不需要打开串口。
+`ssf_mems_protocol_init()` 先设置手册默认值（从站地址 1、9600、无校验），再调用私有的 `ssf_mems_protocol_parse_properties()` 解析从站地址、`current-speed` 和 `sange-cbm,parity`。属性缺失或读取失败时，逐项记录 info 日志并保留该项默认值，继续解析其他属性；不受支持的 `current-speed` 同样回退到 9600，从站地址/校验位非法仍报错。`current-speed` 仅决定初次匹配提示，正式通信目标由采集层设为 128000；主机控制器拒绝非默认启动速率时也回退到 9600。调用 init 前必须设置有效的 `data->serdev`，不需要打开串口。
 
 serdev 打开后，`ssf_mems_protocol_configure_serial()` 统一配置主机波特率、校验位和关闭流控，记录控制器实际速率；`core.c` 只调用接口，不直接管理串口参数。probe 自身不发起 Modbus 请求；IIO 注册后启动采集线程，等待 1 秒后异步匹配/修改波特率并轮询特征。不写入 40103；需要修改波特率时由协议层执行保存/重启。
 
@@ -48,7 +48,7 @@ core 的 `write_wakeup` 回调转发到 `serdev_device_write_wakeup()`，让同�
 
 `protocol.parity` 在初始化时设为无校验，启动属性解析时按 `none/odd/even` 更新，主机 UART 配置时读取并转换为 Linux 的 `serdev_parity`；请求层读取它，按每字节 10/11 位计算发送超时。目前没有运行时读取、扫描或修改传感器校验位的专用接口，启动配置必须与传感器已生效的参数一致。
 
-`ssf_mems_protocol_set_baudrate()` 在旧速率下依次写 40102 和 40110=1，每次均要求正确的 0x06 回显。40110 对应帧内地址 0x006D，触发保存 40101～40105 并重启。收到保存应答后持总线锁休眠 `SSF_MEMS_SENSOR_REBOOT_DELAY_MS`（`protocol.h`，默认 1000 ms），期间其他主动请求不能发送；随后清理旧接收数据，切换主机速率并读取 40102 验证。成功才返回 0，采集模块另读取完整特征确认可采集。
+`ssf_mems_protocol_set_baudrate()` 在旧速率下依次写 40102 和 40110=1，每次均要求正确的 0x06 回显。40110 对应帧内地址 0x006D，触发保存 40101～40105 并重启。收到保存应答后持总线锁休眠 `SSF_MEMS_SENSOR_REBOOT_DELAY_MS`（`protocol.h`，保守静默 8000 ms），期间其他主动请求不能发送；随后清理旧接收数据，切换主机速率并读取 40102 验证。成功才返回 0，采集模块另读取完整特征确认可采集。
 
 重启验证最多读取 `SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS`（默认 8）次，仅在
 `-ETIMEDOUT` 时重试。重试等待至少 `SSF_MEMS_BAUDRATE_VERIFY_RETRY_MS`

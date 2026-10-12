@@ -287,7 +287,7 @@ static void reset_device(enum scenario next) {
   fail_reads = fail_thread_start = stop_requested = false;
   scenario = next;
   /* 旧场景显式选择 115200 目标，随后从已匹配的 9600 链路模拟各种恢复情况。 */
-  device.protocol.baudrate = SSF_MEMS_BAUDRATE_115200;
+  device.protocol.baudrate = SSF_MEMS_BAUDRATE_128000;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
   device.protocol.baudrate = SSF_MEMS_BAUDRATE_9600;
   first_match_baudrate = 0;
@@ -318,7 +318,7 @@ static void test_thread_scenarios(void) {
   CHECK(!status.online && !status.have_sample && status.interval_ms == 1000);
   run_thread();
   CHECK(get_count == 1 && set_count == 1 && publish_count == 70);
-  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_128000);
   CHECK(sampling_config_calls == 1 && sensor_setting_writes == 1);
   CHECK(device.acquisition.policy.interval_ms == 1000);
   /* 排除首次连接验证后完整等待的一轮，普通轮询应扣除读取耗时。
@@ -371,15 +371,15 @@ static void test_thread_scenarios(void) {
   reset_device(MANUAL);
   set_error = -ETIMEDOUT;
   CHECK(ssf_mems_acquisition_set_baudrate(&device, SSF_MEMS_BAUDRATE_57600) == -ETIMEDOUT);
-  CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
   CHECK(device.protocol.host_baudrate == 9600 && device.acquisition.reconnect);
   set_error = 0;
   get_count = set_count = 0;
   run_thread();
-  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200 && set_count == 1);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_128000 && set_count == 1);
 
   reset_device(MANUAL);
-  sensor_baudrate = SSF_MEMS_BAUDRATE_115200;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_128000;
   device.protocol.host_baudrate = 115200;
   device.protocol.baudrate = sensor_baudrate;
   sensor_sampling_index = 6;
@@ -394,7 +394,7 @@ static void test_thread_scenarios(void) {
   device.protocol.host_baudrate = 1000000;
   device.protocol.baudrate = sensor_baudrate;
   run_thread();
-  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_115200 && set_count == 1);
+  CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_128000 && set_count == 1);
   CHECK(sensor_sampling_index == 6 && sensor_setting_writes == 1);
 
   reset_device(CONFIG_FAILURE);
@@ -437,7 +437,7 @@ static void test_thread_scenarios(void) {
   CHECK(!device.acquisition.online && !device.protocol.valid);
   CHECK(ssf_mems_acquisition_get_baudrate(NULL, &baudrate) == -EINVAL);
   CHECK(ssf_mems_acquisition_get_baudrate(&device, NULL) == -EINVAL);
-  CHECK(ssf_mems_acquisition_set_baudrate(NULL, SSF_MEMS_BAUDRATE_115200) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_baudrate(NULL, SSF_MEMS_BAUDRATE_128000) == -EINVAL);
   CHECK(ssf_mems_acquisition_set_baudrate(&device, SSF_MEMS_BAUDRATE_MAX) == -EINVAL);
 }
 
@@ -586,37 +586,34 @@ static void test_capture_properties(void) {
         device.acquisition.feature_duration_ms == 5000);
 }
 
-/* 启动目标来自协议初始化，而不是固定 115200；扫描结果不能覆盖该目标。 */
+/* 初次匹配保留启动提示，正式运行始终使用 128000，不随扫描结果改变。 */
 static void test_startup_baudrate_target(void) {
-  static const enum ssf_mems_baudrate targets[] = {
+  static const enum ssf_mems_baudrate hints[] = {
       SSF_MEMS_BAUDRATE_DEFAULT, SSF_MEMS_BAUDRATE_57600,
-      SSF_MEMS_BAUDRATE_115200,
+      SSF_MEMS_BAUDRATE_128000,
   };
   unsigned int i;
 
-  for (i = 0; i < ARRAY_SIZE(targets); i++) {
+  for (i = 0; i < ARRAY_SIZE(hints); i++) {
     reset_device(MANUAL);
-    device.protocol.baudrate = targets[i];
-    device.protocol.host_baudrate = ssf_mems_baudrate_to_value(targets[i]);
+    device.protocol.baudrate = hints[i];
+    device.protocol.host_baudrate = ssf_mems_baudrate_to_value(hints[i]);
     CHECK(ssf_mems_acquisition_init(&device) == 0);
     device.acquisition.raw_duration_ms = 0;
-    CHECK(device.acquisition.target_baudrate == targets[i]);
-    /* 默认目标已匹配，无须写入；其他目标需先找到 9600 再切换。 */
+    CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
     run_thread();
-    CHECK(first_match_baudrate == (unsigned int)ssf_mems_baudrate_to_value(targets[i]));
-    CHECK(ssf_mems_baudrate_to_value(sensor_baudrate) ==
-          ssf_mems_baudrate_to_value(targets[i]));
-    CHECK(set_count == (i == 0 ? 0 : 1));
-    CHECK(device.acquisition.target_baudrate == targets[i]);
+    CHECK(first_match_baudrate == (unsigned int)ssf_mems_baudrate_to_value(hints[i]));
+    CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_128000 && set_count == 1);
+    CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
   }
   reset_device(MANUAL);
-  device.protocol.baudrate = SSF_MEMS_BAUDRATE_57600;
-  device.protocol.host_baudrate = 57600;
-  sensor_baudrate = SSF_MEMS_BAUDRATE_57600;
+  device.protocol.baudrate = SSF_MEMS_BAUDRATE_128000;
+  device.protocol.host_baudrate = 128000;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_128000;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
   device.acquisition.raw_duration_ms = 0;
   run_thread();
-  CHECK(first_match_baudrate == 57600 && set_count == 0);
+  CHECK(first_match_baudrate == 128000 && set_count == 0);
   reset_device(NO_SENSOR);
   device.protocol.baudrate = SSF_MEMS_BAUDRATE_57600;
   device.protocol.host_baudrate = 57600;
@@ -624,7 +621,7 @@ static void test_startup_baudrate_target(void) {
   get_error = -ETIMEDOUT;
   run_thread();
   CHECK(first_match_baudrate == 57600 && set_count == 0 && publish_count == 0);
-  CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_57600);
+  CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
 }
 
 int main(void) {

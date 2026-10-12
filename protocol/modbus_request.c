@@ -446,9 +446,10 @@ int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
 }
 
 /* 返回 0 连续写入成功，-EINVAL 参数/范围错误，-ENOENT 地址缺失，-EACCES 不可写，-EOPNOTSUPP 帧格式不支持，-ENODEV 无设备/关闭中，-EBUSY 请求占用，-ENOMEM 分配失败，-EIO 发送不足，-EREMOTEIO 从机异常，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；其他负值来自组帧或串口。 */
-int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
-                               u16 reg_count, const u16 *values,
-                               size_t values_count, unsigned int timeout_ms) {
+static int ssf_mems_modbus_write_regs_common(
+    struct serdev_device *serdev, u16 display_reg, u16 reg_count,
+    const u16 *values, size_t values_count, unsigned int timeout_ms,
+    bool bus_locked) {
   struct ssf_modbus_transfer transfer;
   int ret;
 
@@ -459,7 +460,23 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
   if (ret != 0)
     return ret;
   return ssf_mems_modbus_execute(serdev, &transfer, values, values_count,
-                                 NULL, 0, timeout_ms, false, false);
+                                 NULL, 0, timeout_ms, bus_locked, false);
+}
+
+/* 普通连续写：由请求执行器取得总线锁。 */
+int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
+                               u16 reg_count, const u16 *values,
+                               size_t values_count, unsigned int timeout_ms) {
+  return ssf_mems_modbus_write_regs_common(serdev, display_reg, reg_count,
+                                          values, values_count, timeout_ms, false);
+}
+
+/* 已持总线锁的连续写：用于原始批采集前配置长度，不重复加锁。 */
+int ssf_mems_modbus_write_regs_locked(
+    struct serdev_device *serdev, u16 display_reg, u16 reg_count,
+    const u16 *values, size_t values_count, unsigned int timeout_ms) {
+  return ssf_mems_modbus_write_regs_common(serdev, display_reg, reg_count,
+                                          values, values_count, timeout_ms, true);
 }
 
 /* 按表中块描述执行写入；返回 0 成功，-EINVAL 参数/范围错误，-EOPNOTSUPP 不是可写块或格式不支持；其他负值同连续写入。 */

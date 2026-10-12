@@ -54,18 +54,17 @@ interruption. Receive tests occupy all four candidate slots with unfinished
 frames, exercise both timer and per-byte expiration, and ensure a fragmented
 valid frame remains usable within the low-baud wire-time budget. The shim uses
 controlled jiffies; it does not validate real UART delivery latency.
-# 连续原始流测试
+# 定长原始批次测试
 
-测试直接编译 `raw_stream.c` 和实际 FIFO 接收器，覆盖逐字节拆包、坏 CRC、
-坏尾标记、数据区含帧头/尾、重新同步、序号回绕/跳变和 IIO 推送失败。
-连续模式控制测试覆盖无普通 ACK 的启动、1 Mbaud 切速、停止及恢复验证、
-首包/收流超时、停止发送重试、信号打断、卸载，以及删除启动/停止表项时
-禁止进入原始模式。共 12 组寄存器表变体使用 ASan/UBSan 运行。
+直接编译 raw_stream.c 和实际 FIFO 接收器，覆盖拆包、CRC、尾标记、
+含帧头/尾的载荷、重同步、首包非零、序号跳变、越界包及 IIO 推送失败。
+控制测试使用 128000，验证 FC03 40060 无普通应答、每批 16 包/1024 XYZ、
+窗口内多批、非零自定义长度改为零且不改其他工作参数。
 
-恢复回归还覆盖：6 秒后首包正常到达、首包前卸载后固件迟到启动、
-连续六次停止丢失后保留恢复状态、恢复期间普通读写禁止发送、后台再次
-停止并只读确认、关闭请求模块后仍执行卸载确认，以及加载时从遗留
-1 Mbaud 私有流恢复到不同的普通配置速率，全程不能误写 40102/40110。
-有效采集和排空统计分别验证，候选 CRC 错误不冒充精确丢包数。
-停止等待还覆盖新完整包唤醒和无新包的有界回退；这不能替代实机 RS485
-方向控制和包间发送时序验证。
+故障用例覆盖首包超时、末包丢失、中间包丢失、触发发送失败、
+6 秒后首包、信号打断、首包前和上传中卸载。卸载收尾只读确认，
+不发送 40058/40059，不切到 1 Mbaud，不写 40102/40110。
+确认失败时普通写请求被恢复门禁拒绝，再次只读确认后才能恢复业务。
+
+共 13 组寄存器表变体使用 ASan/UBSan；删除旧连续启停表项不再影响定长采集，
+删除 40060 则拒绝触发。模拟测试不能代替实机 UART/RS485 方向时序和 IIO 验证。

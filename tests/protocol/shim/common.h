@@ -43,6 +43,7 @@ struct device {
   const char *parity;
   int slave_id_read_error, current_speed_read_error, parity_read_error;
   unsigned int info_count;
+  unsigned int error_count; /* 记录生产解析器日志，区分候选帧误报和请求失败。 */
   char last_info[256];
   bool has_raw_duration, has_feature_duration;
   u32 raw_duration_ms, feature_duration_ms;
@@ -99,7 +100,7 @@ long test_wait_timeout(unsigned long timeout);
 #define system_wq NULL
 #define msecs_to_jiffies(ms) (ms)
 #define wait_event_interruptible_timeout(q, condition, timeout) ((void)(q), (condition) ? 1L : test_wait_timeout(timeout))
-#define dev_err(dev, ...) ((void)(dev))
+#define dev_err(dev, ...) ((dev)->error_count++)
 #define dev_warn(dev, ...) ((void)(dev))
 #define dev_err_ratelimited(dev, ...) dev_err(dev, __VA_ARGS__)
 #define dev_warn_ratelimited(dev, ...) dev_warn(dev, __VA_ARGS__)

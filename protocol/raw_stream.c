@@ -23,7 +23,8 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
   unsigned int i;
 
   WRITE_ONCE(raw->stream_seen, true);
-  if (raw->have_sequence == true && sequence != raw->next_sequence) {
+  if (sequence != raw->next_sequence || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
+      raw->batch_done == true) {
     if (raw->publishing == true) {
       WRITE_ONCE(raw->discontinuities, raw->discontinuities + 1U);
       dev_warn_ratelimited(&data->serdev->dev,
@@ -35,13 +36,15 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
   }
   raw->have_sequence = true;
   raw->next_sequence = sequence + 1U;
+  WRITE_ONCE(raw->batch_packets, raw->batch_packets + 1U);
   for (i = 0; i < SSF_MEMS_RAW_SAMPLES_PER_PACKET; i++) {
     struct ssf_mems_raw_sample sample;
     unsigned int axis;
     size_t offset = 5U + i * 6U;
     int ret;
 
-    if (raw->publishing == false)
+    if (raw->publishing == false || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
+        raw->batch_done == true)
       break;
 
     for (axis = 0; axis < 3U; axis++)
@@ -57,6 +60,8 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
     WRITE_ONCE(raw->packets, raw->packets + 1U);
   else
     WRITE_ONCE(raw->drain_packets, raw->drain_packets + 1U);
+  if (sequence == SSF_MEMS_RAW_BATCH_PACKETS - 1U)
+    WRITE_ONCE(raw->batch_done, true);
   wake_up_interruptible(&raw->waitq);
 }
 
@@ -65,8 +70,10 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
 void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_raw_state *raw = &data->raw;
 
-  if (raw->used == 0 && byte != 0x15)
+  if (raw->used == 0 && byte != 0x15) {
+    WRITE_ONCE(raw->ignored_bytes, raw->ignored_bytes + 1U);
     return;
+  }
   raw->packet[raw->used++] = byte;
   if (raw->used != SSF_MEMS_RAW_PACKET_BYTES)
     return;

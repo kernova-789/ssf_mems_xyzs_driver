@@ -202,12 +202,12 @@ static int ssf_mems_acquisition_thread(void *context) {
         ret = ssf_mems_protocol_collect_raw(data, acq->raw_duration_ms);
         if (ret == -EOPNOTSUPP) {
           dev_warn(&data->serdev->dev,
-                   "continuous raw mode requires no parity and sampling index 0..8; keeping feature acquisition\n");
+                   "finite raw mode requires no parity and sampling index 0..8; keeping feature acquisition\n");
           acq->raw_duration_ms = 0;
           ret = 0;
         }
         if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
-          /* 恢复未确认时不能轮询特征；connect 会先停止私有流再匹配。 */
+          /* 定长上传未确认结束时不能轮询特征；connect 先完成只读恢复。 */
           ssf_mems_acquisition_offline(data);
           acq->phase = SSF_MEMS_ACQ_BACKOFF;
         } else {
@@ -286,8 +286,8 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
   acq->have_sample = false;
   acq->last_sample = 0;
   acq->phase = SSF_MEMS_ACQ_STARTUP;
-  /* 协议层已解析设备树并配置主机；保留此目标，不随扫描匹配结果改变。 */
-  acq->target_baudrate = data->protocol.baudrate;
+  /* 设备树仅提供初次匹配速率；正式的原始数据和特征通信统一为 128000。 */
+  acq->target_baudrate = SSF_MEMS_BAUDRATE_128000;
   acq->retry_ms = SSF_MEMS_ACQ_RETRY_INITIAL_MS;
   acq->raw_duration_ms = ssf_mems_acquisition_window(
       &data->serdev->dev, "sange-cbm,raw-duration-ms", true);
