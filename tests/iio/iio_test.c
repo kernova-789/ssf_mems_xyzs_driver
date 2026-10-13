@@ -19,6 +19,9 @@ static const s64 timestamp = 123456789;
 static int setting_error;
 static u16 setting_value;
 static enum ssf_mems_sensor_setting last_setting;
+static struct ssf_mems_acquisition_config acquisition_config; /* 模拟采集层配置。 */
+static int control_error; /* 模拟配置层关闭或不支持的错误。 */
+static unsigned int control_writes; /* 检查非法 sysfs 输入不会进入配置层。 */
 
 int ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
                                    const struct ssf_mems_sensor_data *features) {
@@ -186,6 +189,38 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *d,
   return setting_error;
 }
 void ssf_mems_acquisition_get_status(struct ssf_mems_xyzs_data *d, struct ssf_mems_acquisition_status *s) { abort(); }
+/* IIO 用例只检查分派，调度和锁由 acquisition 用例验证。 */
+int ssf_mems_acquisition_get_config(struct ssf_mems_xyzs_data *d,
+                                   struct ssf_mems_acquisition_config *c) {
+  assert(d == &sensor);
+  *c = acquisition_config;
+  return control_error;
+}
+/* 模拟采集层的范围检查，验证 IIO 正确传递模式及错误。 */
+int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *d,
+                                 enum ssf_mems_acquisition_mode mode) {
+  assert(d == &sensor && (unsigned int)mode < SSF_MEMS_ACQ_MODE_COUNT);
+  control_writes++;
+  if (control_error != 0)
+    return control_error;
+  acquisition_config.mode = mode;
+  return 0;
+}
+/* 单独更新指定窗口，另一项不应被覆盖。 */
+int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *d,
+                                     bool raw_window, unsigned int duration) {
+  assert(d == &sensor);
+  control_writes++;
+  if (control_error != 0)
+    return control_error;
+  if (duration < SSF_MEMS_ACQ_MIN_DURATION_MS || duration > SSF_MEMS_ACQ_MAX_DURATION_MS)
+    return -EINVAL;
+  if (raw_window == true)
+    acquisition_config.raw_duration_ms = duration;
+  else
+    acquisition_config.feature_duration_ms = duration;
+  return 0;
+}
 int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate b) { abort(); }
 int sysfs_emit(char *buf, const char *fmt, ...) {
   va_list args;
@@ -242,6 +277,53 @@ static void test_configuration_attributes(void) {
 }
 
 /* 新统计属性均只读；有效采集、排空和业务模式分别输出，不能串错成员。 */
+/* 覆盖模式字符串、两项时长、非法输入和关闭时错误的 sysfs 透传。 */
+static void test_acquisition_controls(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *mode = &iio_dev_attr_sensor_acquisition_mode.dev_attr;
+  struct device_attribute *raw = &iio_dev_attr_sensor_raw_duration_ms.dev_attr;
+  struct device_attribute *feature = &iio_dev_attr_sensor_feature_duration_ms.dev_attr;
+  char buf[4096];
+  unsigned int before;
+
+  indio.private = &state;
+  acquisition_config.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
+  acquisition_config.raw_duration_ms = acquisition_config.feature_duration_ms = 5000;
+  assert(mode->show(&indio.dev, mode, buf) == 12 && !strcmp(buf, "alternating\n"));
+  assert(mode->store(&indio.dev, mode, "raw\n", 4) == 4);
+  assert(acquisition_config.mode == SSF_MEMS_ACQ_MODE_RAW);
+  assert(mode->store(&indio.dev, mode, "feature", 7) == 7);
+  assert(acquisition_config.mode == SSF_MEMS_ACQ_MODE_FEATURE);
+  assert(mode->store(&indio.dev, mode, "alternating\n", 12) == 12);
+  before = control_writes;
+  assert(mode->store(&indio.dev, mode, "RAW\n", 4) == -EINVAL);
+  assert(mode->store(&indio.dev, mode, "raw extra\n", 10) == -EINVAL);
+  assert(mode->store(&indio.dev, mode, "", 0) == -EINVAL);
+  assert(control_writes == before);
+  assert(raw->store(&indio.dev, raw, "2000\n", 5) == 5);
+  assert(feature->store(&indio.dev, feature, "3000\n", 5) == 5);
+  assert(acquisition_config.raw_duration_ms == 2000 && acquisition_config.feature_duration_ms == 3000);
+  assert(raw->show(&indio.dev, raw, buf) == 5 && !strcmp(buf, "2000\n"));
+  assert(feature->show(&indio.dev, feature, buf) == 5 && !strcmp(buf, "3000\n"));
+  assert(raw->store(&indio.dev, raw, "99", 2) == -EINVAL);
+  assert(feature->store(&indio.dev, feature, "60001", 5) == -EINVAL);
+  before = control_writes;
+  assert(raw->store(&indio.dev, raw, "-1", 2) == -EINVAL);
+  assert(raw->store(&indio.dev, raw, "invalid", 7) == -EINVAL);
+  assert(raw->store(&indio.dev, raw, "0x100", 5) == -EINVAL);
+  assert(raw->store(&indio.dev, raw, "4294967296", 10) < 0);
+  assert(control_writes == before);
+  assert(acquisition_config.raw_duration_ms == 2000 && acquisition_config.feature_duration_ms == 3000);
+  control_error = -ENODEV;
+  assert(mode->show(&indio.dev, mode, buf) == -ENODEV);
+  assert(mode->store(&indio.dev, mode, "raw", 3) == -ENODEV);
+  assert(raw->store(&indio.dev, raw, "1000", 4) == -ENODEV);
+  control_error = -EOPNOTSUPP;
+  assert(mode->store(&indio.dev, mode, "raw", 3) == -EOPNOTSUPP);
+  control_error = 0;
+  indio.private = NULL;
+}
+
 static void test_raw_status_attributes(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   struct device_attribute *attrs[] = {
@@ -289,6 +371,7 @@ int main(void) {
   size_t i;
 
   test_configuration_attributes();
+  test_acquisition_controls();
   test_raw_status_attributes();
   memset(&sample, 0, sizeof(sample));
   for (i = 0; i < SSF_MEMS_IIO_FEATURE_MAX; i++) {

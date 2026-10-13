@@ -36,9 +36,12 @@ static struct ssf_mems_sensor_data published;
 enum scenario {
   CHANGING, CONSTANT, LINK_FAILURE, EXCEPTION, NO_SENSOR, MANUAL,
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
-  RAW_RECOVERY_FAILURE
+  RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
+  RAW_ONLY_DROPS, SHORT_WINDOWS
 };
 static enum scenario scenario;
+static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
+static unsigned long raw_started_at[80]; /* 检查短窗口不会被 1 s 轮询间隔拖长。 */
 
 /* 停止接口无论线程在哪个阶段退出，都必须检查协议层残留的私有流。 */
 int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
@@ -53,12 +56,16 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
                                  unsigned int duration_ms) {
   CHECK(data == &device && duration_ms == device.acquisition.raw_duration_ms);
   CHECK(data->acquisition.phase == SSF_MEMS_ACQ_RAW);
-  raw_captures++;
+  CHECK(raw_captures < ARRAY_SIZE(raw_started_at));
+  raw_started_at[raw_captures++] = jiffies;
   jiffies += duration_ms;
-  if (scenario == RAW_RECOVERY_FAILURE) {
+  if (scenario == RAW_RECOVERY_FAILURE ||
+      (scenario == RAW_ONLY_RECOVERY && raw_captures == 1)) {
     data->protocol.mode = SSF_MEMS_LINK_RAW_RECOVERING;
     return -ETIMEDOUT;
   }
+  if (scenario == RAW_ONLY_DROPS && raw_captures == 2)
+    return -ENOSPC;
   return 0;
 }
 
@@ -129,7 +136,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *s,
                                   unsigned int timeout_ms) {
   CHECK(s == &serial && timeout_ms == 200);
   get_count++;
-  if (scenario == RAW_RECOVERY_FAILURE && get_count > 1) {
+  if ((scenario == RAW_RECOVERY_FAILURE || scenario == RAW_ONLY_RECOVERY) && get_count > 1) {
     CHECK(device.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
     CHECK(device.acquisition.phase == SSF_MEMS_ACQ_MATCH);
     device.protocol.mode = SSF_MEMS_LINK_MODBUS;
@@ -236,6 +243,9 @@ void test_acquisition_wait(unsigned long timeout) {
     } else if (scenario == RAW_RECOVERY_FAILURE) {
       CHECK(raw_captures == 1 && get_count == 1 && publish_count >= 2);
       CHECK(device.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
+    } else if (scenario == RAW_ONLY_RECOVERY) {
+      CHECK(raw_captures == 1 && get_count == 1 && publish_count == 0);
+      CHECK(device.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
     } else {
       CHECK(scenario == LINK_FAILURE && failure_count >= 5);
       CHECK(publish_count == 1);
@@ -246,7 +256,35 @@ void test_acquisition_wait(unsigned long timeout) {
     }
   } else if (device.acquisition.phase == SSF_MEMS_ACQ_POLL) {
     CHECK(timeout >= 2);
-    if (scenario == CHANGING || scenario == CONSTANT) {
+    if (scenario == RAW_ONLY || scenario == RAW_ONLY_RECOVERY || scenario == RAW_ONLY_DROPS) {
+      CHECK(device.acquisition.online && !device.protocol.valid);
+      CHECK(publish_count == 0 && read_count == 0);
+      if (raw_captures == 3)
+        stop_requested = true;
+    } else if (scenario == SHORT_WINDOWS) {
+      CHECK(device.acquisition.online && publish_count == raw_captures + 1);
+      if (raw_captures == 5)
+        stop_requested = true;
+    } else if (scenario == MODE_SWITCH) {
+      if (mode_switch_step == 0) {
+        CHECK(publish_count == 1 && raw_captures == 0);
+        CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_RAW) == 0);
+        mode_switch_step++;
+      } else if (mode_switch_step == 1 && raw_captures == 2) {
+        CHECK(publish_count == 1);
+        CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_FEATURE) == 0);
+        mode_switch_step++;
+      } else if (mode_switch_step == 2 && publish_count == 3) {
+        CHECK(raw_captures == 2);
+        CHECK(ssf_mems_acquisition_set_duration(&device, true, 100) == 0);
+        CHECK(ssf_mems_acquisition_set_duration(&device, false, 100) == 0);
+        CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_ALTERNATING) == 0);
+        mode_switch_step++;
+      } else if (mode_switch_step == 3 && raw_captures >= 3) {
+        CHECK(publish_count >= 4);
+        stop_requested = true;
+      }
+    } else if (scenario == CHANGING || scenario == CONSTANT) {
       CHECK(device.acquisition.online && device.protocol.valid);
       if (publish_count >= 70)
         stop_requested = true;
@@ -293,7 +331,8 @@ static void reset_device(enum scenario next) {
   first_match_baudrate = 0;
   CHECK(device.acquisition.raw_duration_ms == 5000);
   CHECK(device.acquisition.feature_duration_ms == 5000);
-  device.acquisition.raw_duration_ms = 0; /* 旧用例只验证原有特征轮询。 */
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
+  mode_switch_step = 0;
   raw_captures = 0;
 }
 
@@ -571,8 +610,9 @@ static void test_capture_properties(void) {
         device.acquisition.feature_duration_ms == 3000);
   serial.dev.raw_duration_ms = serial.dev.feature_duration_ms = 0;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
-  CHECK(device.acquisition.raw_duration_ms == 0 &&
-        device.acquisition.feature_duration_ms == 5000);
+  CHECK(device.acquisition.raw_duration_ms == 5000 &&
+        device.acquisition.feature_duration_ms == 5000 &&
+        device.acquisition.mode == SSF_MEMS_ACQ_MODE_FEATURE);
   serial.dev.raw_duration_ms = 99;
   serial.dev.feature_duration_ms = 60001;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
@@ -584,6 +624,50 @@ static void test_capture_properties(void) {
   CHECK(ssf_mems_acquisition_init(&device) == 0);
   CHECK(device.acquisition.raw_duration_ms == 5000 &&
         device.acquisition.feature_duration_ms == 5000);
+  serial.dev.duration_read_error = 0;
+  device.protocol.parity = SSF_MEMS_PARITY_EVEN;
+  CHECK(ssf_mems_acquisition_init(&device) == 0);
+  CHECK(device.acquisition.mode == SSF_MEMS_ACQ_MODE_FEATURE);
+}
+
+/* 主机配置可在离线时修改；非法值、同值写和关闭不能额外触发串口请求。 */
+static void test_runtime_controls(void) {
+  struct ssf_mems_acquisition_config config;
+  unsigned int wakes;
+
+  reset_device(MANUAL);
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == 0);
+  CHECK(config.mode == SSF_MEMS_ACQ_MODE_FEATURE && config.raw_duration_ms == 5000);
+  CHECK(ssf_mems_acquisition_get_config(NULL, &config) == -EINVAL);
+  CHECK(ssf_mems_acquisition_get_config(&device, NULL) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_mode(NULL, SSF_MEMS_ACQ_MODE_RAW) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_COUNT) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_mode(&device, -1) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_duration(NULL, true, 5000) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_duration(&device, true, 0) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_duration(&device, true, 99) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_duration(&device, false, 60001) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_duration(&device, false, UINT_MAX) == -EINVAL);
+  wakes = test_wake_count;
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_FEATURE) == 0);
+  CHECK(ssf_mems_acquisition_set_duration(&device, true, 5000) == 0);
+  CHECK(test_wake_count == wakes && !device.acquisition.config_changed);
+  device.protocol.valid = device.acquisition.have_sample = true;
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_RAW) == 0);
+  CHECK(device.acquisition.config_changed && !device.acquisition.reconnect);
+  CHECK(!device.protocol.valid && !device.acquisition.have_sample);
+  CHECK(ssf_mems_acquisition_set_duration(&device, true, 100) == 0);
+  CHECK(ssf_mems_acquisition_set_duration(&device, false, 60000) == 0);
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == 0);
+  CHECK(config.raw_duration_ms == 100 && config.feature_duration_ms == 60000);
+  device.protocol.parity = SSF_MEMS_PARITY_EVEN;
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_ALTERNATING) == -EOPNOTSUPP);
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_FEATURE) == 0);
+  device.acquisition.stopping = true;
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == -ENODEV);
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_FEATURE) == -ENODEV);
+  CHECK(ssf_mems_acquisition_set_duration(&device, true, 5000) == -ENODEV);
+  CHECK(get_count == 0 && set_count == 0 && read_count == 0 && setting_calls == 0);
 }
 
 /* 初次匹配保留启动提示，正式运行始终使用 128000，不随扫描结果改变。 */
@@ -599,7 +683,7 @@ static void test_startup_baudrate_target(void) {
     device.protocol.baudrate = hints[i];
     device.protocol.host_baudrate = ssf_mems_baudrate_to_value(hints[i]);
     CHECK(ssf_mems_acquisition_init(&device) == 0);
-    device.acquisition.raw_duration_ms = 0;
+    device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
     CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
     run_thread();
     CHECK(first_match_baudrate == (unsigned int)ssf_mems_baudrate_to_value(hints[i]));
@@ -611,7 +695,7 @@ static void test_startup_baudrate_target(void) {
   device.protocol.host_baudrate = 128000;
   sensor_baudrate = SSF_MEMS_BAUDRATE_128000;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
-  device.acquisition.raw_duration_ms = 0;
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
   run_thread();
   CHECK(first_match_baudrate == 128000 && set_count == 0);
   reset_device(NO_SENSOR);
@@ -629,19 +713,46 @@ int main(void) {
   test_thread_scenarios();
   test_settings();
   reset_device(CHANGING);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
   device.acquisition.raw_duration_ms = 100;
   device.acquisition.feature_duration_ms = 2000;
   run_thread();
   CHECK(raw_captures > 10 && publish_count == 70);
   CHECK(get_count == 1 && set_count == 1); /* 正常交替不重新保存波特率。 */
   reset_device(RAW_RECOVERY_FAILURE);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
   device.acquisition.raw_duration_ms = 100;
   device.acquisition.feature_duration_ms = 2000;
   run_thread();
   CHECK(raw_captures == 1 && backoff_count == 1 && get_count == 2);
   CHECK(set_count == 1); /* 恢复状态不会被当作普通波特率变化重复保存。 */
   test_capture_properties();
+  test_runtime_controls();
   test_startup_baudrate_target();
+  reset_device(RAW_ONLY);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_RAW;
+  run_thread();
+  CHECK(raw_captures == 3 && read_count == 0 && publish_count == 0);
+  CHECK(get_count == 1 && set_count == 1);
+  reset_device(MODE_SWITCH);
+  run_thread();
+  CHECK(mode_switch_step == 3 && get_count == 1 && set_count == 1);
+  reset_device(RAW_ONLY_RECOVERY);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_RAW;
+  run_thread();
+  CHECK(raw_captures == 3 && backoff_count == 1 && get_count == 2);
+  CHECK(set_count == 1 && read_count == 0 && publish_count == 0);
+  reset_device(RAW_ONLY_DROPS);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_RAW;
+  run_thread();
+  CHECK(raw_captures == 3 && backoff_count == 0 && get_count == 1 && set_count == 1);
+  reset_device(SHORT_WINDOWS);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
+  device.acquisition.raw_duration_ms = device.acquisition.feature_duration_ms = 100;
+  run_thread();
+  CHECK(raw_started_at[0] - read_started_at[0] == 105);
+  for (unsigned int i = 1; i < raw_captures; i++)
+    CHECK(raw_started_at[i] - raw_started_at[i - 1] == 200);
   printf("PASS acquisition policy and lifecycle: %u checks\n", checks);
   return 0;
 }

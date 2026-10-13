@@ -92,7 +92,8 @@ than acquisition enable state.
 After registration, a background thread waits one second, matches the sensor's
 baud rate, uses `current-speed` only as a startup hint (9600 if missing, unreadable
 or unsupported), applies the operational target of 128000, sets sampling-rate
-index 6 (5333.4 Hz), and verifies a complete feature read. Matching baud rates
+index 6 (5333.4 Hz), and verifies a complete feature read (raw-only mode instead
+starts finite batches after configuration verification). Matching baud rates
 and unchanged sampling settings skip writes. If the initial target rate does
 not respond, discovery finds the active rate before saving/rebooting the sensor
 to the target. No responding rate means retrying, not blindly writing a new rate;
@@ -104,6 +105,15 @@ periods currently keep it at 1000 ms. Sustained communication failure stops poll
 and starts baud-rate discovery with exponential retry delays capped at 30 s.
 Stale or disconnected samples become invalid and direct reads return `-ENODATA`.
 See [acquisition/README.md](acquisition/README.md) for the policy and tuning points.
+
+Runtime IIO controls `sensor_acquisition_mode` (`raw`, `feature`, `alternating`),
+`sensor_raw_duration_ms`, and `sensor_feature_duration_ms` select the host-side
+schedule. Durations accept 100..60000 ms; the default remains alternating with
+5000 ms windows. Updates wait for the current raw window to finish and do not
+save sensor configuration. See [IIO controls](iio/README.md#运行中修改采集策略).
+The serdev receive callback now explicitly uses the target Linux 5.10 `int`
+signature; the former `typeof` typedef for cross-kernel return-type inference
+has been removed. A newer kernel with a `size_t` callback needs adaptation.
 
 Baud changes stage 40102, save/reboot through 40110=1 at the old rate, wait,
 switch the host UART, and verify. Sampling configuration follows that reboot;

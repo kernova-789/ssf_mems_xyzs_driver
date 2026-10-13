@@ -676,6 +676,49 @@ static void test_response_matching(void) {
   CHECK(ssf_mems_modbus_parse_response(&transfer, 1, 0, multi, sizeof(multi), NULL, 0) == -ENOMSG);
 }
 
+/* 按名称路径仍通过同一个权限/请求执行器；表删除或重排不能改变映射。 */
+static void test_named_requests(void) {
+  struct serdev_device no_driver = {0};
+  u16 value = 0;
+  size_t i, j;
+
+  reset_sensor();
+  for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
+    const struct ssf_reg_desc *reg = &ssf_reg_table[i];
+    CHECK(reg->name != NULL && reg->name[0] != '\0');
+    CHECK(ssf_mems_modbus_find_reg_by_name(reg->name) == reg);
+    for (j = i + 1; j < SSF_REG_TABLE_SIZE; j++)
+      CHECK(strcmp(reg->name, ssf_reg_table[j].name) != 0);
+  }
+  CHECK(ssf_mems_modbus_find_reg_by_name(NULL) == NULL);
+  CHECK(ssf_mems_modbus_find_reg_by_name("") == NULL);
+  CHECK(ssf_mems_modbus_read_reg_by_name(&serial, "firmware_version", &value, 0) == 0);
+  CHECK(value == wire_value(120) && last_tx[2] == 0 && last_tx[3] == 120);
+  CHECK(ssf_mems_modbus_write_reg_by_name(&serial, "slave_addr", 17, 0) == 0);
+  CHECK(last_tx[3] == 100 && last_tx[4] == 0 && last_tx[5] == 17);
+  mutex_lock(&sensor.protocol.bus_lock);
+  CHECK(ssf_mems_modbus_read_reg_by_name_locked(&serial, "firmware_version", &value, 0) == 0);
+  CHECK(ssf_mems_modbus_write_reg_by_name_locked(&serial, "slave_addr", 18, 0) == 0);
+  mutex_unlock(&sensor.protocol.bus_lock);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, NULL, &value, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "", &value, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(NULL, "baudrate", &value, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "baudrate", NULL, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "FIRMWARE_VERSION", &value, 0), -ENOENT);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&no_driver, "firmware_version", &value, 0), -ENODEV);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial, "firmware_version", 1, 0), -EACCES);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial, NULL, 1, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial, "", 1, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(NULL, "slave_addr", 1, 0), -EINVAL);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial, "missing", 1, 0), -ENOENT);
+  NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial,
+      ssf_mems_modbus_find_reg(40061)->name, 1, 0), -EOPNOTSUPP);
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial,
+      ssf_mems_modbus_find_reg(40054)->name, &value, 0), -EOPNOTSUPP);
+  if (ssf_mems_modbus_find_reg(40050) == NULL)
+    NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "auto_report_enable", &value, 0), -ENOENT);
+}
+
 static void test_requests(void) {
   u16 values[126] = {0x1122, 0xabcd, 0x8001};
   struct serdev_device no_driver = {0};
@@ -1681,6 +1724,7 @@ int main(int argc, char **argv) {
   test_codecs();
   test_response_matching();
   test_requests();
+  test_named_requests();
   test_serial_configuration();
   test_baudrate_management();
   test_baudrate_reboot();

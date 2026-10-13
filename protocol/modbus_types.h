@@ -97,7 +97,7 @@ struct ssf_reg_desc {
   size_t feature_offset;          // 在 ssf_mems_sensor_data 中的字段偏移
   u8 feature_width; /* 0 表示该寄存器不映射到特征缓存。 */
   u16 value_mask;                 // 写入特征缓存前保留的位
-  const char *name;               // 便于阅读和调试的名称
+  const char *name;               // 表内唯一、稳定的查询名称，同时用于调试
 };
 
 /* 上层批量操作的逻辑编号，不是 Modbus 功能码。 */

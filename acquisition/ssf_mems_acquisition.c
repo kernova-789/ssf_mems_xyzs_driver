@@ -32,7 +32,8 @@ static void ssf_mems_acquisition_wait(struct ssf_mems_acquisition_state *acq,
                                      unsigned int delay_ms, bool reconfigure) {
   wait_event_interruptible_timeout(
       acq->waitq, ssf_mems_acquisition_stopping(acq) ||
-                      (reconfigure && READ_ONCE(acq->reconnect)),
+                      (reconfigure && (READ_ONCE(acq->reconnect) ||
+                                       READ_ONCE(acq->config_changed))),
       msecs_to_jiffies(delay_ms));
 }
 
@@ -147,9 +148,16 @@ static int ssf_mems_acquisition_connect(struct ssf_mems_xyzs_data *data) {
 
   acq->phase = SSF_MEMS_ACQ_VERIFY;
   ssf_mems_acquisition_policy_init(&acq->policy, jiffies);
-  ret = ssf_mems_acquisition_sample(data);
-  if (ret != 0)
-    return ret;
+  if (acq->mode == SSF_MEMS_ACQ_MODE_RAW) {
+    /* 速率和采样配置已读回；纯原始模式不额外读取或发布特征。 */
+    acq->online = true;
+    acq->have_sample = false;
+    ssf_mems_protocol_invalidate_features(data);
+  } else {
+    ret = ssf_mems_acquisition_sample(data);
+    if (ret != 0)
+      return ret;
+  }
 
   acq->phase = SSF_MEMS_ACQ_POLL;
   acq->feature_until = jiffies + msecs_to_jiffies(acq->feature_duration_ms);
@@ -177,6 +185,11 @@ static int ssf_mems_acquisition_thread(void *context) {
       mutex_unlock(&acq->lock);
       break;
     }
+    if (acq->config_changed == true) {
+      WRITE_ONCE(acq->config_changed, false);
+      /* 交替模式修改后从完整特征窗口开始；纯原始模式下不使用此截止时间。 */
+      acq->feature_until = jiffies + msecs_to_jiffies(acq->feature_duration_ms);
+    }
     started = jiffies;
     if (acq->phase != SSF_MEMS_ACQ_POLL || acq->reconnect == true) {
       WRITE_ONCE(acq->reconnect, false);
@@ -191,31 +204,38 @@ static int ssf_mems_acquisition_thread(void *context) {
                               "sensor connection failed: %d, retry in %u ms\n",
                               ret, delay_ms);
       } else {
-        /* 首次验证也是一份样本，下一轮从本次完成后计算间隔。 */
-        delay_ms = acq->policy.interval_ms;
+        /* 纯原始模式完成配置后立即开始批次，其他模式保留特征读取间隔。 */
+        delay_ms = acq->mode == SSF_MEMS_ACQ_MODE_RAW ?
+                       ssf_mems_acquisition_gap(data) : acq->policy.interval_ms;
+        if (acq->mode == SSF_MEMS_ACQ_MODE_ALTERNATING)
+          delay_ms = min(delay_ms, acq->feature_duration_ms);
       }
     } else {
-      if (acq->raw_duration_ms != 0 &&
-          time_after_eq(jiffies, acq->feature_until)) {
+      if (acq->mode == SSF_MEMS_ACQ_MODE_RAW ||
+          (acq->mode == SSF_MEMS_ACQ_MODE_ALTERNATING &&
+           time_after_eq(jiffies, acq->feature_until))) {
         acq->phase = SSF_MEMS_ACQ_RAW;
         acq->have_sample = false;
         ret = ssf_mems_protocol_collect_raw(data, acq->raw_duration_ms);
         if (ret == -EOPNOTSUPP) {
-          dev_warn(&data->serdev->dev,
-                   "finite raw mode requires no parity and sampling index 0..8; keeping feature acquisition\n");
-          acq->raw_duration_ms = 0;
-          ret = 0;
+          dev_warn_ratelimited(&data->serdev->dev,
+                   "finite raw mode requires no parity and sampling index 0..8\n");
+          /* 不把用户选择的纯原始模式偷偷变成特征模式。 */
+          ssf_mems_acquisition_offline(data);
+          acq->phase = SSF_MEMS_ACQ_BACKOFF;
         }
         if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
           /* 定长上传未确认结束时不能轮询特征；connect 先完成只读恢复。 */
           ssf_mems_acquisition_offline(data);
           acq->phase = SSF_MEMS_ACQ_BACKOFF;
-        } else {
+        } else if (acq->phase != SSF_MEMS_ACQ_BACKOFF) {
           acq->phase = SSF_MEMS_ACQ_POLL;
         }
         acq->feature_until = jiffies + msecs_to_jiffies(acq->feature_duration_ms);
-        ssf_mems_acquisition_policy_init(&acq->policy, jiffies);
-        if (ret == 0 && ssf_mems_acquisition_stopping(acq) == false)
+        if (ret == 0 || ret == -ENOSPC || ret == -EILSEQ)
+          ssf_mems_acquisition_policy_init(&acq->policy, jiffies);
+        if (ret == 0 && acq->mode != SSF_MEMS_ACQ_MODE_RAW &&
+            ssf_mems_acquisition_stopping(acq) == false)
           ret = ssf_mems_acquisition_sample(data);
       } else {
         ret = ssf_mems_acquisition_sample(data);
@@ -232,7 +252,7 @@ static int ssf_mems_acquisition_thread(void *context) {
                               "sensor communication lost, restarting baud discovery\n");
         } else if (ret != -ENODEV) {
           dev_warn_ratelimited(&data->serdev->dev,
-                              "failed to read sensor features: %d\n", ret);
+                              "sensor acquisition failed: %d\n", ret);
         }
       }
       if (acq->phase == SSF_MEMS_ACQ_BACKOFF) {
@@ -241,8 +261,14 @@ static int ssf_mems_acquisition_thread(void *context) {
         unsigned int elapsed_ms = jiffies_to_msecs(jiffies - started);
         unsigned int gap_ms = ssf_mems_acquisition_gap(data);
 
-        delay_ms = acq->policy.interval_ms > elapsed_ms ?
-                       acq->policy.interval_ms - elapsed_ms : gap_ms;
+        delay_ms = acq->mode == SSF_MEMS_ACQ_MODE_RAW ? gap_ms :
+                       (acq->policy.interval_ms > elapsed_ms ?
+                            acq->policy.interval_ms - elapsed_ms : gap_ms);
+        /* 不因为特征轮询间隔长于窗口而明显推迟切换到原始采集。 */
+        if (acq->mode == SSF_MEMS_ACQ_MODE_ALTERNATING &&
+            time_before(jiffies, acq->feature_until) == true)
+          delay_ms = min(delay_ms,
+                         (unsigned int)jiffies_to_msecs(acq->feature_until - jiffies));
         delay_ms = max(gap_ms, delay_ms);
       }
     }
@@ -264,7 +290,8 @@ static unsigned int ssf_mems_acquisition_window(struct device *dev,
   int ret = device_property_read_u32(dev, property, &value);
 
   if (ret == 0 && ((allow_zero == true && value == 0) ||
-                   (value >= 100U && value <= 60000U)))
+                   (value >= SSF_MEMS_ACQ_MIN_DURATION_MS &&
+                    value <= SSF_MEMS_ACQ_MAX_DURATION_MS)))
     return value;
   dev_info(dev, "could not use %s, using default %u ms\n",
            property, SSF_MEMS_ACQ_WINDOW_MS);
@@ -293,6 +320,17 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
       &data->serdev->dev, "sange-cbm,raw-duration-ms", true);
   acq->feature_duration_ms = ssf_mems_acquisition_window(
       &data->serdev->dev, "sange-cbm,feature-duration-ms", false);
+  /* 兼容旧设备树 raw-duration-ms=0 的“仅特征”语义；保存合法原始窗口供以后切换。 */
+  acq->mode = acq->raw_duration_ms == 0 ? SSF_MEMS_ACQ_MODE_FEATURE :
+                                        SSF_MEMS_ACQ_MODE_ALTERNATING;
+  if (acq->raw_duration_ms == 0)
+    acq->raw_duration_ms = SSF_MEMS_ACQ_WINDOW_MS;
+  if (data->protocol.parity != SSF_MEMS_PARITY_NONE) {
+    acq->mode = SSF_MEMS_ACQ_MODE_FEATURE;
+    dev_info(&data->serdev->dev,
+             "finite raw mode requires no parity; using feature mode\n");
+  }
+  acq->config_changed = false;
   acq->feature_until = 0;
   ssf_mems_acquisition_policy_init(&acq->policy, jiffies);
   dev_info(&data->serdev->dev,
@@ -300,6 +338,79 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
            ssf_mems_baudrate_to_value(acq->target_baudrate),
            SSF_MEMS_ACQ_TARGET_SAMPLING_RATE);
   return 0;
+}
+
+/* 一次锁内复制配置，避免模式和窗口来自不同时刻。 */
+int ssf_mems_acquisition_get_config(
+    struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_config *config) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret = 0;
+
+  if (data == NULL || config == NULL)
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  if (READ_ONCE(acq->stopping) == true) {
+    ret = -ENODEV;
+  } else {
+    config->mode = acq->mode;
+    config->raw_duration_ms = acq->raw_duration_ms;
+    config->feature_duration_ms = acq->feature_duration_ms;
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
+/* 模式只影响主机调度，不请求重新匹配，也不写传感器配置。 */
+int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *data,
+                                  enum ssf_mems_acquisition_mode mode) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret = 0;
+
+  if (data == NULL || (unsigned int)mode >= SSF_MEMS_ACQ_MODE_COUNT)
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  if (READ_ONCE(acq->stopping) == true) {
+    ret = -ENODEV;
+  } else if (mode != SSF_MEMS_ACQ_MODE_FEATURE &&
+             data->protocol.parity != SSF_MEMS_PARITY_NONE) {
+    ret = -EOPNOTSUPP;
+  } else if (acq->mode != mode) {
+    acq->mode = mode;
+    WRITE_ONCE(acq->config_changed, true);
+    if (mode == SSF_MEMS_ACQ_MODE_RAW) {
+      acq->have_sample = false;
+      ssf_mems_protocol_invalidate_features(data);
+    }
+    wake_up_interruptible(&acq->waitq);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
+/* 单独修改一个窗口，避免两个 sysfs 写者读改写整个配置时互相覆盖。 */
+int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *data,
+                                      bool raw_window, unsigned int duration_ms) {
+  struct ssf_mems_acquisition_state *acq;
+  unsigned int *window;
+  int ret = 0;
+
+  if (data == NULL || duration_ms < SSF_MEMS_ACQ_MIN_DURATION_MS ||
+      duration_ms > SSF_MEMS_ACQ_MAX_DURATION_MS)
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  window = raw_window == true ? &acq->raw_duration_ms : &acq->feature_duration_ms;
+  if (READ_ONCE(acq->stopping) == true) {
+    ret = -ENODEV;
+  } else if (*window != duration_ms) {
+    *window = duration_ms;
+    WRITE_ONCE(acq->config_changed, true);
+    wake_up_interruptible(&acq->waitq);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
 }
 
 int ssf_mems_acquisition_start(struct ssf_mems_xyzs_data *data) {

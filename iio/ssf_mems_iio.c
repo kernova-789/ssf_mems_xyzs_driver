@@ -473,6 +473,90 @@ static IIO_DEVICE_ATTR(sensor_firmware_version, 0444,
                        SSF_MEMS_SETTING_FIRMWARE_VERSION);
 static IIO_CONST_ATTR(sensor_sampling_rate_index_available, "0 1 2 3 4 5 6 7 8 9");
 
+/* 属性地址仅分派主机调度配置，不是 Modbus 寄存器地址。 */
+enum ssf_mems_iio_acquisition_control {
+  SSF_MEMS_IIO_ACQ_MODE,             /* raw / feature / alternating。 */
+  SSF_MEMS_IIO_ACQ_RAW_DURATION,     /* 原始窗口，单位 ms。 */
+  SSF_MEMS_IIO_ACQ_FEATURE_DURATION, /* 特征窗口，单位 ms。 */
+};
+
+/* 与采集层枚举对应的用户态名称。 */
+static const char *const ssf_mems_iio_acquisition_modes[] = {
+    [SSF_MEMS_ACQ_MODE_RAW] = "raw",
+    [SSF_MEMS_ACQ_MODE_FEATURE] = "feature",
+    [SSF_MEMS_ACQ_MODE_ALTERNATING] = "alternating",
+};
+
+/* 读取主机配置快照，不发送 Modbus 请求。 */
+static ssize_t ssf_mems_iio_control_show(struct device *dev,
+                                        struct device_attribute *attr,
+                                        char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_acquisition_config config;
+  unsigned long address = to_iio_dev_attr(attr)->address;
+  int ret;
+
+  ret = ssf_mems_acquisition_get_config(state->data, &config);
+  if (ret != 0)
+    return ret;
+  switch (address) {
+  case SSF_MEMS_IIO_ACQ_MODE:
+    if ((unsigned int)config.mode >= ARRAY_SIZE(ssf_mems_iio_acquisition_modes))
+      return -EINVAL;
+    return sysfs_emit(buf, "%s\n", ssf_mems_iio_acquisition_modes[config.mode]);
+  case SSF_MEMS_IIO_ACQ_RAW_DURATION:
+    return sysfs_emit(buf, "%u\n", config.raw_duration_ms);
+  case SSF_MEMS_IIO_ACQ_FEATURE_DURATION:
+    return sysfs_emit(buf, "%u\n", config.feature_duration_ms);
+  default:
+    return -EINVAL;
+  }
+}
+
+/* 仅解析 sysfs 输入；模式和时长由采集层统一加锁应用。 */
+static ssize_t ssf_mems_iio_control_store(struct device *dev,
+                                         struct device_attribute *attr,
+                                         const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned long address = to_iio_dev_attr(attr)->address;
+  unsigned int value;
+  unsigned int i;
+  int ret;
+
+  if (address == SSF_MEMS_IIO_ACQ_MODE) {
+    for (i = 0; i < ARRAY_SIZE(ssf_mems_iio_acquisition_modes); i++) {
+      if (sysfs_streq(buf, ssf_mems_iio_acquisition_modes[i]) == true)
+        break;
+    }
+    if (i == ARRAY_SIZE(ssf_mems_iio_acquisition_modes))
+      return -EINVAL;
+    ret = ssf_mems_acquisition_set_mode(state->data, i);
+  } else {
+    if (address != SSF_MEMS_IIO_ACQ_RAW_DURATION &&
+        address != SSF_MEMS_IIO_ACQ_FEATURE_DURATION)
+      return -EINVAL;
+    ret = kstrtouint(buf, 10, &value);
+    if (ret != 0)
+      return ret;
+    ret = ssf_mems_acquisition_set_duration(
+        state->data, address == SSF_MEMS_IIO_ACQ_RAW_DURATION, value);
+  }
+  if (ret != 0)
+    return ret;
+  return len;
+}
+
+static IIO_DEVICE_ATTR(sensor_acquisition_mode, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_MODE);
+static IIO_CONST_ATTR(sensor_acquisition_mode_available, "raw feature alternating");
+static IIO_DEVICE_ATTR(sensor_raw_duration_ms, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_RAW_DURATION);
+static IIO_DEVICE_ATTR(sensor_feature_duration_ms, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_FEATURE_DURATION);
+
 static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
                                           struct device_attribute *attr,
                                           char *buf) {
@@ -506,6 +590,10 @@ static IIO_CONST_ATTR(
     "460800 500000 512000 600000 750000 921600 1000000");
 
 static struct attribute *ssf_mems_iio_attributes[] = {
+    &iio_dev_attr_sensor_acquisition_mode.dev_attr.attr,
+    &iio_const_attr_sensor_acquisition_mode_available.dev_attr.attr,
+    &iio_dev_attr_sensor_raw_duration_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_feature_duration_ms.dev_attr.attr,
     &iio_dev_attr_sensor_baudrate.dev_attr.attr,
     &iio_dev_attr_sensor_online.dev_attr.attr,
     &iio_dev_attr_sensor_poll_interval_ms.dev_attr.attr,

@@ -69,6 +69,24 @@ core 的 `write_wakeup` 回调转发到 `serdev_device_write_wakeup()`，让同�
 
 ## 接口迁移
 
+### 按寄存器名称访问
+
+`modbus_request.h` 新增 `ssf_mems_modbus_read_reg_by_name()`、
+`ssf_mems_modbus_write_reg_by_name()` 及对应的 `_locked` 版本。原有地址接口不变。
+名称来自 `ssf_reg_table[].name`，表内必须唯一，按大小写精确匹配；重命名属于内部
+接口变更。通过同一张表查到地址后复用原来的校验和执行器，没有第二张地址映射表。
+
+```c
+u16 value;
+ret = ssf_mems_modbus_read_reg_by_name(serdev, "firmware_version", &value, 1000);
+```
+
+空名称/空参数返回 `-EINVAL`，未入表返回 `-ENOENT`；权限、私有响应和串口错误仍
+沿用地址接口。只读一个 16 位原始寄存器，不自动拼接 U32、不换算单位；也不提供
+“名称加 N 个逻辑字段”的连续读取。`_locked` 调用者必须持有 `protocol.bus_lock`。
+写 `"baudrate"` 只写该寄存器，不能代替 `ssf_mems_protocol_set_baudrate()` 的
+保存、重启等待和主机切速流程。当前仍只有 XYZS 的表，多型号选择尚未实现。
+
 业务接口已从 `ssf_mems_modbus_*` 改为 `ssf_mems_protocol_*`，声明统一在 `protocol.h`：
 
 - `ssf_mems_protocol_decode_features()`

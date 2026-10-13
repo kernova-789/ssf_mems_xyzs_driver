@@ -44,7 +44,49 @@ complete sample. Before the first successful sample, the age returns `-ENODATA`.
 A reachable device returning Modbus exceptions can be online while its feature
 cache is stale, so link status and sample age have separate meanings.
 
-## Sensor feature configuration
+## 运行中修改采集策略
+
+在特征设备 `ssf_mems_xyzs` 下增加以下主机调度属性，不改变扫描记录布局：
+
+| 属性 | 取值 |
+| --- | --- |
+| `sensor_acquisition_mode`（读写） | `raw`、`feature`、`alternating` |
+| `sensor_acquisition_mode_available`（只读） | 支持的三个模式名称 |
+| `sensor_raw_duration_ms`（读写） | 原始窗口，十进制 100..60000 ms |
+| `sensor_feature_duration_ms`（读写） | 特征窗口，十进制 100..60000 ms |
+
+`raw` 持续重复完整 1024 点批次，不读取特征，不使用固件 40058 的连续流命令。
+它仍会执行必要的配置读取和批后通信确认，因此不是无间断原始波形。
+`feature` 持续轮询特征，不触发原始批次。`alternating` 从特征窗口开始交替，
+到原始窗口截止时收完在途批次，不为了满足时长截断数据。特征轮询周期仍为 1000 ms。
+
+默认是交替模式、原始/特征各 5000 ms；设备树两项时段继续提供初始值。
+旧 `sange-cbm,raw-duration-ms=0` 仍选择仅特征，但原始窗口读回为可供以后切换的
+5000 ms。运行时写时长不接受 0，请用模式选择关闭某类采集。有校验位时默认仅特征，
+请求含原始采集的模式返回 `-EOPNOTSUPP`，因为当前私有格式只支持无校验。
+
+以 root 身份操作，先将路径中的 X 换为名字是 `ssf_mems_xyzs` 的设备编号：
+
+```sh
+IIO=/sys/bus/iio/devices/iio:deviceX
+cat "$IIO/sensor_acquisition_mode_available"
+echo raw > "$IIO/sensor_acquisition_mode"          # 持续定长采集
+echo feature > "$IIO/sensor_acquisition_mode"      # 持续特征采集
+echo 2000 > "$IIO/sensor_raw_duration_ms"
+echo 3000 > "$IIO/sensor_feature_duration_ms"
+echo alternating > "$IIO/sensor_acquisition_mode"  # 原始约 2 s / 特征约 3 s
+```
+
+这些属性只读写主机状态，不发送保存命令、不重启、不改变波特率或采样率。
+配置与采集共用 `acquisition.lock`；写入可能等待当前原始窗口（最长配置 60 s 加
+在途批次/恢复等待）收尾，返回后唤醒调度。模式/窗口变化后交替调度从新的特征窗口
+开始；同值写不重置窗口。两个窗口分别更新，多个属性写入不是一次原子事务。
+纯原始模式不再提供有效特征缓存；特征 buffer 可能仍存有切换前的旧记录，须按
+时间戳识别。采集模式不自动开启 IIO buffer，仍需应用自行配置并消费对应 buffer。
+设置可在离线时保存于驱动内存并在重连后沿用；卸载后不保留，下一次加载重新使用
+设备树/默认值。新功能只完成离线回归和目标板内核编译，尚未实机验证。
+
+## Sensor feature register configuration
 
 The following attributes query the sensor over Modbus, serialized with
 acquisition and baud-rate recovery. They return `-ENODATA` while offline:

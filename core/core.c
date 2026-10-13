@@ -13,13 +13,8 @@
 #include "modbus_request.h"
 #include "ssf_mems_acquisition.h"
 
-/* receive_buf 在旧内核返回 int，新内核返回 size_t；从 API 本身推导类型。 */
-typedef typeof(((struct serdev_device_ops *)0)->receive_buf(
-    (struct serdev_device *)0, (const unsigned char *)0, (size_t)0))
-    ssf_mems_receive_ret_t;
-
-static ssf_mems_receive_ret_t
-ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
+/* 目标开发板 Linux 5.10 的 receive_buf 回调明确返回 int。 */
+static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
                               const unsigned char *buf, size_t count) {
   ssize_t ret;
 
@@ -30,7 +25,7 @@ ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
     return 0;
   }
 
-  return (ssf_mems_receive_ret_t)ret;
+  return (int)ret;
 }
 
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {

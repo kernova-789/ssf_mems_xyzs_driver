@@ -15,6 +15,11 @@ output, input parsing and error propagation using a mock acquisition interface.
 Baud-rate and status callbacks are not exercised. This validates producer
 synchronization, packing and attribute dispatch, not actual kernel IIO kfifo
 implementation or hardware behavior.
+
+Runtime acquisition-control callbacks are exercised against an acquisition
+substitute: all three mode strings, optional newline, invalid/trailing input,
+decimal duration routing, range errors and shutdown/unsupported errors. Actual
+scheduling is covered by `tests/acquisition`, not by this substitute.
 # 原始 IIO buffer 测试
 
 增加原始 XYZ、包号和包内序号全部 31 种非空字段子集测试，各自覆盖带/不带

@@ -1,5 +1,10 @@
 # Protocol tests
 
+Named-register cases check table-wide unique names, address/name equivalence,
+normal and caller-locked access, invalid/missing names, permissions, private
+responses and deleted entries across all table variants. They use the production
+request executor and do not introduce a second address mapping.
+
 Run from the repository root:
 
 ```sh

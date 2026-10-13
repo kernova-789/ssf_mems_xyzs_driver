@@ -445,6 +445,66 @@ int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
                                           timeout_ms, true);
 }
 
+/* 名称只用于定位表项；收发、权限和总线锁沿用已有单寄存器读取。 */
+static int ssf_mems_modbus_read_name(struct serdev_device *serdev,
+                                    const char *name, u16 *value,
+                                    unsigned int timeout_ms, bool bus_locked) {
+  const struct ssf_reg_desc *reg;
+
+  if (serdev == NULL || name == NULL || name[0] == '\0' || value == NULL)
+    return -EINVAL;
+  reg = ssf_mems_modbus_find_reg_by_name(name);
+  if (reg == NULL)
+    return -ENOENT;
+  if (bus_locked == true)
+    return ssf_mems_modbus_read_reg_locked(serdev, reg->display_reg, value,
+                                          timeout_ms);
+  return ssf_mems_modbus_read_reg(serdev, reg->display_reg, value, timeout_ms);
+}
+
+/* 普通按名称读取，内部获取总线锁。 */
+int ssf_mems_modbus_read_reg_by_name(struct serdev_device *serdev,
+                                    const char *name, u16 *value,
+                                    unsigned int timeout_ms) {
+  return ssf_mems_modbus_read_name(serdev, name, value, timeout_ms, false);
+}
+
+/* 已持总线锁的按名称读取，不重复加锁。 */
+int ssf_mems_modbus_read_reg_by_name_locked(struct serdev_device *serdev,
+                                           const char *name, u16 *value,
+                                           unsigned int timeout_ms) {
+  return ssf_mems_modbus_read_name(serdev, name, value, timeout_ms, true);
+}
+
+/* 查表后复用原有写路径，不额外发送保存或重启命令。 */
+static int ssf_mems_modbus_write_name(struct serdev_device *serdev,
+                                     const char *name, u16 value,
+                                     unsigned int timeout_ms, bool bus_locked) {
+  const struct ssf_reg_desc *reg;
+
+  if (serdev == NULL || name == NULL || name[0] == '\0')
+    return -EINVAL;
+  reg = ssf_mems_modbus_find_reg_by_name(name);
+  if (reg == NULL)
+    return -ENOENT;
+  return ssf_mems_modbus_write_reg_common(serdev, reg->display_reg, value,
+                                          timeout_ms, bus_locked);
+}
+
+/* 普通按名称写入，内部获取总线锁。 */
+int ssf_mems_modbus_write_reg_by_name(struct serdev_device *serdev,
+                                     const char *name, u16 value,
+                                     unsigned int timeout_ms) {
+  return ssf_mems_modbus_write_name(serdev, name, value, timeout_ms, false);
+}
+
+/* 已持总线锁的按名称写入，不重复加锁。 */
+int ssf_mems_modbus_write_reg_by_name_locked(struct serdev_device *serdev,
+                                            const char *name, u16 value,
+                                            unsigned int timeout_ms) {
+  return ssf_mems_modbus_write_name(serdev, name, value, timeout_ms, true);
+}
+
 /* 返回 0 连续写入成功，-EINVAL 参数/范围错误，-ENOENT 地址缺失，-EACCES 不可写，-EOPNOTSUPP 帧格式不支持，-ENODEV 无设备/关闭中，-EBUSY 请求占用，-ENOMEM 分配失败，-EIO 发送不足，-EREMOTEIO 从机异常，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；其他负值来自组帧或串口。 */
 static int ssf_mems_modbus_write_regs_common(
     struct serdev_device *serdev, u16 display_reg, u16 reg_count,

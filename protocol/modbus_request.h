@@ -75,6 +75,24 @@ int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
 int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
                                      u16 display_reg, u16 value,
                                      unsigned int timeout_ms);
+/* 按表项 name 读取一个原始寄存器值；空参数 -EINVAL，名称缺失 -ENOENT，
+ * 其余返回值同 read_reg；不做单位换算，不触发高层配置流程。 */
+int ssf_mems_modbus_read_reg_by_name(struct serdev_device *serdev,
+                                    const char *name, u16 *value,
+                                    unsigned int timeout_ms);
+/* 同上，调用者必须已经持有 protocol.bus_lock。 */
+int ssf_mems_modbus_read_reg_by_name_locked(struct serdev_device *serdev,
+                                           const char *name, u16 *value,
+                                           unsigned int timeout_ms);
+/* 按 name 执行一次 0x06 写入，权限和功能码仍按表校验；写 baudrate 不等于
+ * 完成波特率切换，保存/重启流程仍须调用 protocol 的业务接口。 */
+int ssf_mems_modbus_write_reg_by_name(struct serdev_device *serdev,
+                                     const char *name, u16 value,
+                                     unsigned int timeout_ms);
+/* 同上，调用者必须已经持有 protocol.bus_lock。 */
+int ssf_mems_modbus_write_reg_by_name_locked(struct serdev_device *serdev,
+                                            const char *name, u16 value,
+                                            unsigned int timeout_ms);
 /* 连续写入 1～123 个寄存器，校验失败不发送；返回 0 成功，-EINVAL 参数/数量/地址范围错误，-ENOENT 地址未入表，-EACCES 不可写，-EOPNOTSUPP 帧格式不支持，-ENODEV 无设备/关闭中，-EBUSY 请求占用，-ENOMEM 分配失败，-EIO 发送不足，-EREMOTEIO 从机异常，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；其他负值来自组帧或串口。 */
 /* 此接口检查寄存器权限，设备是否接受任意子范围的 0x10 仍需实测。 */
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,

@@ -2,6 +2,7 @@
 
 #include <linux/kernel.h>
 #include <linux/stddef.h>
+#include <linux/string.h>
 
 #include "modbus_types.h"
 #include "sensor_data.h"
@@ -673,6 +674,21 @@ ssf_mems_modbus_find_reg(u16 display_reg) {
 
   for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
     if (ssf_reg_table[i].display_reg == display_reg)
+      return &ssf_reg_table[i];
+  }
+  return NULL;
+}
+
+/* 名称是稳定的内部标识，区分大小写；仅在当前表查找，未找到返回 NULL。 */
+static inline const struct ssf_reg_desc *
+ssf_mems_modbus_find_reg_by_name(const char *name) {
+  size_t i;
+
+  if (name == NULL || name[0] == '\0')
+    return NULL;
+  for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
+    if (ssf_reg_table[i].name != NULL &&
+        strcmp(ssf_reg_table[i].name, name) == 0)
       return &ssf_reg_table[i];
   }
   return NULL;
