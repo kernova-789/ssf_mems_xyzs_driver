@@ -9,12 +9,12 @@
 u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len) {
   u16 crc = SSF_MEMS_MODBUS_CRC_INIT;
 
-  while (len--) {
+  while (len-- != 0) {
     int i;
 
     crc ^= *buf++;
     for (i = 0; i < 8; i++)
-      crc = (crc & 1) ? (crc >> 1) ^ SSF_MEMS_MODBUS_CRC_POLY : crc >> 1;
+      crc = (crc & 1) != 0 ? (crc >> 1) ^ SSF_MEMS_MODBUS_CRC_POLY : crc >> 1;
   }
   return crc;
 }
@@ -49,7 +49,7 @@ int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame,
        byte_count / frame->rx_bytes_per_reg > frame->max_reg_count))
     return -EMSGSIZE;
 
-  len = frame->rx_base_len + (frame->rx_bytes_per_reg ? byte_count : 0);
+  len = frame->rx_base_len + (frame->rx_bytes_per_reg != 0 ? byte_count : 0);
   if (len > SSF_MEMS_MODBUS_MAX_FRAME_LEN)
     return -EMSGSIZE;
   return len;
@@ -66,7 +66,8 @@ static u16 ssf_mems_modbus_get_u16(const u8 *buf, size_t offset) {
   return ((u16)buf[offset] << 8) | buf[offset + 1];
 }
 
-/* 返回组装后的帧长度；-EINVAL 参数/布局错误，-ENOSPC 帧缓冲区不足，其他负值来自帧长度检查。 */
+/* 返回组装后的帧长度；-EINVAL 参数/布局错误，-ENOSPC 帧缓冲区不足，
+ * -EOPNOTSUPP 无发送格式，-EMSGSIZE 超出 RTU 上限。 */
 int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
                                  u8 slave_id, const u16 *values,
                                  size_t values_count, u8 *buf, size_t capacity) {
@@ -108,6 +109,7 @@ int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
       ssf_mems_modbus_put_u16(buf, frame->tx_data_offset + i * sizeof(u16), values[i]);
   }
 
+  /* RTU 线上 CRC 低字节在前，与寄存器的大端数据顺序不同。 */
   crc = ssf_mems_modbus_crc16(buf, len - SSF_MEMS_MODBUS_CRC_LEN);
   buf[len - 2] = crc & 0xff;
   buf[len - 1] = crc >> 8;

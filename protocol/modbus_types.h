@@ -9,15 +9,16 @@
  */
 
 /* RTU 公共参数：CRC 规则、异常标志、默认地址及帧/寄存器上限。 */
-#define SSF_MEMS_MODBUS_CRC_LEN 2U
-#define SSF_MEMS_MODBUS_CRC_INIT 0xffffU
-#define SSF_MEMS_MODBUS_CRC_POLY 0xa001U
-#define SSF_MEMS_MODBUS_EXCEPTION_FLAG 0x80U
-#define SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID 0x01U
-#define SSF_MEMS_MODBUS_READ_MAX_REGS 125U
-#define SSF_MEMS_MODBUS_WRITE_MAX_REGS 123U
-#define SSF_MEMS_MODBUS_MAX_FRAME_LEN 256U
+#define SSF_MEMS_MODBUS_CRC_LEN 2U /* 普通 RTU 帧末尾 CRC 字节数。 */
+#define SSF_MEMS_MODBUS_CRC_INIT 0xffffU /* CRC16 初值。 */
+#define SSF_MEMS_MODBUS_CRC_POLY 0xa001U /* 反射形式 CRC 多项式。 */
+#define SSF_MEMS_MODBUS_EXCEPTION_FLAG 0x80U /* 异常应答功能码最高位。 */
+#define SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID 0x01U /* 手册默认从站地址。 */
+#define SSF_MEMS_MODBUS_READ_MAX_REGS 125U /* 一次普通读取的最大寄存器数。 */
+#define SSF_MEMS_MODBUS_WRITE_MAX_REGS 123U /* 一次 0x10 写入的最大寄存器数。 */
+#define SSF_MEMS_MODBUS_MAX_FRAME_LEN 256U /* 标准 RTU 帧容量，不含私有原始/OTA 帧。 */
 
+/* 标准寄存器读写功能码，数值直接出现在 RTU 帧中。 */
 enum ssf_mems_modbus_func {
   SSF_MEMS_MODBUS_FUNC_READ = 0x03,         // 读保持寄存器
   SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE = 0x06, // 写单个寄存器
@@ -26,38 +27,38 @@ enum ssf_mems_modbus_func {
 
 /* 块命令的操作方向。 */
 enum ssf_cmd_dir {
-  SSF_CMD_READ,
-  SSF_CMD_WRITE,
+  SSF_CMD_READ, /* 从传感器读取。 */
+  SSF_CMD_WRITE, /* 向传感器写入。 */
 };
 
 /* 寄存器权限位，可用 SSF_REG_READ | SSF_REG_WRITE 表示可读写。 */
 enum ssf_reg_access {
-  SSF_REG_READ = BIT(0),
-  SSF_REG_WRITE = BIT(1),
+  SSF_REG_READ = BIT(0), /* 允许读取。 */
+  SSF_REG_WRITE = BIT(1), /* 允许写入。 */
 };
 
 /* 一个寄存器是 U16/S16，或是某个 U32 的高/低 16 位。 */
 enum ssf_reg_type {
-  SSF_REG_U16,
-  SSF_REG_S16,
-  SSF_REG_U32_HIGH,
-  SSF_REG_U32_LOW,
+  SSF_REG_U16, /* 无符号 16 位值。 */
+  SSF_REG_S16, /* 二补码有符号 16 位值。 */
+  SSF_REG_U32_HIGH, /* 无符号 32 位值的高 16 位。 */
+  SSF_REG_U32_LOW, /* 无符号 32 位值的低 16 位。 */
 };
 
 /* 请求帧的组帧方式；NONE 表示该描述不用于发送。 */
 enum ssf_tx_format {
-  SSF_TX_READ_REGS,
-  SSF_TX_WRITE_SINGLE,
-  SSF_TX_WRITE_MULTI,
-  SSF_TX_NONE,
+  SSF_TX_READ_REGS, /* 0x03：起始地址和寄存器数量。 */
+  SSF_TX_WRITE_SINGLE, /* 0x06：地址和一个写入值。 */
+  SSF_TX_WRITE_MULTI, /* 0x10：地址、数量及连续写入值。 */
+  SSF_TX_NONE, /* 只描述接收，不允许构造请求。 */
 };
 
 /* 响应帧的解析方式，包括标准响应、异常响应和设备私有数据。 */
 enum ssf_rx_format {
-  SSF_RX_HOLDING_REGS,
-  SSF_RX_WRITE_SINGLE_ECHO,
-  SSF_RX_WRITE_MULTI_ACK,
-  SSF_RX_EXCEPTION,
+  SSF_RX_HOLDING_REGS, /* 0x03：字节数和寄存器数据。 */
+  SSF_RX_WRITE_SINGLE_ECHO, /* 0x06：回显地址和写入值。 */
+  SSF_RX_WRITE_MULTI_ACK, /* 0x10：确认地址和写入数量。 */
+  SSF_RX_EXCEPTION, /* 功能码最高位置位，并携带异常码。 */
   SSF_RX_RAW_AXIS, /* 私有原始轴数据，通用读取接口不支持。 */
   SSF_RX_RAW_XYZ, /* 私有 0x15 XYZ 流，由独立流解析器处理。 */
 };
@@ -102,8 +103,8 @@ struct ssf_reg_desc {
 
 /* 上层批量操作的逻辑编号，不是 Modbus 功能码。 */
 enum ssf_block_cmd_id {
-  SSF_BLOCK_READ_ALL_FEATURES,
-  SSF_BLOCK_WRITE_WORK_PARAMETERS,
+  SSF_BLOCK_READ_ALL_FEATURES, /* 分段读取全部保留的特征表项。 */
+  SSF_BLOCK_WRITE_WORK_PARAMETERS, /* 批量写入 40061～40070 工作参数。 */
 };
 
 /* 描述一个高层批量命令；sparse_read 表示允许跳过缺失表项分段读取。 */

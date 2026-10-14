@@ -8,13 +8,15 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 初始化等待队列和计数器，后续启停由协议层在 bus_lock 下负责。 */
+/* 初始化等待队列和计数器，后续启停由协议层在 bus_lock 下负责。
+ * 无返回值，不发送数据，也不切换串口。 */
 void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data) {
   memset(&data->raw, 0, sizeof(data->raw));
   init_waitqueue_head(&data->raw.waitq);
 }
 
-/* 按固件格式拆出 64 组 XYZ；不转换成浮点数、不调换固件已经映射的 Y/Z。 */
+/* 拆出并发布一包 64 组 XYZ；保留固件 Y/Z 映射，不做浮点换算。
+ * 无返回值，序号异常/IIO 推送失败记录到计数器。 */
 static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
   u32 sequence = ((u32)raw->packet[1] << 24) |
@@ -47,6 +49,7 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
         raw->batch_done == true)
       break;
 
+    /* 每组六字节按 X/Y/Z 的大端有符号 16 位值解码。 */
     for (axis = 0; axis < 3U; axis++)
       sample.xyz[axis] = (s16)(((u16)raw->packet[offset + axis * 2U] << 8) |
                                raw->packet[offset + axis * 2U + 1U]);
@@ -66,7 +69,8 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
 }
 
 /* 私有包是 0x15 + BE32 包号 + 384 字节 XYZ + CRC16 + 0x17；没有从站地址。
- * 损坏后逐字节滑动找下一个通过 CRC 的包，兼容拆包、粘包和任意二进制载荷。 */
+ * 损坏后逐字节滑动找下一个通过 CRC 的包，兼容拆包、粘包和任意二进制载荷。
+ * 无返回值，仅由接收工作项持 parse_lock 调用，错误计入统计。 */
 void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_raw_state *raw = &data->raw;
 

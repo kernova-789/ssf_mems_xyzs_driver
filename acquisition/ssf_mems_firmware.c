@@ -7,7 +7,11 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 文件加载在采集锁之外进行；真正传输期间不允许采集或 IIO 配置抢占总线。 */
+/* 文件加载在采集锁之外进行；真正传输期间不允许采集或 IIO 配置抢占总线。
+ * 返回 0 升级确认完成；-EINVAL 文件名非法，-ENOENT 文件不存在，-ENOMEM 加载内存不足，
+ * -EFBIG 镜像过大，-ENOEXEC 向量表不匹配，-EBUSY 升级占用/链路模式不允许，
+ * -ENODATA 未上线，-ENODEV 停止中，-EINTR 被信号中断；其余含义见 ota_transfer()。
+ * 其他负 errno 原样来自 firmware 加载器（如 -EACCES 文件访问受限、-EIO 读取失败）。 */
 int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
                                          const char *name) {
   const struct firmware *firmware = NULL;

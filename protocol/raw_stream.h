@@ -6,8 +6,8 @@
 
 struct ssf_mems_xyzs_data;
 
-#define SSF_MEMS_RAW_PACKET_BYTES 392U
-#define SSF_MEMS_RAW_SAMPLES_PER_PACKET 64U
+#define SSF_MEMS_RAW_PACKET_BYTES 392U /* 头、包号、XYZ 载荷、CRC 和结束标记总长度。 */
+#define SSF_MEMS_RAW_SAMPLES_PER_PACKET 64U /* 一个私有包内同步 XYZ 样本数。 */
 #define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 一批 XYZ 组数；使用固件零长度的默认值。 */
 #define SSF_MEMS_RAW_BATCH_PACKETS 16U /* 1024 / 64，每批包号固定为 0..15。 */
 
@@ -37,8 +37,8 @@ struct ssf_mems_raw_state {
   u16 sampling_rate_index; /* 本轮启动前读回的采样率索引，用于解释原始序列。 */
 };
 
-/* 初始化私有流状态；不发送数据，也不切换串口。 */
+/* 初始化私有流状态；无返回值，不发送数据，也不切换串口。 */
 void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data);
 
-/* 消费一个字节；仅由接收工作项在持有 parse_lock 时调用。 */
+/* 消费一个字节；无返回值，仅由接收工作项持 parse_lock 调用，错误计入统计。 */
 void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);

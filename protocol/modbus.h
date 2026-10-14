@@ -12,7 +12,8 @@ int ssf_mems_modbus_tx_frame_len(const struct ssf_modbus_frame_desc *frame, u16 
 /* 返回响应帧长度；-EINVAL 无描述，-EMSGSIZE 普通读取字节数为零、非整寄存器或超限。 */
 int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame, u8 byte_count);
 
-/* 返回组装帧长度；-EINVAL 参数/布局错误，-ENOSPC 容量不足，其他负值来自帧长度检查。 */
+/* 返回组装帧长度；-EINVAL 参数/布局错误，-ENOSPC 容量不足，
+ * -EOPNOTSUPP 无发送格式，-EMSGSIZE 帧超出 RTU 上限。 */
 int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
                                  u8 slave_id, const u16 *values, size_t values_count,
                                  u8 *buf, size_t capacity);

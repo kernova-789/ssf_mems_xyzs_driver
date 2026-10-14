@@ -7,11 +7,11 @@
 
 struct ssf_mems_xyzs_data;
 
-#define SSF_MEMS_OTA_BLOCK_SIZE 256U
-#define SSF_MEMS_OTA_FRAME_SIZE 263U
-#define SSF_MEMS_OTA_APP_ADDRESS 0x08020000U
-#define SSF_MEMS_OTA_MAX_SIZE (256U * 1024U)
-#define SSF_MEMS_OTA_NAME_SIZE 128U
+#define SSF_MEMS_OTA_BLOCK_SIZE 256U /* 一包写入的固定载荷字节数。 */
+#define SSF_MEMS_OTA_FRAME_SIZE 263U /* 6 字节头 + 256 字节载荷 + 1 字节校验。 */
+#define SSF_MEMS_OTA_APP_ADDRESS 0x08020000U /* Bootloader 的应用区起点。 */
+#define SSF_MEMS_OTA_MAX_SIZE (256U * 1024U) /* 应用区/暂存区容量，字节。 */
+#define SSF_MEMS_OTA_NAME_SIZE 128U /* 文件名缓冲区容量，包含结尾 NUL。 */
 
 /* complete 表示传输应答及重启后通信已确认，不代表整镜像读回校验。 */
 enum ssf_mems_ota_stage {
@@ -50,24 +50,36 @@ struct ssf_mems_ota_state {
   u32 next_packet;             /* 当前应答报告的下一包号。 */
 };
 
-/* 初始化/关闭仅改变主机状态，不发送升级或重启命令。 */
+/* 初始化 OTA 状态；无返回值，data 必须有效，不发送串口命令。 */
 void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data);
+/* 禁止新升级并唤醒等待者；无返回值，不发送重启命令。 */
 void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data);
-/* 检查应用区大小、栈指针和 Thumb 复位入口；不证明机型或签名匹配。 */
+/* 检查应用区大小、栈指针和 Thumb 复位入口；不证明机型或签名匹配。
+ * 返回 0 基础校验通过，-EINVAL 空数据/不足 8 字节，-EFBIG 超过 256 KiB，
+ * -ENOEXEC 栈指针/复位入口不满足应用区要求。 */
 int ssf_mems_ota_validate_image(const u8 *image, size_t size);
-/* 只允许 firmware 目录下的简单 .bin 文件名，不接受路径或嵌入 NUL。 */
+/* 解析简单 .bin 文件名；返回 0 成功，-EINVAL 空参数、路径、非法字符/长度/后缀。
+ * name 必须提供 SSF_MEMS_OTA_NAME_SIZE 字节空间。 */
 int ssf_mems_ota_parse_name(const char *buf, size_t len, char *name);
-/* 组包时尾块填充 0xff；最后一个有数据的包使用 0xffffffff 包号。 */
+/* 组包时尾块填充 0xff；最后一个有数据的包使用 0xffffffff 包号。
+ * 返回 0 成功，-EINVAL 地址非法、载荷超长或缓冲区指针为空。
+ * frame 必须提供 SSF_MEMS_OTA_FRAME_SIZE 字节空间。 */
 int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
                               size_t size, u8 *frame);
-/* 仅在 OTA 模式由接收工作项调用，可处理碎片和连续应答。 */
+/* 接收工作项处理一个 OTA 字节；无返回值，收齐应答后唤醒发送者。 */
 void ssf_mems_ota_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);
-/* 调用者持 update_lock 和采集锁；函数独占 bus_lock，失败不自动提交或重启。 */
+/* 调用者持 update_lock 和采集锁，函数独占 bus_lock；失败不自动重启。
+ * 返回 0 分包应答及重启后通信已确认，不代表整镜像读回验证；
+ * -EINVAL 参数非法，-EFBIG 镜像过大，-ENOEXEC 向量表不符，-EBUSY 模式/速率不允许，
+ * -ENODEV 停止中，-EPROTO 包计数不符，-EIO 串口短写，-ETIMEDOUT 应答/启动验证超时，
+ * -EINTR 被信号打断；其他为版本读取请求错误（见 modbus_request.h）或串口负 errno。 */
 int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
                           const u8 *image, size_t size);
-/* 短锁读写状态，供采集入口和 IIO 展示使用。 */
+/* 更新阶段/错误码，开始加载时清旧进度；无返回值，只获取短锁。 */
 void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
                             enum ssf_mems_ota_stage stage, int error);
+/* 复制升级进度快照；无返回值，data/status 必须有效，不获取采集锁。 */
 void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
                              struct ssf_mems_ota_status *status);
+/* 返回静态阶段名称字符串，非法枚举返回 "unknown"，不会返回 NULL。 */
 const char *ssf_mems_ota_stage_name(enum ssf_mems_ota_stage stage);

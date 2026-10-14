@@ -12,10 +12,12 @@
 
 /* 仅由接收工作项串行消费 FIFO 并拼帧；返回 0 已消费，-EINVAL 空设备，-ENODEV 无驱动数据或接收已关闭。 */
 static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev);
+/* 释放候选帧内存并归还槽位；无返回值。 */
 static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot);
 
 /* 串口驱动可能分批交付字节，不能拿交付时间直接当作线上的 t1.5。
- * 使用最长 RTU 帧传输时间加调度余量，避免因工作队列延迟误丢完整帧。 */
+ * 使用最长 RTU 帧传输时间加调度余量，避免因工作队列延迟误丢完整帧。
+ * 返回候选帧最长存活 jiffies，包含完整线上传输时间和调度余量。 */
 static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_xyzs_data *data) {
   unsigned int baudrate = READ_ONCE(data->protocol.host_baudrate);
   unsigned int bits = READ_ONCE(data->protocol.parity) == SSF_MEMS_PARITY_NONE ? 10U : 11U;
@@ -27,6 +29,7 @@ static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_xyzs_data *data) {
   return msecs_to_jiffies(wire_ms + SSF_MEMS_RX_EXPIRY_MARGIN_MS);
 }
 
+/* 清理超期半帧，已排队字节优先解析；无返回值，关闭/flush 时跳过。 */
 static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   struct ssf_mems_modbus_receive_state *rx =
       container_of(work, struct ssf_mems_modbus_receive_state, expiry_work.work);
@@ -46,7 +49,8 @@ static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
     return;
   }
   /* 已交付但尚未解析的字节应先被解析。push() 会重新启动空闲计时。 */
-  expired = kfifo_is_empty(&rx->fifo) && time_after_eq(now, rx->last_rx + expiry);
+  expired = kfifo_is_empty(&rx->fifo) == true &&
+            time_after_eq(now, rx->last_rx + expiry) == true;
   if (expired == false)
     mod_delayed_work(system_wq, &rx->expiry_work, expiry);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
@@ -136,7 +140,8 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   return 0;
 }
 
-/* 清空旧串口参数下的字节和候选帧；清理期间到达的字节也会被丢弃。 */
+/* 清空旧串口参数下的字节和候选帧；清理期间到达的字节也会被丢弃。
+ * 无返回值；空指针或已关闭时直接返回。 */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
@@ -194,6 +199,7 @@ void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   mutex_unlock(&rx->parse_lock);
 }
 
+/* 返回最近接收活动的 jiffies，用于发送前检测空闲；包含 flush 期间丢弃的字节。 */
 unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data) {
   unsigned long flags;
   unsigned long last_rx;
@@ -370,7 +376,8 @@ static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
   }
 }
 
-/* 识别普通 Modbus 从机地址并创建候选帧；私有流在字节入口另行处理。 */
+/* 识别普通 Modbus 从机地址并创建候选帧；私有流在字节入口另行处理。
+ * 遇到本机地址时尝试建立候选帧；无返回值，无空槽仅记录限速日志。 */
 static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_frame_slot *slot;
 
@@ -464,7 +471,7 @@ static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev) {
     mutex_unlock(&rx->parse_lock);
     return -ENODEV;
   }
-  while (!READ_ONCE(rx->shutting_down) && !READ_ONCE(rx->flushing) &&
+  while (READ_ONCE(rx->shutting_down) == false && READ_ONCE(rx->flushing) == false &&
          kfifo_out_spinlocked(&rx->fifo, &byte, sizeof(byte), &rx->fifo_lock) == sizeof(byte))
     ssf_mems_rx_process_byte(data, byte);
   mutex_unlock(&rx->parse_lock);

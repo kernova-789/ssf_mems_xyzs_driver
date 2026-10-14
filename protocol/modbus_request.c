@@ -72,7 +72,8 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
   return 0;
 }
 
-/* 按实际串口格式估算线上发送时间，并预留调度/控制器余量。 */
+/* 按实际串口格式估算线上发送时间，并预留调度/控制器余量。
+ * 返回完整发送的超时毫秒数，含线上时间与调度余量，至少 100 ms。 */
 static unsigned int
 ssf_mems_modbus_write_timeout_ms(const struct ssf_mems_xyzs_data *data,
                                  size_t len) {
@@ -183,14 +184,15 @@ static void ssf_mems_modbus_finish_request(struct ssf_mems_modbus_request_state 
   req->status = status;
 }
 
-/* 返回请求的最终 status，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；取走结果后释放请求占用。 */
+/* 返回 0 请求成功，-EREMOTEIO 从机异常，-EFAULT 输出缓冲区异常，
+ * -ENODEV 被卸载中断，-ETIMEDOUT 超时，-ERESTARTSYS 信号打断；取走后释放占用。 */
 static int ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *req,
                                        unsigned int timeout_ms) {
   long wait_ret;
   int ret;
 
   mutex_unlock(&req->lock);
-  wait_ret = wait_event_interruptible_timeout(req->waitq, !READ_ONCE(req->pending),
+  wait_ret = wait_event_interruptible_timeout(req->waitq, READ_ONCE(req->pending) == false,
                                                msecs_to_jiffies(timeout_ms));
   mutex_lock(&req->lock);
   if (req->pending == false) {
@@ -204,6 +206,7 @@ static int ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *re
   return ret;
 }
 
+/* 返回 3.5 字符时间对应的帧间静默 jiffies，至少按 2 ms 换算。 */
 static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_xyzs_data *data) {
   unsigned int baudrate = READ_ONCE(data->protocol.host_baudrate);
   unsigned int bits = READ_ONCE(data->protocol.parity) == SSF_MEMS_PARITY_NONE ? 35U : 39U;
@@ -214,13 +217,15 @@ static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_xyzs_data *dat
 }
 
 /* 调用者持 bus_lock、保留 busy，但不持 req.lock。旧应答在 pending=false
- * 期间只会被丢弃。等待可由卸载中断，连续噪声也不会无限阻塞。 */
+ * 期间只会被丢弃。等待可由卸载中断，连续噪声也不会无限阻塞。
+ * 返回 0 静默和隔离条件满足，-ENODEV 关闭中，-ETIMEDOUT 总线持续忙，
+ * -ERESTARTSYS 被信号打断；调用者持总线锁，但不能持请求锁。 */
 static int ssf_mems_modbus_prepare_request(struct ssf_mems_xyzs_data *data,
                                            bool recovery_read) {
   struct ssf_mems_modbus_request_state *req = &data->modbus_req;
   unsigned long silent = ssf_mems_modbus_silent_ticks(data);
   unsigned long now = jiffies;
-  unsigned long deadline = time_after(req->quarantine_until, now) ?
+  unsigned long deadline = time_after(req->quarantine_until, now) == true ?
                                req->quarantine_until : now;
 
   deadline += msecs_to_jiffies(SSF_MEMS_MODBUS_IDLE_WAIT_MS);
@@ -259,7 +264,9 @@ static int ssf_mems_modbus_prepare_request(struct ssf_mems_xyzs_data *data,
   }
 }
 
-/* 执行已校验请求；返回 0 成功，-EINVAL 空设备，-ENODEV 无驱动数据/关闭中，-EBUSY 请求占用；其他负值来自发送、响应或等待。 */
+/* 执行已校验请求；返回 0 成功，-EINVAL 空设备，-ENODEV 无设备/关闭中，
+ * -EBUSY 请求占用，-EAGAIN 当前总线模式不允许；其他负值及含义见请求头文件。
+ * 校验/CRC 不匹配的候选帧会丢弃，等待正确应答或最终超时。 */
 static int ssf_mems_modbus_execute(struct serdev_device *serdev,
                                   const struct ssf_modbus_transfer *transfer,
                                   const u16 *tx_values, size_t tx_values_count,
@@ -299,6 +306,7 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
   }
 
   req->busy = true;
+  /* 保留总线所有权，但先放开请求锁，让旧帧回调和 flush 可以完成。 */
   mutex_unlock(&req->lock);
   ret = ssf_mems_modbus_prepare_request(data, recovery_read);
   mutex_lock(&req->lock);
@@ -314,6 +322,7 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
   req->values = rx_values;
   req->values_count = rx_values_count;
   req->write_value = transfer->frame->tx_format == SSF_TX_WRITE_SINGLE ? tx_values[0] : 0;
+  /* 先发布等待状态再发送，避免快速应答先到达而被当作无主帧丢弃。 */
   req->status = -ETIMEDOUT;
   req->pending = true;
 
@@ -358,6 +367,7 @@ static int ssf_mems_modbus_read_block_range_common(
                                  values_count, timeout_ms, bus_locked, false);
 }
 
+/* 读取块命令中的实际连续段；返回 0 成功，-EINVAL 参数/范围错误，-ENOENT 地址缺失，-EACCES 不可读，-EOPNOTSUPP 格式不支持；其他负值同通用读取。 */
 int ssf_mems_modbus_read_block_range(struct serdev_device *serdev,
                                      const struct ssf_block_cmd_desc *block,
                                      u16 display_reg, u16 reg_count,
@@ -368,6 +378,7 @@ int ssf_mems_modbus_read_block_range(struct serdev_device *serdev,
       false);
 }
 
+/* 调用者已持 bus_lock 的块读取；返回值及含义同 read_block_range()。 */
 int ssf_mems_modbus_read_block_range_locked(
     struct serdev_device *serdev, const struct ssf_block_cmd_desc *block,
     u16 display_reg, u16 reg_count, u16 *values, size_t values_count,
@@ -391,6 +402,7 @@ int ssf_mems_modbus_read_reg(struct serdev_device *serdev, u16 display_reg,
   return ssf_mems_modbus_read(serdev, display_reg, 1, value, 1, timeout_ms);
 }
 
+/* 调用者已持 bus_lock 的单寄存器读取；返回值及含义同 read_reg()。 */
 int ssf_mems_modbus_read_reg_locked(struct serdev_device *serdev,
                                     u16 display_reg, u16 *value,
                                     unsigned int timeout_ms) {
@@ -398,7 +410,8 @@ int ssf_mems_modbus_read_reg_locked(struct serdev_device *serdev,
       serdev, NULL, display_reg, 1, value, 1, timeout_ms, true);
 }
 
-/* 退出原始流时仍需确认普通应答，不能因 shutting_down 而省略确认。 */
+/* 退出原始流时仍需确认普通应答，不能因 shutting_down 而省略确认。
+ * 返回 0 成功；其余错误同普通读取，OTA 模式仍返回 -EAGAIN。 */
 int ssf_mems_modbus_read_reg_recovery_locked(struct serdev_device *serdev,
                                              u16 display_reg, u16 *value,
                                              unsigned int timeout_ms) {
@@ -433,12 +446,14 @@ static int ssf_mems_modbus_write_reg_common(struct serdev_device *serdev,
                                  timeout_ms, bus_locked, false);
 }
 
+/* 以 0x06 写入 write_single 为真的可写寄存器；返回 0 成功，-EOPNOTSUPP 表项不支持 0x06；其余校验、发送、响应和等待错误同 ssf_mems_modbus_write_regs()。 */
 int ssf_mems_modbus_write_reg(struct serdev_device *serdev, u16 display_reg,
                               u16 value, unsigned int timeout_ms) {
   return ssf_mems_modbus_write_reg_common(serdev, display_reg, value,
                                           timeout_ms, false);
 }
 
+/* 调用者已持 bus_lock 的单寄存器写入；返回值及含义同 write_reg()。 */
 int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
                                      u16 display_reg, u16 value,
                                      unsigned int timeout_ms) {
@@ -446,7 +461,9 @@ int ssf_mems_modbus_write_reg_locked(struct serdev_device *serdev,
                                           timeout_ms, true);
 }
 
-/* 名称只用于定位表项；收发、权限和总线锁沿用已有单寄存器读取。 */
+/* 名称只用于定位表项；收发、权限和总线锁沿用已有单寄存器读取。
+ * 返回 0 成功，-EINVAL 空参数/空名称，-ENOENT 名称未入表；
+ * 其余负值及含义同 ssf_mems_modbus_read_reg()。 */
 static int ssf_mems_modbus_read_name(struct serdev_device *serdev,
                                     const char *name, u16 *value,
                                     unsigned int timeout_ms, bool bus_locked) {
@@ -463,21 +480,25 @@ static int ssf_mems_modbus_read_name(struct serdev_device *serdev,
   return ssf_mems_modbus_read_reg(serdev, reg->display_reg, value, timeout_ms);
 }
 
-/* 普通按名称读取，内部获取总线锁。 */
+/* 普通按名称读取，内部获取总线锁。
+ * 返回值同 read_reg；不做单位换算，不触发高层配置流程。 */
 int ssf_mems_modbus_read_reg_by_name(struct serdev_device *serdev,
                                     const char *name, u16 *value,
                                     unsigned int timeout_ms) {
   return ssf_mems_modbus_read_name(serdev, name, value, timeout_ms, false);
 }
 
-/* 已持总线锁的按名称读取，不重复加锁。 */
+/* 已持总线锁的按名称读取，不重复加锁。
+ * 返回值及含义同 read_reg_by_name()。 */
 int ssf_mems_modbus_read_reg_by_name_locked(struct serdev_device *serdev,
                                            const char *name, u16 *value,
                                            unsigned int timeout_ms) {
   return ssf_mems_modbus_read_name(serdev, name, value, timeout_ms, true);
 }
 
-/* 查表后复用原有写路径，不额外发送保存或重启命令。 */
+/* 查表后复用原有写路径，不额外发送保存或重启命令。
+ * 返回 0 成功，-EINVAL 空参数/空名称，-ENOENT 名称未入表；
+ * 其余负值及含义同 ssf_mems_modbus_write_reg()。 */
 static int ssf_mems_modbus_write_name(struct serdev_device *serdev,
                                      const char *name, u16 value,
                                      unsigned int timeout_ms, bool bus_locked) {
@@ -492,14 +513,16 @@ static int ssf_mems_modbus_write_name(struct serdev_device *serdev,
                                           timeout_ms, bus_locked);
 }
 
-/* 普通按名称写入，内部获取总线锁。 */
+/* 普通按名称写入，内部获取总线锁。
+ * 返回 0 成功，-EINVAL 名称/设备为空，-ENOENT 名称缺失；其余错误同 write_reg()。 */
 int ssf_mems_modbus_write_reg_by_name(struct serdev_device *serdev,
                                      const char *name, u16 value,
                                      unsigned int timeout_ms) {
   return ssf_mems_modbus_write_name(serdev, name, value, timeout_ms, false);
 }
 
-/* 已持总线锁的按名称写入，不重复加锁。 */
+/* 已持总线锁的按名称写入，不重复加锁。
+ * 返回值及含义同 write_reg_by_name()。 */
 int ssf_mems_modbus_write_reg_by_name_locked(struct serdev_device *serdev,
                                             const char *name, u16 value,
                                             unsigned int timeout_ms) {
@@ -524,7 +547,7 @@ static int ssf_mems_modbus_write_regs_common(
                                  NULL, 0, timeout_ms, bus_locked, false);
 }
 
-/* 普通连续写：由请求执行器取得总线锁。 */
+/* 普通连续写，由执行器取得总线锁；返回 0 成功，负值及含义同 write_regs_common()。 */
 int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
                                u16 reg_count, const u16 *values,
                                size_t values_count, unsigned int timeout_ms) {
@@ -532,7 +555,8 @@ int ssf_mems_modbus_write_regs(struct serdev_device *serdev, u16 display_reg,
                                           values, values_count, timeout_ms, false);
 }
 
-/* 已持总线锁的连续写：用于原始批采集前配置长度，不重复加锁。 */
+/* 已持总线锁的连续写：用于原始批采集前配置长度，不重复加锁。
+ * 返回值及含义同 write_regs()，仅配置指定范围。 */
 int ssf_mems_modbus_write_regs_locked(
     struct serdev_device *serdev, u16 display_reg, u16 reg_count,
     const u16 *values, size_t values_count, unsigned int timeout_ms) {
@@ -560,6 +584,7 @@ static int ssf_mems_modbus_write_block_common(
                                  NULL, 0, timeout_ms, bus_locked, false);
 }
 
+/* 按块描述执行写入，保留功能码/响应格式/方向和固定范围校验；返回 0 成功，-EINVAL 参数错误，-EOPNOTSUPP 不是可写块或格式不支持；其余负值同 ssf_mems_modbus_write_regs()。 */
 int ssf_mems_modbus_write_block(struct serdev_device *serdev,
                                 const struct ssf_block_cmd_desc *block,
                                 const u16 *values, size_t values_count,
@@ -568,6 +593,7 @@ int ssf_mems_modbus_write_block(struct serdev_device *serdev,
       serdev, block, values, values_count, timeout_ms, false);
 }
 
+/* 已持 bus_lock 的块写入；返回值及含义同 write_block()。 */
 int ssf_mems_modbus_write_block_locked(
     struct serdev_device *serdev, const struct ssf_block_cmd_desc *block,
     const u16 *values, size_t values_count, unsigned int timeout_ms) {

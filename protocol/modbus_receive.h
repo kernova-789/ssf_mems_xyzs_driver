@@ -15,18 +15,19 @@ struct ssf_modbus_frame_desc;
 typedef int (*ssf_mems_frame_handler_t)(void *context, const u8 *buf, size_t len);
 
 #define SSF_MEMS_RX_FIFO_SIZE 16384U /* 容纳定长批次上传时的接收调度抖动。 */
-#define SSF_MEMS_FRAME_SLOT_NUM 4
-#define SSF_MEMS_FRAME_SLOT_FREE 0
-#define SSF_MEMS_FRAME_SLOT_USED 1
-#define SSF_MEMS_RX_EXPIRY_MARGIN_MS 100U
+#define SSF_MEMS_FRAME_SLOT_NUM 4 /* 同时保留的帧边界候选数。 */
+#define SSF_MEMS_FRAME_SLOT_FREE 0 /* 候选槽位可分配。 */
+#define SSF_MEMS_FRAME_SLOT_USED 1 /* 候选槽位已占用。 */
+#define SSF_MEMS_RX_EXPIRY_MARGIN_MS 100U /* 半帧寿命额外调度余量，ms。 */
 
+/* 单个候选帧的解析阶段，与总线业务模式无关。 */
 enum ssf_mems_rx_state {
-  SSF_MEMS_RX_IDLE,
-  SSF_MEMS_RX_FUNC,
-  SSF_MEMS_RX_DATA,
-  SSF_MEMS_RX_CRC,
-  SSF_MEMS_RX_DONE,
-  SSF_MEMS_RX_ERROR,
+  SSF_MEMS_RX_IDLE, /* 槽位未保存候选帧。 */
+  SSF_MEMS_RX_FUNC, /* 已收到从站地址，等待功能码。 */
+  SSF_MEMS_RX_DATA, /* 收集字节数或响应数据。 */
+  SSF_MEMS_RX_CRC, /* 收集帧末尾的两个 CRC 字节。 */
+  SSF_MEMS_RX_DONE, /* 已收齐帧，准备校验并交付。 */
+  SSF_MEMS_RX_ERROR, /* 预留错误状态，异常候选通常直接释放。 */
 };
 
 /*
@@ -42,14 +43,14 @@ struct ssf_mems_frame_slot {
   size_t data_pos;  //当前已经接收了多少字节
   size_t frame_len; //根据帧头判断出来的“这一帧应该有多少字节”
 
-  enum ssf_mems_rx_state state;
+  enum ssf_mems_rx_state state; /* 当前候选帧解析阶段。 */
 
-  u8 slave_id;
-  u8 function;
+  u8 slave_id; /* 本候选帧的从站地址。 */
+  u8 function; /* 本候选帧的响应功能码。 */
   const struct ssf_modbus_frame_desc *frame_desc; // 来自表的响应长度和布局描述
   unsigned long started; // 候选帧创建时刻，寿命预算由当前波特率决定
 
-  atomic_t in_use;
+  atomic_t in_use; /* FREE/USED 标记，防止同一槽位被重复认领。 */
 };
 
 /* 接收模块独立拥有字节 FIFO、FIFO 锁、解析工作项和候选帧槽位。 */
@@ -75,10 +76,10 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
 
 /* 清空 FIFO 和未完成候选帧；发送准备及波特率切换时调用，不得持请求锁。
- * 空指针或已关闭时直接返回。 */
+ * 无返回值；空指针或已关闭时直接返回。 */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
 
-/* 最近串口接收活动，用于发送前检测空闲；包括 flush 期间被丢弃的字节。 */
+/* 返回最近接收活动的 jiffies，用于发送前检测空闲；包含 flush 期间丢弃的字节。 */
 unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data);
 
 /* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */

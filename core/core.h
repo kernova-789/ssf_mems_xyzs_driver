@@ -14,14 +14,14 @@ struct iio_dev;
 
 /* core 只组合设备和各模块状态，模块内部的变量由各自负责初始化和管理。 */
 struct ssf_mems_xyzs_data {
-  struct serdev_device *serdev;
+  struct serdev_device *serdev; /* 与板载 UART 绑定的串口设备。 */
   u8 slave_id; // 当前设备实例对应的 Modbus 从机地址
-  struct ssf_mems_modbus_receive_state modbus_rx;
-  struct ssf_mems_modbus_request_state modbus_req;
-  struct ssf_mems_protocol_state protocol;
-  struct ssf_mems_acquisition_state acquisition;
+  struct ssf_mems_modbus_receive_state modbus_rx; /* 字节 FIFO 和接收拼帧状态。 */
+  struct ssf_mems_modbus_request_state modbus_req; /* 当前请求和响应等待状态。 */
+  struct ssf_mems_protocol_state protocol; /* 总线模式、串口配置和特征缓存。 */
+  struct ssf_mems_acquisition_state acquisition; /* 采集线程、调度和恢复状态。 */
   struct iio_dev *indio_dev; // IIO 对象的创建/释放由 iio 目录代码负责
   struct iio_dev *raw_indio_dev; /* 独立的 XYZ 原始采样 IIO 设备。 */
-  struct ssf_mems_raw_state raw; /* 私有连续流的拼包和丢包统计状态。 */
+  struct ssf_mems_raw_state raw; /* 私有定长数据的拼包和丢包统计状态。 */
   struct ssf_mems_ota_state ota; /* bin 升级的应答、进度和生命周期。 */
 };

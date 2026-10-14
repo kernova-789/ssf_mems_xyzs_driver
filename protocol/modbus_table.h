@@ -650,7 +650,8 @@ ssf_mems_modbus_find_frame(u8 function) {
   return NULL;
 }
 
-/* 按响应功能码查帧；如 0x83 先还原为 0x03，再返回通用异常描述。 */
+/* 按响应功能码查帧；返回普通/异常描述指针，功能码未支持时返回 NULL。
+ * 如 0x83 先确认对应的 0x03 已支持，再返回通用异常描述。 */
 static inline const struct ssf_modbus_frame_desc *
 ssf_mems_modbus_find_rx_frame(u8 function) {
   const struct ssf_modbus_frame_desc *normal;

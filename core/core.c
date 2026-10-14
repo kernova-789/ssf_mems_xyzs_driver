@@ -13,7 +13,8 @@
 #include "modbus_request.h"
 #include "ssf_mems_acquisition.h"
 
-/* 目标开发板 Linux 5.10 的 receive_buf 回调明确返回 int。 */
+/* Linux 5.10 串口接收回调；返回实际入队字节数，0 表示本次未接收/内部失败。
+ * 部分入队时 serdev 可重送剩余字节，不把请求错误码交给串口层。 */
 static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
                               const unsigned char *buf, size_t count) {
   ssize_t ret;
@@ -28,15 +29,19 @@ static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
   return (int)ret;
 }
 
+/* UART 发送队列有空间时唤醒 serdev 写入者；无返回值。 */
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {
   serdev_device_write_wakeup(serdev);
 }
 
+/* serdev 回调表：接收只入队，发送唤醒交给 serdev 通用实现。 */
 static const struct serdev_device_ops ssf_mems_xyzs_ops = {
     .receive_buf = ssf_mems_xyzs_ops_receive_buf,
     .write_wakeup = ssf_mems_xyzs_ops_write_wakeup,
 };
 
+/* 绑定串口、初始化模块并启动后台线程；返回 0 成功，-EINVAL 启动配置非法，
+ * -ENOMEM 分配失败；其他负 errno 由串口打开、IIO 注册或线程创建透传，见各模块接口。 */
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   int ret;
@@ -47,6 +52,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
 
   data->serdev = serdev;
 
+  /* probe 只初始化主机状态；真正匹配和 Modbus 读写由后台线程执行。 */
   ret = ssf_mems_protocol_init(data);
   if (ret != 0) {
     dev_err(&serdev->dev, "failed to initialize protocol configuration: %d\n",
@@ -96,6 +102,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   return 0;
 
 err_iio:
+  /* 与成功初始化的顺序相反回滚；先停止所有使用 IIO/接收状态的生产者。 */
   ssf_mems_ota_shutdown(data);
   ssf_mems_modbus_request_remove(data);
   ssf_mems_acquisition_stop(data);
@@ -107,6 +114,7 @@ err_request:
   return ret;
 }
 
+/* 依次停止升级、请求、采集及接收；无返回值，先等生产者退出再释放资源。 */
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   data = serdev_device_get_drvdata(serdev);
@@ -118,6 +126,7 @@ static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   ssf_mems_modbus_receive_remove(data);
 }
 
+/* 当前只绑定温振声型号；最后一个空项是 OF 匹配表的结束标记。 */
 static const struct of_device_id ssf_mems_of_matchs[] = {
     {
         .compatible = "sange-cbm,ssf-mems-xyzs",
@@ -126,6 +135,7 @@ static const struct of_device_id ssf_mems_of_matchs[] = {
 
 MODULE_DEVICE_TABLE(of, ssf_mems_of_matchs);
 
+/* 将设备树匹配、绑定/解绑入口及模块所有者交给 serdev 总线。 */
 static struct serdev_device_driver ssf_mems_driver = {
     .driver =
         {

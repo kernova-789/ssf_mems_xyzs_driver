@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
+/* 比较单轴的全部特征；返回 true 字段全部相同，false 至少一项不同。 */
 static bool ssf_mems_axis_equal(const struct ssf_mems_axis_features *a,
                                 const struct ssf_mems_axis_features *b) {
   return a->high_freq_acc_rms_x100 == b->high_freq_acc_rms_x100 &&
@@ -17,7 +18,8 @@ static bool ssf_mems_axis_equal(const struct ssf_mems_axis_features *a,
          a->velocity_rms_x100 == b->velocity_rms_x100;
 }
 
-/* 按字段比较，避免结构体尾部填充字节影响重复判定。 */
+/* 按字段比较，避免结构体尾部填充字节影响重复判定。
+ * 返回 true 两份完整特征相同，false 至少一项不同；不比较填充字节。 */
 static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
                                   const struct ssf_mems_sensor_data *b) {
   return ssf_mems_axis_equal(&a->x, &b->x) &&
@@ -33,18 +35,21 @@ static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
          a->startup_flags == b->startup_flags;
 }
 
+/* 清空当前调速窗口统计；无返回值，不清除上次样本和连接时间。 */
 static void ssf_mems_reset_window(struct ssf_mems_acquisition_policy *policy) {
   policy->comparisons = 0;
   policy->repeats = 0;
   policy->max_read_ms = 0;
 }
 
+/* 将轮询周期缩短约 5%，受最小周期限制；无返回值。 */
 static void ssf_mems_poll_faster(struct ssf_mems_acquisition_policy *policy) {
   unsigned int step = max(1U, policy->interval_ms / 20U);
 
   policy->interval_ms = max(SSF_MEMS_POLL_MIN_MS, policy->interval_ms - step);
 }
 
+/* 重置策略并设置初始周期；无返回值，policy 必须有效。 */
 void ssf_mems_acquisition_policy_init(
     struct ssf_mems_acquisition_policy *policy, unsigned long now) {
   memset(policy, 0, sizeof(*policy));
@@ -53,6 +58,7 @@ void ssf_mems_acquisition_policy_init(
   policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
 }
 
+/* 记录一次成功样本并按窗口调整周期；无返回值，指针必须有效。 */
 void ssf_mems_acquisition_policy_sample(
     struct ssf_mems_acquisition_policy *policy,
     const struct ssf_mems_sensor_data *sample, unsigned int read_ms,
@@ -89,18 +95,22 @@ void ssf_mems_acquisition_policy_sample(
   ssf_mems_reset_window(policy);
 }
 
+/* 记录错误；返回 true 需重新连接，false 尚未达到次数/时间阈值或非通信错误。
+ * -EREMOTEIO 说明收到合法从机异常，清除断线计数。 */
 bool ssf_mems_acquisition_policy_error(
     struct ssf_mems_acquisition_policy *policy, int error, unsigned long now) {
   policy->have_previous = false;
   ssf_mems_reset_window(policy);
 
   if (error == -EREMOTEIO) {
+    /* 收到合法异常应答仍说明线路可达，不能据此启动波特率扫描。 */
     policy->link_failures = 0;
     policy->last_contact = now;
     return false;
   }
   if (error != -ETIMEDOUT && error != -EIO && error != -EBADMSG)
     return false;
+  /* 同时满足失败次数与无通信时间，避免单次丢包触发重连。 */
   if (policy->link_failures < SSF_MEMS_LINK_FAILURE_LIMIT)
     policy->link_failures++;
   return policy->link_failures >= SSF_MEMS_LINK_FAILURE_LIMIT &&

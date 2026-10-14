@@ -19,33 +19,35 @@ struct ssf_mems_raw_sample {
  * 保留原始定点表示既可避免在内核中进行浮点运算，也能避免二次量化。
  */
 struct ssf_mems_axis_features {
-  u16 high_freq_acc_rms_x100;     /* g */
-  u16 low_freq_velocity_rms_x100; /* mm/s */
-  u16 acc_peak_to_peak_x100; /* g */
-  u16 acc_peak_x100;         /* g */
-  u16 acc_rms_x100;          /* g */
-  u16 kurtosis_x100;
-  u16 velocity_rms_x100; /* mm/s */
+  u16 high_freq_acc_rms_x100; /* 高频加速度有效值，g × 100。 */
+  u16 low_freq_velocity_rms_x100; /* 低频速度有效值，mm/s × 100。 */
+  u16 acc_peak_to_peak_x100; /* 加速度峰峰值，g × 100。 */
+  u16 acc_peak_x100; /* 加速度峰值，g × 100。 */
+  u16 acc_rms_x100; /* 加速度有效值，g × 100。 */
+  u16 kurtosis_x100; /* 峭度，无量纲 × 100。 */
+  u16 velocity_rms_x100; /* 速度有效值，mm/s × 100。 */
 };
 
+/* 声音特征，保留固件的 dB 定点表示。 */
 struct ssf_mems_sound_features {
-  u16 rms_db_x100;          /* dB */
-  u16 peak_db_x100;         /* dB */
-  u16 peak_to_peak_db_x100; /* dB */
+  u16 rms_db_x100; /* 声音有效值，dB × 100。 */
+  u16 peak_db_x100; /* 声音峰值，dB × 100。 */
+  u16 peak_to_peak_db_x100; /* 声音峰峰值，dB × 100。 */
 };
 
+/* 一次完整特征快照；各字段来自同一轮寄存器读取。 */
 struct ssf_mems_sensor_data {
-  struct ssf_mems_axis_features x;
-  struct ssf_mems_axis_features y;
-  struct ssf_mems_axis_features z;
+  struct ssf_mems_axis_features x; /* X 轴振动特征。 */
+  struct ssf_mems_axis_features y; /* Y 轴振动特征。 */
+  struct ssf_mems_axis_features z; /* Z 轴振动特征。 */
 
   s16 temperature_x100; /* 摄氏度，固件负温以二补码传输 */
-  struct ssf_mems_sound_features sound;
+  struct ssf_mems_sound_features sound; /* 声音特征。 */
   u16 zero_crossing_rate_percent; /* 百分数，寄存器 1 = 1% */
-  u16 spectral_centroid_hz_x10;   /* Hz */
+  u16 spectral_centroid_hz_x10; /* 频谱重心，Hz × 10。 */
   u16 spectral_flux_x100;         /* 无标准物理单位的频谱差平方和 */
 
   /* 位 0..2 为 XYZ 运行判定：去直流加速度峰值 >= 0.06 g 时置位。
    * MEMS2.0 modebusInBuff 输出 motor_run_flag，0 不代表采集被禁用。 */
-  u8 startup_flags;
+  u8 startup_flags; /* XYZ 运行判定位，定义见上方说明。 */
 };
