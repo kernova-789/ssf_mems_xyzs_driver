@@ -385,7 +385,7 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
   unsigned int i;
   int ret;
 
-  ret = kstrtouint(buf, 0, &value);
+  ret = kstrtouint(buf, 0, &value); //字符串转无符号整数
   if (ret != 0)
     return ret;
 
@@ -475,16 +475,16 @@ static IIO_CONST_ATTR(sensor_sampling_rate_index_available, "0 1 2 3 4 5 6 7 8 9
 
 /* 属性地址仅分派主机调度配置，不是 Modbus 寄存器地址。 */
 enum ssf_mems_iio_acquisition_control {
-  SSF_MEMS_IIO_ACQ_MODE,             /* raw / feature / alternating。 */
+  SSF_MEMS_IIO_ACQ_MODE,             /* 采集模式，raw / feature / alternating。 */
   SSF_MEMS_IIO_ACQ_RAW_DURATION,     /* 原始窗口，单位 ms。 */
   SSF_MEMS_IIO_ACQ_FEATURE_DURATION, /* 特征窗口，单位 ms。 */
 };
 
 /* 与采集层枚举对应的用户态名称。 */
 static const char *const ssf_mems_iio_acquisition_modes[] = {
-    [SSF_MEMS_ACQ_MODE_RAW] = "raw",
-    [SSF_MEMS_ACQ_MODE_FEATURE] = "feature",
-    [SSF_MEMS_ACQ_MODE_ALTERNATING] = "alternating",
+    [SSF_MEMS_ACQ_MODE_RAW] = "raw",                  //只进行原始数据定长采集
+    [SSF_MEMS_ACQ_MODE_FEATURE] = "feature",          //只进行特征数据采集
+    [SSF_MEMS_ACQ_MODE_ALTERNATING] = "alternating",  //两种数据交替采集
 };
 
 /* 读取主机配置快照，不发送 Modbus 请求。 */
@@ -589,7 +589,43 @@ static IIO_CONST_ATTR(
     "2400 4800 9600 19200 38400 57600 115200 128000 230400 256000 "
     "460800 500000 512000 600000 750000 921600 1000000");
 
+/* 用户传入 firmware 文件名；升级为同步操作，进度可从另一个属性读取。 */
+static ssize_t ssf_mems_iio_firmware_store(struct device *dev,
+                                          struct device_attribute *attr,
+                                          const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  char name[SSF_MEMS_OTA_NAME_SIZE];
+  int ret;
+
+  ret = ssf_mems_ota_parse_name(buf, len, name);
+  if (ret != 0)
+    return ret;
+  ret = ssf_mems_acquisition_update_firmware(state->data, name);
+  return ret != 0 ? ret : (ssize_t)len;
+}
+
+/* 不获取采集锁，避免升级期间查看进度被长事务阻塞。 */
+static ssize_t ssf_mems_iio_firmware_show(struct device *dev,
+                                         struct device_attribute *attr,
+                                         char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_ota_status status;
+
+  ssf_mems_ota_get_status(state->data, &status);
+  return sysfs_emit(buf, "%s %zu/%zu error=%d version=%d blocked=%u\n",
+                    ssf_mems_ota_stage_name(status.stage), status.acknowledged,
+                    status.total, status.error, status.version,
+                    READ_ONCE(state->data->acquisition.firmware_blocked));
+}
+
+static IIO_DEVICE_ATTR(sensor_firmware_update, 0200, NULL,
+                       ssf_mems_iio_firmware_store, 0);
+static IIO_DEVICE_ATTR(sensor_firmware_update_status, 0444,
+                       ssf_mems_iio_firmware_show, NULL, 0);
+
 static struct attribute *ssf_mems_iio_attributes[] = {
+    &iio_dev_attr_sensor_firmware_update.dev_attr.attr,
+    &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr,
     &iio_dev_attr_sensor_acquisition_mode.dev_attr.attr,
     &iio_const_attr_sensor_acquisition_mode_available.dev_attr.attr,
     &iio_dev_attr_sensor_raw_duration_ms.dev_attr.attr,

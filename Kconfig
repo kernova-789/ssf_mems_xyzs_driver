@@ -4,6 +4,7 @@ config SSF_SENSOR
 	select CRC16
 	select IIO_BUFFER
 	select IIO_KFIFO_BUF
+	select FW_LOADER
 	help
 	  Build the SSF sensor driver for a Modbus RTU device connected through
 	  the Linux serial-device (serdev) bus and expose its measurements through

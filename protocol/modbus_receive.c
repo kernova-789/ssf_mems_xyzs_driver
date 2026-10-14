@@ -388,6 +388,11 @@ static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byt
 static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   int i;
 
+  if (READ_ONCE(data->protocol.mode) == SSF_MEMS_LINK_OTA) {
+    ssf_mems_ota_receive_byte(data, byte);
+    return;
+  }
+
   if (READ_ONCE(data->raw.active) == true) {
     ssf_mems_raw_receive_byte(data, byte);
     return;

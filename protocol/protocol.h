@@ -77,6 +77,7 @@ enum ssf_mems_link_mode {
   SSF_MEMS_LINK_RAW_STARTING, /* 启动已发送，固件可能仍在完成当前计算。 */
   SSF_MEMS_LINK_RAW_STREAMING, /* 已收到通过 CRC 校验的原始包。 */
   SSF_MEMS_LINK_RAW_RECOVERING, /* 已停止发布，尚未确认恢复普通通信。 */
+  SSF_MEMS_LINK_OTA, /* bus_lock 内的固件传输；只解析私有 6 字节应答。 */
 };
 
 /* 传感器协议业务状态；lock 保护缓存，bus_lock 串行化所有请求和串口配置。 */

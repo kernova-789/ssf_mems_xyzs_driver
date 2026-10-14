@@ -4,6 +4,14 @@ This directory contains a Linux serdev driver for the SSF MEMS Modbus RTU
 sensor. It validates and decodes Modbus responses, exposes the sensor feature
 registers through IIO, and supports sensor baud-rate discovery and updates.
 
+Application-bin OTA is available through `sensor_firmware_update` and
+`sensor_firmware_update_status` on the feature IIO device. See
+[OTA requirements and board commands](protocol/OTA.md): the image must be linked
+at `0x08020000`, at most 256 KiB, and the RS485 bus must contain only the target
+sensor. The existing reference-tree bin has a different link address and is
+rejected. OTA has offline coverage and a target-kernel build, not a hardware
+flashing result.
+
 ## Layout
 
 - `core/` — serdev probe/remove and shared device state.
@@ -15,6 +23,7 @@ registers through IIO, and supports sensor baud-rate discovery and updates.
   publishing, and communication recovery.
 - `tests/protocol/` — userspace protocol tests with a Linux/serdev shim.
 - `tests/acquisition/` — deterministic acquisition policy and lifecycle tests.
+- `tests/ota/` — application image validation, staged-Flash transfer and fault tests.
 - `tools/` — userspace IIO polling/printf test for the development board;
   see [tools/README.md](tools/README.md) for build and run instructions.
 

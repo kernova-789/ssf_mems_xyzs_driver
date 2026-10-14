@@ -49,6 +49,7 @@ struct ssf_mems_acquisition_state {
   bool stopping;
   bool reconnect;
   bool online;
+  bool firmware_blocked; /* 末包结果不确定时停止自动通信，等待人工处理/再次升级。 */
   bool have_sample;
   enum ssf_mems_acquisition_phase phase;
   enum ssf_mems_baudrate target_baudrate; /* 启动配置/手动设置的目标，不被扫描覆盖。 */
@@ -97,3 +98,7 @@ int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *data,
 /* raw_window=true 配置原始窗口，否则配置特征窗口；范围 100..60000 ms。 */
 int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *data,
                                       bool raw_window, unsigned int duration_ms);
+/* 同步加载 /lib/firmware 下的 bin，等采集窗口结束后独占升级。
+ * 成功后按原配置恢复采集；末包结果不确定时暂停自动串口操作。 */
+int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
+                                         const char *name);

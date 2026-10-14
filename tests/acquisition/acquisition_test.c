@@ -37,7 +37,7 @@ enum scenario {
   CHANGING, CONSTANT, LINK_FAILURE, EXCEPTION, NO_SENSOR, MANUAL,
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
   RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
-  RAW_ONLY_DROPS, SHORT_WINDOWS
+  RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED
 };
 static enum scenario scenario;
 static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
@@ -225,6 +225,11 @@ void test_acquisition_wait(unsigned long timeout) {
   if (wait_count == 1) {
     CHECK(timeout == 1000 && read_count == 0 && get_count == 0);
     if (scenario == STOP_STARTUP)
+      stop_requested = true;
+  } else if (scenario == OTA_BLOCKED) {
+    CHECK(device.acquisition.firmware_blocked == true);
+    CHECK(get_count == 0 && set_count == 0 && read_count == 0 && raw_captures == 0);
+    if (wait_count == 4)
       stop_requested = true;
   } else if (scenario == STOP_VERIFY &&
              device.acquisition.phase == SSF_MEMS_ACQ_VERIFY) {
@@ -709,6 +714,9 @@ static void test_startup_baudrate_target(void) {
 }
 
 int main(void) {
+  enum ssf_mems_baudrate baud;
+  u16 value;
+
   test_policy();
   test_thread_scenarios();
   test_settings();
@@ -753,6 +761,17 @@ int main(void) {
   CHECK(raw_started_at[0] - read_started_at[0] == 105);
   for (unsigned int i = 1; i < raw_captures; i++)
     CHECK(raw_started_at[i] - raw_started_at[i - 1] == 200);
+  reset_device(OTA_BLOCKED);
+  device.acquisition.firmware_blocked = true;
+  device.acquisition.online = false;
+  CHECK(ssf_mems_acquisition_get_baudrate(&device, &baud) == -EBUSY);
+  CHECK(ssf_mems_acquisition_set_baudrate(&device, SSF_MEMS_BAUDRATE_9600) == -EBUSY);
+  CHECK(ssf_mems_acquisition_read_setting(&device, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                          &value) == -EBUSY);
+  CHECK(ssf_mems_acquisition_write_setting(&device, SSF_MEMS_SETTING_SAMPLING_RATE,
+                                           0) == -EBUSY);
+  run_thread();
+  CHECK(get_count == 0 && set_count == 0 && read_count == 0 && raw_captures == 0);
   printf("PASS acquisition policy and lifecycle: %u checks\n", checks);
   return 0;
 }

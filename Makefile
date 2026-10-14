@@ -7,9 +7,11 @@ ssf_mems-y += protocol/modbus_receive.o
 ssf_mems-y += protocol/modbus_request.o
 ssf_mems-y += protocol/protocol.o
 ssf_mems-y += protocol/raw_stream.o
+ssf_mems-y += protocol/ota.o
 ssf_mems-y += iio/ssf_mems_iio.o
 ssf_mems-y += acquisition/ssf_mems_acquisition.o
 ssf_mems-y += acquisition/acquisition_policy.o
+ssf_mems-y += acquisition/ssf_mems_firmware.o
 
 ccflags-y += -I$(src)/core
 ccflags-y += -I$(src)/iio

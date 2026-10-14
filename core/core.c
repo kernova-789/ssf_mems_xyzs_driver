@@ -96,6 +96,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   return 0;
 
 err_iio:
+  ssf_mems_ota_shutdown(data);
   ssf_mems_modbus_request_remove(data);
   ssf_mems_acquisition_stop(data);
   ssf_mems_iio_unregister(data);
@@ -109,6 +110,7 @@ err_request:
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   data = serdev_device_get_drvdata(serdev);
+  ssf_mems_ota_shutdown(data);
   /* 先拒绝新请求并唤醒在途请求，再等待生产者退出，最后释放其使用的资源。 */
   ssf_mems_modbus_request_remove(data);
   ssf_mems_acquisition_stop(data);

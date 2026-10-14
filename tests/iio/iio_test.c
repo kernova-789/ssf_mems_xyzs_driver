@@ -22,6 +22,7 @@ static enum ssf_mems_sensor_setting last_setting;
 static struct ssf_mems_acquisition_config acquisition_config; /* 模拟采集层配置。 */
 static int control_error; /* 模拟配置层关闭或不支持的错误。 */
 static unsigned int control_writes; /* 检查非法 sysfs 输入不会进入配置层。 */
+static unsigned int firmware_updates; /* 检查升级属性仅转交合法文件名。 */
 
 int ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
                                    const struct ssf_mems_sensor_data *features) {
@@ -222,6 +223,12 @@ int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *d,
   return 0;
 }
 int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate b) { abort(); }
+int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
+                                         const char *name) {
+  assert(data == &sensor && strcmp(name, "update.bin") == 0);
+  firmware_updates++;
+  return control_error;
+}
 int sysfs_emit(char *buf, const char *fmt, ...) {
   va_list args;
   int count;
@@ -324,6 +331,35 @@ static void test_acquisition_controls(void) {
   indio.private = NULL;
 }
 
+/* 升级期间进度不依赖采集锁；非法名字不触发文件加载或传感器操作。 */
+static void test_firmware_attributes(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *update = &iio_dev_attr_sensor_firmware_update.dev_attr;
+  struct device_attribute *status = &iio_dev_attr_sensor_firmware_update_status.dev_attr;
+  char buf[4096];
+
+  indio.private = &state;
+  ssf_mems_ota_init(&sensor);
+  assert(update->show == NULL && status->store == NULL);
+  assert(update->store(&indio.dev, update, "update.bin\n", 11) == 11);
+  assert(firmware_updates == 1);
+  assert(update->store(&indio.dev, update, "../update.bin", 13) == -EINVAL);
+  assert(update->store(&indio.dev, update, "", 0) == -EINVAL);
+  assert(update->store(&indio.dev, update, "bad\0file.bin", 12) == -EINVAL);
+  assert(firmware_updates == 1);
+  control_error = -EBUSY;
+  assert(update->store(&indio.dev, update, "update.bin", 10) == -EBUSY);
+  control_error = 0;
+  sensor.ota.status.stage = SSF_MEMS_OTA_SENDING;
+  sensor.ota.status.acknowledged = 256;
+  sensor.ota.status.total = 1001;
+  assert(status->show(&indio.dev, status, buf) > 0);
+  assert(strcmp(buf, "sending 256/1001 error=0 version=-1 blocked=0\n") == 0);
+  pthread_mutex_destroy(&sensor.ota.lock.native);
+  pthread_mutex_destroy(&sensor.ota.update_lock.native);
+  indio.private = NULL;
+}
+
 static void test_raw_status_attributes(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   struct device_attribute *attrs[] = {
@@ -372,6 +408,7 @@ int main(void) {
 
   test_configuration_attributes();
   test_acquisition_controls();
+  test_firmware_attributes();
   test_raw_status_attributes();
   memset(&sample, 0, sizeof(sample));
   for (i = 0; i < SSF_MEMS_IIO_FEATURE_MAX; i++) {

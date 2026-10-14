@@ -185,6 +185,11 @@ static int ssf_mems_acquisition_thread(void *context) {
       mutex_unlock(&acq->lock);
       break;
     }
+    if (acq->firmware_blocked == true) {
+      mutex_unlock(&acq->lock);
+      ssf_mems_acquisition_wait(acq, SSF_MEMS_ACQ_RETRY_INITIAL_MS, false);
+      continue;
+    }
     if (acq->config_changed == true) {
       WRITE_ONCE(acq->config_changed, false);
       /* 交替模式修改后从完整特征窗口开始；纯原始模式下不使用此截止时间。 */
@@ -310,6 +315,7 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
   acq->stopping = false;
   acq->reconnect = false;
   acq->online = false;
+  acq->firmware_blocked = false;
   acq->have_sample = false;
   acq->last_sample = 0;
   acq->phase = SSF_MEMS_ACQ_STARTUP;
@@ -463,6 +469,10 @@ int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *data,
     ret = -ENODEV;
     goto out;
   }
+  if (acq->firmware_blocked == true) {
+    ret = -EBUSY;
+    goto out;
+  }
   ret = ssf_mems_protocol_get_baudrate(data->serdev, baudrate,
                                       SSF_MEMS_ACQ_TIMEOUT_MS);
   if (ret != 0 || ssf_mems_baudrate_to_value(*baudrate) !=
@@ -487,6 +497,10 @@ int ssf_mems_acquisition_set_baudrate(struct ssf_mems_xyzs_data *data,
   mutex_lock(&acq->lock);
   if (READ_ONCE(acq->stopping) == true) {
     ret = -ENODEV;
+    goto out;
+  }
+  if (acq->firmware_blocked == true) {
+    ret = -EBUSY;
     goto out;
   }
   ret = ssf_mems_protocol_set_baudrate(data->serdev, baudrate,
@@ -515,6 +529,8 @@ int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
   mutex_lock(&acq->lock);
   if (READ_ONCE(acq->stopping) == true)
     ret = -ENODEV;
+  else if (acq->firmware_blocked == true)
+    ret = -EBUSY;
   else if (acq->online == false)
     ret = -ENODATA;
   else
@@ -536,6 +552,8 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
   mutex_lock(&acq->lock);
   if (READ_ONCE(acq->stopping) == true) {
     ret = -ENODEV;
+  } else if (acq->firmware_blocked == true) {
+    ret = -EBUSY;
   } else if (acq->online == false) {
     ret = -ENODATA;
   } else {

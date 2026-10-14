@@ -24,18 +24,19 @@ VARIANTS = {
     "delete_finite_start": {40060},
     "reverse_table": set(),
 }
-MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream")
+MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream", "ota")
 HEADERS = (
     "sensor_data.h", "modbus_types.h", "modbus.h", "modbus_table.h",
     "modbus_request.h", "modbus_receive.h", "protocol.h", "core.h",
-    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h", "ota.h",
 )
 ALLOWED_DEPENDENCIES = {
     "modbus": set(),
     "modbus_request": {"modbus", "modbus_receive"},
-    "modbus_receive": {"modbus", "raw_stream"},
-    "protocol": {"modbus", "modbus_request", "modbus_receive", "raw_stream"},
+    "modbus_receive": {"modbus", "raw_stream", "ota"},
+    "protocol": {"modbus", "modbus_request", "modbus_receive", "raw_stream", "ota"},
     "raw_stream": {"modbus", "iio"},
+    "ota": {"modbus_request", "modbus_receive", "protocol"},
 }
 
 def check_module_dependencies(objects):

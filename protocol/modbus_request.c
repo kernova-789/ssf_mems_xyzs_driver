@@ -288,7 +288,8 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
   }
   /* 未确认退出私有流时，只有专用只读恢复接口可以使用总线。
    * 关闭优先返回 -ENODEV，不能让卸载期间的普通调用误以为只需稍后重试。 */
-  if (data->protocol.mode != SSF_MEMS_LINK_MODBUS && recovery_read == false) {
+  if (data->protocol.mode == SSF_MEMS_LINK_OTA ||
+      (data->protocol.mode != SSF_MEMS_LINK_MODBUS && recovery_read == false)) {
     ret = -EAGAIN;
     goto out_unlock;
   }

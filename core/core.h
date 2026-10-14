@@ -8,6 +8,7 @@
 #include "modbus_request.h"
 #include "ssf_mems_acquisition.h"
 #include "raw_stream.h"
+#include "ota.h"
 
 struct iio_dev;
 
@@ -22,4 +23,5 @@ struct ssf_mems_xyzs_data {
   struct iio_dev *indio_dev; // IIO 对象的创建/释放由 iio 目录代码负责
   struct iio_dev *raw_indio_dev; /* 独立的 XYZ 原始采样 IIO 设备。 */
   struct ssf_mems_raw_state raw; /* 私有连续流的拼包和丢包统计状态。 */
+  struct ssf_mems_ota_state ota; /* bin 升级的应答、进度和生命周期。 */
 };

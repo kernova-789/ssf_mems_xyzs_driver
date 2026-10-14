@@ -86,6 +86,17 @@ echo alternating > "$IIO/sensor_acquisition_mode"  # 原始约 2 s / 特征约 3
 设置可在离线时保存于驱动内存并在重连后沿用；卸载后不保留，下一次加载重新使用
 设备树/默认值。新功能只完成离线回归和目标板内核编译，尚未实机验证。
 
+## bin 固件升级
+
+特征设备新增 root 只写的 `sensor_firmware_update` 和只读的
+`sensor_firmware_update_status`。前者接受放在开发板 `/lib/firmware/` 下的 `.bin`
+简单文件名；后者返回阶段、已应答字节数/总字节数、错误码、重启后版本号和暂停标志。
+升级写入为同步操作，状态读取使用独立短锁，不会因升级占用采集锁而等待。
+升级时暂停两种采集，成功后恢复；末包结果不确定时暂停自动通信。
+
+**必须先阅读 [镜像地址、总线限制和操作说明](../protocol/OTA.md)**。
+这不是对任意 bin 的通用烧录接口；目录内原有 bin 的链接地址不适合这套 OTA。
+
 ## Sensor feature register configuration
 
 The following attributes query the sensor over Modbus, serialized with

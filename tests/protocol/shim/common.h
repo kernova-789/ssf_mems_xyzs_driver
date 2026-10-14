@@ -81,10 +81,14 @@ long test_wait_timeout(unsigned long timeout);
 #define mutex_init(p) pthread_mutex_init(&(p)->native, NULL)
 #define mutex_lock(p) pthread_mutex_lock(&(p)->native)
 #define mutex_unlock(p) pthread_mutex_unlock(&(p)->native)
+#define mutex_trylock(p) (pthread_mutex_trylock(&(p)->native) == 0)
+#define mutex_lock_interruptible(p) pthread_mutex_lock(&(p)->native)
 #else
 #define mutex_init(p) ((p)->unused = 0)
 #define mutex_lock(p) ((void)(p))
 #define mutex_unlock(p) ((void)(p))
+#define mutex_trylock(p) ((void)(p), 1)
+#define mutex_lock_interruptible(p) ((void)(p), 0)
 #endif
 #define spin_lock_init(p) (*(p) = 0)
 #define spin_lock_irqsave(p, flags) do { (void)(p); (flags) = 0; } while (0)

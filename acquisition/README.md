@@ -4,6 +4,13 @@
 波特率目标、IIO 数据发布及退出。`acquisition_policy.c/.h` 负责完整快照比较、
 轮询周期调整和通信失败判定，不执行串口操作。
 
+`ssf_mems_firmware.c` 提供同步固件升级入口：先加载和校验 bin，再获取采集锁等待
+当前窗口收尾，交给 `protocol/ota.c` 独占总线传输。锁顺序是 OTA `update_lock` →
+采集 `lock` → 协议 `bus_lock`；进度和应答使用独立的 OTA 短锁。
+成功后沿用原模式/窗口请求重新连接；末包结果不确定时设置 `firmware_blocked`，
+后台停止串口操作，IIO 波特率/传感器配置接口返回 EBUSY。再次成功升级或重新绑定
+才解除该暂停，普通调度模式修改不解除。参见 [OTA 使用说明](../protocol/OTA.md)。
+
 ## 启动与连接
 
 core 在 IIO 注册前初始化采集状态，注册成功后启动 kthread。线程先等待 1000 ms，

@@ -113,6 +113,7 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   memset(&state->features, 0, sizeof(state->features));
   state->valid = false;
   ssf_mems_raw_init(data);
+  ssf_mems_ota_init(data);
   return ssf_mems_protocol_parse_properties(data);
 }
 

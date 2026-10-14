@@ -18,7 +18,9 @@ def main():
         for directory in (TEST_DIR / "shim", ROOT / "tests/protocol/shim",
                           ROOT / "iio", ROOT / "core", ROOT / "protocol", ROOT / "acquisition"):
             flags += ["-I" + str(directory)]
-        subprocess.run(flags + [str(TEST_DIR / "iio_test.c"), "-o", str(executable)], check=True)
+        subprocess.run(flags + [str(TEST_DIR / "iio_test.c"),
+                               str(ROOT / "protocol/ota.c"),
+                               "-o", str(executable)], check=True)
         subprocess.run([str(executable)], check=True)
 
 if __name__ == "__main__":
