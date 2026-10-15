@@ -28,16 +28,17 @@ static const int ssf_mems_baudrates_table[SSF_MEMS_BAUDRATE_MAX] = {
 /* 解析启动属性；返回 0 成功或已使用默认值，-EINVAL 从站地址/校验位非法。 */
 static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data);
 
-/* 高层配置项对应的手册显示地址；特征掩码和完整开关字共用 40070。 */
-static const u16 ssf_mems_setting_registers[SSF_MEMS_SETTING_MAX] = {
-    [SSF_MEMS_SETTING_SAMPLING_RATE] = 40052,
-    [SSF_MEMS_SETTING_SAMPLING_LENGTH] = 40053,
-    [SSF_MEMS_SETTING_PARAMETER_SWITCH] = 40070,
-    [SSF_MEMS_SETTING_FEATURE_ENABLE] = 40070,
-    [SSF_MEMS_SETTING_FIRMWARE_VERSION] = 40121,
+/* 高层配置项对应表项的稳定名称；具体地址由寄存器表决定。 */
+static const char * const ssf_mems_setting_registers[SSF_MEMS_SETTING_MAX] = {
+    [SSF_MEMS_SETTING_SAMPLING_RATE] = "sampling_rate",
+    [SSF_MEMS_SETTING_SAMPLING_LENGTH] = "sampling_length",
+    [SSF_MEMS_SETTING_PARAMETER_SWITCH] = "parameter_switch",
+    [SSF_MEMS_SETTING_FEATURE_ENABLE] = "parameter_switch",
+    [SSF_MEMS_SETTING_FIRMWARE_VERSION] = "firmware_version",
 };
 
-/* 读取指定配置；返回 0 成功，-EINVAL 参数/配置项非法，-ENODEV 无驱动数据；
+/* 读取指定配置；返回 0 成功，-EINVAL 参数/配置项非法，-ENODEV 无驱动数据，
+ * -ENOENT 同名表项缺失；
  * 其余错误及含义见 modbus_request.h 的请求返回值约定。 */
 int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
                                   enum ssf_mems_sensor_setting setting,
@@ -53,7 +54,7 @@ int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
   if (data == NULL)
     return -ENODEV;
   mutex_lock(&data->protocol.bus_lock);
-  ret = ssf_mems_modbus_read_reg_locked(
+  ret = ssf_mems_modbus_read_reg_by_name_locked(
       serdev, ssf_mems_setting_registers[setting], &reg_value, timeout_ms);
   mutex_unlock(&data->protocol.bus_lock);
   if (ret == 0)
@@ -64,13 +65,13 @@ int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
 /* 仅允许采样率索引 0..9 和特征掩码 0..63；不改报警位，不发送保存/重启。
  * 固件自行将采样率变化保存至 Flash。相同值不重复写，写后读回验证。
  * 返回 0 成功/无需写入，-EINVAL 参数/范围非法，-ENODEV 无驱动数据，
- * -EIO 读回值不符；其余错误见 modbus_request.h 的请求返回值约定。 */
+ * -ENOENT 同名表项缺失，-EIO 读回值不符；其余错误见请求层返回值约定。 */
 int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
                                    enum ssf_mems_sensor_setting setting,
                                    u16 value, unsigned int timeout_ms) {
   struct ssf_mems_xyzs_data *data;
+  const struct ssf_reg_desc *reg;
   u16 reg_value, desired, verified;
-  u16 reg;
   int ret;
 
   if (serdev == NULL ||
@@ -83,9 +84,12 @@ int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
   data = serdev_device_get_drvdata(serdev);
   if (data == NULL)
     return -ENODEV;
-  reg = ssf_mems_setting_registers[setting];
+  reg = ssf_mems_modbus_find_reg_by_name(ssf_mems_setting_registers[setting]);
+  if (reg == NULL)
+    return -ENOENT;
   mutex_lock(&data->protocol.bus_lock);
-  ret = ssf_mems_modbus_read_reg_locked(serdev, reg, &reg_value, timeout_ms);
+  ret = ssf_mems_modbus_read_reg_locked(serdev, reg->display_reg, &reg_value,
+                                       timeout_ms);
   if (ret != 0)
     goto out;
   /* 只替换高六位特征使能，保留报警等低十位；同值不写，减少重复配置。 */
@@ -93,10 +97,12 @@ int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
                 (reg_value & 0x03ff) | (value << 10) : value;
   if (desired == reg_value)
     goto out;
-  ret = ssf_mems_modbus_write_reg_locked(serdev, reg, desired, timeout_ms);
+  ret = ssf_mems_modbus_write_reg_locked(serdev, reg->display_reg, desired,
+                                        timeout_ms);
   if (ret != 0)
     goto out;
-  ret = ssf_mems_modbus_read_reg_locked(serdev, reg, &verified, timeout_ms);
+  ret = ssf_mems_modbus_read_reg_locked(serdev, reg->display_reg, &verified,
+                                       timeout_ms);
   if (ret == 0 && verified != desired)
     ret = -EIO;
 out:
@@ -114,6 +120,7 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   data->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
   state = &data->protocol;
   state->baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
+  /* UART 配置前是启动提示值，configure_serial 后才是控制器实际值。 */
   state->host_baudrate =
       ssf_mems_baudrates_table[SSF_MEMS_BAUDRATE_DEFAULT];
   state->parity = SSF_MEMS_PARITY_NONE;
@@ -133,6 +140,7 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
 static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
   struct device *dev = &data->serdev->dev;
   const char *parity;
+  enum ssf_mems_baudrate baudrate;
   u32 value;
   int ret;
 
@@ -153,14 +161,14 @@ static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
     dev_info(dev, "could not read current-speed (%d), using default baud rate 9600\n",
              ret);
   } else {
-    ret = ssf_mems_baudrate_from_value(value, &data->protocol.baudrate);
+    ret = ssf_mems_baudrate_from_value(value, &baudrate);
     if (ret != 0) {
       dev_info(dev, "unsupported current-speed %u, using default baud rate 9600\n",
                value);
-      data->protocol.baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
-      data->protocol.host_baudrate = 9600;
     } else {
-      data->protocol.host_baudrate = value;
+      /* 默认值统一在 init 中设置；仅合法属性才能覆盖。 */
+      data->protocol.baudrate = baudrate;
+      data->protocol.host_baudrate = ssf_mems_baudrate_to_value(baudrate);
     }
   }
 
@@ -195,7 +203,7 @@ int ssf_mems_protocol_handle_frame(void *context, const u8 *buf, size_t len) {
   return 0;
 }
 
-/* 写入当前地址段的已保留特征字段；返回 0 成功，-EINVAL
+/* 将registers[]数组映射到传感器数据结构中；返回 0 成功，-EINVAL
  * 参数或字段映射越界；删除的表项跳过。 */
 static int
 ssf_mems_protocol_decode_feature_range(u16 start_reg, const u16 *registers,
@@ -550,7 +558,8 @@ static int ssf_mems_protocol_set_host_parity(struct ssf_mems_xyzs_data *data,
  * 其他负值来自组帧（含义见 modbus.h）或串口发送。 */
 static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data) {
   struct ssf_modbus_transfer transfer = {0};
-  const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(40060);
+  const struct ssf_reg_desc *reg =
+      ssf_mems_modbus_find_reg_by_name("start_custom_length");
   u8 frame[8];
   int len, ret;
 
@@ -609,13 +618,14 @@ static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_xyzs_data *data) {
   return false;
 }
 
-/* 批次自然结束后只读确认 Modbus；异常/卸载也不发送 40059 或保存命令。
+/* 批次自然结束后只读确认 Modbus；异常/卸载也等待在途批次自然结束。
  * 未见末包时等满原始启动/上传预算，不能把首包前的安静误判为已经结束。
  * 只读验证失败则保留恢复门禁，禁止立即开始新批次或写入参数。
  * 返回 0 已恢复普通通信，-ETIMEDOUT 未静默/读回超时，
- * -EPROTO 波特率值非法；其他负值及含义同请求层的只读恢复接口。 */
+ * -ENOENT 波特率表项缺失，-EPROTO 波特率值非法；其他负值同只读恢复接口。 */
 static int ssf_mems_protocol_raw_finish(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
+  const struct ssf_reg_desc *reg;
   u16 reported;
   int ret;
 
@@ -629,12 +639,15 @@ static int ssf_mems_protocol_raw_finish(struct ssf_mems_xyzs_data *data) {
   }
   if (ssf_mems_protocol_raw_quiet(data) == false)
     return -ETIMEDOUT;
+  reg = ssf_mems_modbus_find_reg_by_name("baudrate");
+  if (reg == NULL)
+    return -ENOENT;
   mutex_lock(&data->modbus_rx.parse_lock);
   if (raw->used != 0)
     WRITE_ONCE(raw->drain_crc_errors, raw->drain_crc_errors + 1U);
   mutex_unlock(&data->modbus_rx.parse_lock);
   ssf_mems_protocol_raw_receiver(data, false);
-  ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, 40102,
+  ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, reg->display_reg,
                                                 &reported, 500);
   if (ret == 0 && reported >= SSF_MEMS_BAUDRATE_MAX)
     ret = -EPROTO;
@@ -666,27 +679,42 @@ int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
 
 /* 只配置 40061/40062 为零（固件默认 1024），不覆盖其余工作参数。
  * 普通请求模式下读、必要时写、再读回；长度寄存器本身不触发 Flash 保存。
- * 返回 0 已确认默认 1024 点长度，-EIO 长度读回不符；
+ * 返回 0 已确认默认 1024 点长度，-ENOENT 长度表项缺失，
+ * -EINVAL 高低字地址不相邻，-EIO 长度读回不符；
  * 其他负值及含义来自请求层读写接口，不发送保存命令。 */
 static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
+  const struct ssf_reg_desc *high_reg =
+      ssf_mems_modbus_find_reg_by_name("custom_length_high");
+  const struct ssf_reg_desc *low_reg =
+      ssf_mems_modbus_find_reg_by_name("custom_length_low");
   const u16 zero[2] = {0, 0};
   u16 high, low;
   int ret;
 
-  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40061, &high, 500);
+  if (high_reg == NULL || low_reg == NULL)
+    return -ENOENT;
+  /* FC10 必须同时写入高低字；换表后不能误写高字旁的其他配置。 */
+  if ((u32)high_reg->display_reg + 1U != low_reg->display_reg ||
+      (u32)high_reg->protocol_addr + 1U != low_reg->protocol_addr)
+    return -EINVAL;
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, high_reg->display_reg,
+                                       &high, 500);
   if (ret != 0)
     return ret;
-  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40062, &low, 500);
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, low_reg->display_reg,
+                                       &low, 500);
   if (ret != 0 || (high == 0 && low == 0))
     return ret;
-  ret = ssf_mems_modbus_write_regs_locked(data->serdev, 40061, 2,
+  ret = ssf_mems_modbus_write_regs_locked(data->serdev, high_reg->display_reg, 2,
                                           zero, ARRAY_SIZE(zero), 500);
   if (ret != 0)
     return ret;
-  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40061, &high, 500);
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, high_reg->display_reg,
+                                       &high, 500);
   if (ret != 0)
     return ret;
-  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40062, &low, 500);
+  ret = ssf_mems_modbus_read_reg_locked(data->serdev, low_reg->display_reg,
+                                       &low, 500);
   if (ret == 0 && (high != 0 || low != 0))
     ret = -EIO;
   return ret;
@@ -696,7 +724,7 @@ static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
  * 首包最长等 15 秒，整批额外保留线上时间和两秒余量；速率低也不误超时。
  * 返回 0 完整收完窗口，-EINVAL 参数非法，-EOPNOTSUPP 校验位/采样率不支持，
  * -ENOENT 必要表项缺失，-ENODEV 停止中，-ETIMEDOUT 启动/收尾超时，
- * -EILSEQ 批次不完整/包损坏，-ENOSPC IIO 丢样，-EPROTO 收尾寄存器异常，
+ * -EILSEQ 批次不完整/包损坏，-ENOSPC IIO 丢样，-EPROTO 采样率/收尾寄存器异常，
  * -EIO 短写/配置读回不符，-ERESTARTSYS 等待被信号打断；其余为请求层错误。 */
 int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
                                  unsigned int duration_ms) {
@@ -718,14 +746,20 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
     if (ret != 0)
       goto out;
   }
-  if (ssf_mems_modbus_find_reg(40060) == NULL) {
+  if (ssf_mems_modbus_find_reg_by_name("start_custom_length") == NULL) {
     ret = -ENOENT;
     goto out;
   }
-  ret = ssf_mems_modbus_read_reg_locked(data->serdev, 40052, &sampling_index, 500);
+  ret = ssf_mems_modbus_read_reg_by_name_locked(
+      data->serdev, "sampling_rate", &sampling_index, 500);
   if (ret != 0)
     goto out;
-  if (sampling_index > 8U) {
+  if (sampling_index > SSF_MEMS_SAMPLING_RATE_MAX_INDEX) {
+    ret = -EPROTO;
+    goto out;
+  }
+  /* 手册允许索引 9，但现行定长原始采集仅验证了 0..8，见 RAW_CAPTURE.md。 */
+  if (sampling_index > SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX) {
     ret = -EOPNOTSUPP;
     goto out;
   }
@@ -748,7 +782,6 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
   WRITE_ONCE(raw->batches, 0);
   WRITE_ONCE(raw->ignored_bytes, 0);
   WRITE_ONCE(raw->start_wait_ms, 0);
-  WRITE_ONCE(raw->stop_attempts, 0);
   WRITE_ONCE(raw->sampling_rate_index, sampling_index);
   mutex_unlock(&data->modbus_rx.parse_lock);
   batch_ms = SSF_MEMS_RAW_START_TIMEOUT_MS + 2000U +
@@ -864,7 +897,8 @@ static int ssf_mems_protocol_read_baudrate_once(
   u16 value;
   int ret;
 
-  ret = ssf_mems_modbus_read_reg_locked(serdev, 40102, &value, timeout_ms);
+  ret = ssf_mems_modbus_read_reg_by_name_locked(serdev, "baudrate", &value,
+                                               timeout_ms);
   if (ret != 0)
     return ret;
   if (value >= SSF_MEMS_BAUDRATE_MAX)
@@ -917,7 +951,7 @@ static int ssf_mems_protocol_verify_baudrate_after_reboot(
     if (ret != -ETIMEDOUT || attempt == SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS)
       return ret;
     dev_info(&data->serdev->dev,
-             "baud change: verification %u/%u timed out at host %u; retrying read-only 40102\n",
+             "baud change: verification %u/%u timed out at host %u; retrying read-only baudrate\n",
              attempt, SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS,
              data->protocol.host_baudrate);
     /* 短等待可快速响应卸载；迟到应答的隔离仍由请求层保证。 */
@@ -927,20 +961,13 @@ static int ssf_mems_protocol_verify_baudrate_after_reboot(
 }
 
 /* 普通读回证明候选速率可通信；暂存寄存器不一定已经生效。
- * 旧连续模式遗留的 1 Mbaud 不属于定长协议，拒绝自动保存或反复停流。
- * 返回 0 接受已响应的速率，-EPROTO 疑似旧的 1 Mbaud 连续模式；不写传感器。 */
-static int ssf_mems_protocol_accept_baudrate(
-    struct ssf_mems_xyzs_data *data, enum ssf_mems_baudrate candidate,
-    enum ssf_mems_baudrate reported, enum ssf_mems_baudrate *accepted) {
-  if (candidate == SSF_MEMS_BAUDRATE_1000000 &&
-      ssf_mems_baudrates_table[reported] != 1000000) {
-    dev_warn(&data->serdev->dev,
-             "possible legacy continuous mode at 1000000; refusing automatic save/reset\n");
-    return -EPROTO;
-  }
-  *accepted = ssf_mems_baudrates_table[reported] ==
-                      ssf_mems_baudrates_table[candidate] ? reported : candidate;
-  return 0;
+ * reported 与 candidate 的实际速率一致时保留固件编码（兼容 0/3 的 9600）；
+ * 不一致则接受已经成功通信的 candidate，而不是未生效的暂存配置。
+ * 返回可通信的速率编码；调用前已校验两个枚举，不写传感器。 */
+static enum ssf_mems_baudrate ssf_mems_protocol_accept_baudrate(
+    enum ssf_mems_baudrate candidate, enum ssf_mems_baudrate reported) {
+  return ssf_mems_baudrates_table[reported] ==
+                 ssf_mems_baudrates_table[candidate] ? reported : candidate;
 }
 
 /* 固件先暂存 40102；40110=1 的旧速率回显后保存并重启才真正生效。
@@ -952,6 +979,8 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
                                    unsigned int timeout_ms) {
   struct ssf_mems_xyzs_data *data;
   struct ssf_modbus_transfer planned;
+  const struct ssf_reg_desc *baud_reg;
+  const struct ssf_reg_desc *save_reg;
   enum ssf_mems_baudrate found;
   int ret;
 
@@ -961,44 +990,49 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
   if (data == NULL)
     return -ENODEV;
 
+  baud_reg = ssf_mems_modbus_find_reg_by_name("baudrate");
+  save_reg = ssf_mems_modbus_find_reg_by_name("save_config_and_reboot");
+  if (baud_reg == NULL || save_reg == NULL)
+    return -ENOENT;
   /* 保存命令不可用时，不先修改传感器的暂存值。 */
   ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
-                                     40102, 1, NULL, &planned);
+                                     baud_reg->display_reg, 1, NULL, &planned);
   if (ret != 0)
     return ret;
   ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
-                                     40110, 1, NULL, &planned);
+                                     save_reg->display_reg, 1, NULL, &planned);
   if (ret != 0)
     return ret;
 
   mutex_lock(&data->protocol.bus_lock);
   dev_info(&serdev->dev,
-           "baud change: host %u, requested %d; staging 40102=%u\n",
+           "baud change: host %u, requested %d; staging %u=%u\n",
            data->protocol.host_baudrate,
-           ssf_mems_baudrate_to_value(baudrate), (unsigned int)baudrate);
-  ret = ssf_mems_modbus_write_reg_locked(serdev, 40102, baudrate,
+           ssf_mems_baudrate_to_value(baudrate), baud_reg->display_reg,
+           (unsigned int)baudrate);
+  ret = ssf_mems_modbus_write_reg_locked(serdev, baud_reg->display_reg, baudrate,
                                          timeout_ms);
   if (ret != 0) {
     dev_err_ratelimited(&serdev->dev,
-                        "baud change failed at 40102 staging: %d (host %u, requested %d)\n",
-                        ret, data->protocol.host_baudrate,
+                        "baud change failed at %u staging: %d (host %u, requested %d)\n",
+                        baud_reg->display_reg, ret, data->protocol.host_baudrate,
                         ssf_mems_baudrate_to_value(baudrate));
     goto out_unlock;
   }
 
   ssf_mems_protocol_invalidate_features(data);
   dev_info(&serdev->dev,
-           "baud change: 40102 acknowledged; saving/rebooting via 40110=1 at host %u\n",
-           data->protocol.host_baudrate);
-  ret = ssf_mems_modbus_write_reg_locked(serdev, 40110, 1, timeout_ms);
+           "baud change: %u acknowledged; saving/rebooting via %u=1 at host %u\n",
+           baud_reg->display_reg, save_reg->display_reg, data->protocol.host_baudrate);
+  ret = ssf_mems_modbus_write_reg_locked(serdev, save_reg->display_reg, 1, timeout_ms);
   if (ret != 0) {
     /* 超时/部分发送时不能排除命令已生效；即使失败也留足重启静默期。
      * 不把丢失的保存应答当成功，不自动重发 Flash 保存命令。 */
     if (ret != -EREMOTEIO && ret != -ENOMEM && ret != -ENODEV)
       msleep(SSF_MEMS_SENSOR_REBOOT_DELAY_MS);
     dev_err_ratelimited(&serdev->dev,
-                        "failed to confirm config save/reboot at 40110: %d (host %u, requested %d)\n",
-                        ret, data->protocol.host_baudrate,
+                        "failed to confirm config save/reboot at %u: %d (host %u, requested %d)\n",
+                        save_reg->display_reg, ret, data->protocol.host_baudrate,
                         ssf_mems_baudrate_to_value(baudrate));
     goto out_unlock;
   }
@@ -1021,8 +1055,8 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
   /* 保存已经确认，不能在验证失败时假装仍使用旧速率。 */
   data->protocol.baudrate = baudrate;
   dev_info(&serdev->dev,
-           "baud change: verifying 40102 after reboot at host %u\n",
-           data->protocol.host_baudrate);
+           "baud change: verifying %u after reboot at host %u\n",
+           baud_reg->display_reg, data->protocol.host_baudrate);
   ret = ssf_mems_protocol_verify_baudrate_after_reboot(
       data, baudrate, &found, timeout_ms);
   if (ret != 0)
@@ -1043,7 +1077,7 @@ out_unlock:
 
 /* 先以当前速率读取；仅当没有可匹配应答而超时时扫描其他枚举速率。
  * 返回 0 匹配成功，-EINVAL 参数非法，-ENODEV 无设备/停止中，
- * -EPROTO 寄存器值异常/疑似旧连续模式，-EIO 主机调速失败，
+ * -EPROTO 寄存器值异常，-EIO 主机调速失败，
  * -ETIMEDOUT 所有候选均无应答；其余错误见 modbus_request.h 的请求返回值约定。 */
 int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
                                    enum ssf_mems_baudrate *baudrate,
@@ -1078,9 +1112,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
   ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
   if (ret == 0) {
     /* 成功应答证明当前主机速率可通信，40102 可能仍是尚未保存的值。 */
-    ret = ssf_mems_protocol_accept_baudrate(data, initial, found, &found);
-    if (ret != 0)
-      goto out_unlock;
+    found = ssf_mems_protocol_accept_baudrate(initial, found);
     state->baudrate = found;
     *baudrate = found;
     goto out_unlock;
@@ -1101,9 +1133,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
 
     ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
     if (ret == 0) {
-      ret = ssf_mems_protocol_accept_baudrate(data, candidate, found, &found);
-      if (ret != 0)
-        goto restore_initial;
+      found = ssf_mems_protocol_accept_baudrate(candidate, found);
       state->baudrate = found;
       *baudrate = found;
       ssf_mems_modbus_receive_flush(data);

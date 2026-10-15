@@ -11,7 +11,7 @@
 struct task_struct;
 struct ssf_mems_xyzs_data;
 
-/* 采集策略；raw 是反复执行完整定长批次，不是固件的连续上传命令。 */
+/* 采集策略；raw 反复执行完整定长批次，每批结束后确认普通通信。 */
 enum ssf_mems_acquisition_mode {
   SSF_MEMS_ACQ_MODE_RAW,         /* 只重复定长原始采集。 */
   SSF_MEMS_ACQ_MODE_FEATURE,     /* 只周期读取特征。 */

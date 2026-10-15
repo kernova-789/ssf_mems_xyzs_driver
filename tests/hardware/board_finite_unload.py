@@ -32,7 +32,7 @@ def ready():
 def snapshot(raw):
     """读取无串口副作用的批次统计；多字段不是原子快照。"""
     return {key: int((raw / key).read_text()) for key in
-            ('raw_link_mode', 'raw_batch_packets', 'raw_stop_attempts',
+            ('raw_link_mode', 'raw_batch_packets',
              'raw_publishing', 'raw_batches')}
 
 

@@ -135,7 +135,7 @@ try:
                       ('raw_active', 'raw_packets', 'raw_sequence_gaps',
                        'raw_crc_errors', 'raw_buffer_drops', 'raw_drain_packets',
                        'raw_drain_sequence_gaps', 'raw_drain_crc_errors',
-                       'raw_start_wait_ms', 'raw_stop_attempts',
+                       'raw_start_wait_ms',
                        'raw_link_mode', 'raw_publishing')}
             values['elapsed'] = round(now - start, 3)
             # 累计交付数用于检查整轮是否持续推进，不触发额外串口请求。

@@ -66,7 +66,7 @@ def capture_failures(summary, expected_seconds, recovery_limit=15.0,
     counters = ['raw_sequence_gaps', 'raw_crc_errors', 'raw_buffer_drops']
     if summary.get('finite_batch_samples') is not None:
         counters += ['raw_drain_sequence_gaps', 'raw_drain_crc_errors',
-                     'raw_ignored_bytes', 'raw_stop_attempts']
+                     'raw_ignored_bytes']
     for name in counters:
         peak = max((status[name] for status in statuses), default=0)
         if peak != 0:

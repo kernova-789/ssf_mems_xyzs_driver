@@ -442,6 +442,7 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
         .read_format = SSF_RX_RAW_AXIS,
         .name = "z_raw_data",
     },
+    /* 按手册保留描述；当前采集策略不使用连续模式。 */
     {
         .display_reg = 40058,
         .protocol_addr = 0x0039,

@@ -868,7 +868,6 @@ static ssize_t ssf_mems_raw_status_show(struct device *dev,
   case 7: value = READ_ONCE(raw->drain_discontinuities); break;
   case 8: value = READ_ONCE(raw->drain_crc_errors); break;
   case 9: value = READ_ONCE(raw->start_wait_ms); break;
-  case 10: value = READ_ONCE(raw->stop_attempts); break;
   case 11: value = READ_ONCE(state->data->protocol.mode); break;
   case 12: value = READ_ONCE(raw->publishing); break;
   case 13: value = READ_ONCE(raw->batches); break;
@@ -892,7 +891,6 @@ static IIO_DEVICE_ATTR(raw_drain_packets, 0444, ssf_mems_raw_status_show, NULL, 
 static IIO_DEVICE_ATTR(raw_drain_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL, 7);
 static IIO_DEVICE_ATTR(raw_drain_crc_errors, 0444, ssf_mems_raw_status_show, NULL, 8);
 static IIO_DEVICE_ATTR(raw_start_wait_ms, 0444, ssf_mems_raw_status_show, NULL, 9);
-static IIO_DEVICE_ATTR(raw_stop_attempts, 0444, ssf_mems_raw_status_show, NULL, 10);
 static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL, 11);
 static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL, 12);
 /* 定长批次状态只读；包号在每批 1024 组 XYZ 后从零重新开始。 */
@@ -912,7 +910,6 @@ static struct attribute *ssf_mems_raw_attributes[] = {
     &iio_dev_attr_raw_drain_sequence_gaps.dev_attr.attr,
     &iio_dev_attr_raw_drain_crc_errors.dev_attr.attr,
     &iio_dev_attr_raw_start_wait_ms.dev_attr.attr,
-    &iio_dev_attr_raw_stop_attempts.dev_attr.attr,
     &iio_dev_attr_raw_link_mode.dev_attr.attr,
     &iio_dev_attr_raw_publishing.dev_attr.attr,
     &iio_dev_attr_raw_batches.dev_attr.attr,

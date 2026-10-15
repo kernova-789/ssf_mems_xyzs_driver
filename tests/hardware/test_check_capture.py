@@ -62,10 +62,10 @@ class CaptureValidationTest(unittest.TestCase):
         summary['raw_status'] = []
         self.assertTrue(capture_failures(summary, 20))
 
-    def test_finite_drain_and_stop_errors_fail(self):
-        """定长模式不应发送停止命令，排空错误也不能隐藏。"""
+    def test_finite_drain_errors_fail(self):
+        """定长模式的排空错误不能隐藏。"""
         keys = ('raw_drain_sequence_gaps', 'raw_drain_crc_errors',
-                'raw_ignored_bytes', 'raw_stop_attempts')
+                'raw_ignored_bytes')
         for key in keys:
             summary = sample_summary()
             summary['finite_batch_samples'] = 1024

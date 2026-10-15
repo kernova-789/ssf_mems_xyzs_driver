@@ -33,7 +33,6 @@ struct ssf_mems_raw_state {
   u32 drain_discontinuities; /* 停止/恢复期间的序号跳变次数。 */
   u32 drain_crc_errors; /* 停止/恢复期间的损坏候选包数。 */
   u32 start_wait_ms; /* 开始发送启动命令到采集线程确认首包的耗时。 */
-  u32 stop_attempts; /* 兼容旧只读属性；定长模式不发送停止命令，恒为零。 */
   u16 sampling_rate_index; /* 本轮启动前读回的采样率索引，用于解释原始序列。 */
 };
 

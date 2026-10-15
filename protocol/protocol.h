@@ -51,6 +51,8 @@ enum ssf_mems_sensor_setting {
 
 /* MEMS2.0 的 40052 索引 9 对应最高配置采样率 26667 Hz。 */
 #define SSF_MEMS_SAMPLING_RATE_MAX_INDEX 9U
+/* 当前定长原始采集已验证的上限；索引 9 合法，但该采集路径尚未验证。 */
+#define SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX 8U
 
 /* 读取指定配置；返回 0 成功，-EINVAL 参数/配置项非法，-ENODEV 无驱动数据；
  * 其余错误及含义见 modbus_request.h 的请求返回值约定。 */
@@ -94,7 +96,7 @@ struct ssf_mems_protocol_state {
   struct mutex bus_lock;                // 公共 Modbus/serdev 总线锁
   enum ssf_mems_baudrate baudrate;      // 当前通信速率；定长数据与 Modbus 共用
   enum ssf_mems_parity parity;          // 当前主机校验位，数值与 40103 一致
-  unsigned int host_baudrate;           // 控制器实际波特率，用于计算发送超时
+  unsigned int host_baudrate;           // UART 配置前为启动值，配置后为实际速率
   enum ssf_mems_link_mode mode; /* bus_lock 保护的业务模式，不随解析格式切换。 */
   unsigned long raw_start_until; /* 当前批次的最晚收尾时间，含启动和线上传输预算。 */
 };
@@ -114,7 +116,7 @@ int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data);
 
 /* 独占总线，在 duration_ms 窗口内逐批读取 1024 组 XYZ；至少完成一批。
  * 40060 启动，保持工作波特率；窗口到期/卸载时等待在途批次自然结束。
- * 不发送连续模式启停命令。调用者持采集锁；当前支持无校验、采样索引 0..8。
+ * 调用者持采集锁；当前支持无校验、采样索引 0..8。
  * 返回 0 完整收完窗口，-EINVAL 参数非法，-EOPNOTSUPP 校验位/采样率不支持，
  * -ENOENT 必要表项缺失，-ENODEV 停止中，-ETIMEDOUT 启动/收尾超时，
  * -EILSEQ 批次不完整/包损坏，-ENOSPC IIO 丢样，-EPROTO 收尾寄存器异常，
@@ -189,7 +191,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
  * 当前 serdev 速率超时时，按枚举切换
  * serdev 并在每个速率只尝试一次；成功时保留匹配速率，全部失败时
  * 恢复入口速率。返回 0 匹配成功，-EINVAL 参数非法，-ENODEV 无设备/停止中，
- * -EPROTO 寄存器值异常/疑似旧连续模式，-EIO 主机调速失败，
+ * -EPROTO 寄存器值异常，-EIO 主机调速失败，
  * -ETIMEDOUT 所有候选均无应答；其余错误见 modbus_request.h 的请求返回值约定。
  */
 int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,

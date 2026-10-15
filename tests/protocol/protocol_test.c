@@ -756,8 +756,8 @@ static void test_requests(void) {
     NO_SEND(ssf_mems_protocol_write_work_parameters(&serial, values, 126, 0), -ENOENT);
   }
 
-  NO_SEND(ssf_mems_modbus_read(&serial, 40059, 1, values, 126, 0),
-          ssf_mems_modbus_find_reg(40059) == NULL ? -ENOENT : -EACCES);
+  NO_SEND(ssf_mems_modbus_read(&serial, 40110, 1, values, 126, 0),
+          ssf_mems_modbus_find_reg(40110) == NULL ? -ENOENT : -EACCES);
   NO_SEND(ssf_mems_modbus_read(&serial, 40054, 1, values, 126, 0), -EOPNOTSUPP);
   NO_SEND(ssf_mems_modbus_read(&serial, 40103, 2, values, 126, 0), -ENOENT);
   NO_SEND(ssf_mems_modbus_write_regs(&serial, 40121, 1, values, 126, 0), -EACCES);
@@ -995,6 +995,7 @@ static void test_baudrate_management(void) {
   CHECK(baudrate == SSF_MEMS_BAUDRATE_9600);
   CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_9600);
   CHECK(serial.baudrate == 9600 && serial.baudrate_set_count == 0);
+
   CHECK(sends == 1);
 
   if (!ssf_mems_modbus_find_reg(40110)) {
@@ -1074,6 +1075,19 @@ static void test_baudrate_management(void) {
 
   NO_SEND(ssf_mems_protocol_get_baudrate(NULL, &baudrate, 0), -EINVAL);
   NO_SEND(ssf_mems_protocol_get_baudrate(&serial, NULL, 0), -EINVAL);
+
+  /* 所有合法速率都采用同一规则：暂存配置不覆盖已经验证的通信速率。 */
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_1000000;
+  staged_baudrate = SSF_MEMS_BAUDRATE_9600;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 50) == 0);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_1000000);
+  CHECK(serial.baudrate == 1000000 && sensor.protocol.host_baudrate == 1000000);
+  sends_before = sends;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 50) == 0);
+  CHECK(baudrate == SSF_MEMS_BAUDRATE_1000000 && sends == sends_before + 1);
+  CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_9600 && !reboots);
 }
 
 static void shutdown_during_reboot(void) {
@@ -1586,15 +1600,6 @@ static void test_raw_recovery(void) {
   CHECK(ssf_mems_protocol_recover_raw(&sensor) == 0 && sends == before);
   CHECK(ssf_mems_protocol_recover_raw(NULL) == -EINVAL);
 
-  /* 旧连续模式的临时 1 Mbaud 应答不能引发自动保存；失败后 UART 要恢复。 */
-  reset_sensor();
-  enforce_sensor_baudrate = true;
-  sensor_baudrate = SSF_MEMS_BAUDRATE_1000000;
-  staged_baudrate = SSF_MEMS_BAUDRATE_9600;
-  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == -EPROTO);
-  CHECK(serial.baudrate == 9600 && sensor.protocol.host_baudrate == 9600);
-  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == -EPROTO);
-  CHECK(serial.baudrate == 9600 && !reboots);
 }
 
 /* 验证定长触发、完整 16 包、零长度默认值和失败/卸载时有界收尾。 */
@@ -1617,6 +1622,10 @@ static void test_raw_session(void) {
   setting_registers[51] = 9;
   CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EOPNOTSUPP);
   CHECK(sends == 1 && !sensor.raw.active);
+  finite_sensor();
+  setting_registers[51] = SSF_MEMS_SAMPLING_RATE_MAX_INDEX + 1;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EPROTO);
+  CHECK(sends == 1 && !sensor.raw.active);
 
   for (action = 0; action <= 7; action++) {
     const int expected[] = {0, -ETIMEDOUT, -ENODEV, -ERESTARTSYS, 0, -EILSEQ, -ETIMEDOUT, -ENODEV};
@@ -1625,7 +1634,6 @@ static void test_raw_session(void) {
     CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == expected[action]);
     CHECK(serial.baudrate == 128000 && !sensor.raw.active);
     CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
-    CHECK(sensor.raw.stop_attempts == 0);
     CHECK(sends == 5 && tx_events[3].address == 59 && tx_events[4].address == 101);
     for (i = 0; i < sends; i++)
       CHECK(tx_events[i].baudrate == 128000 && tx_events[i].function == 3);
@@ -1715,8 +1723,86 @@ static void test_startup_baudrate_matching(void) {
   }
 }
 
+/* 只改寄存器表的显示地址，业务调用仍必须找到同名配置并完成真实收发。 */
+static void test_relocated_registers(void) {
+  enum ssf_mems_baudrate found;
+
+  CHECK(ssf_mems_modbus_find_reg(40052) == NULL);
+  CHECK(ssf_mems_modbus_find_reg_by_name("sampling_rate")->display_reg == 41052);
+  test_feature_settings();
+
+  finite_sensor();
+  setting_registers[60] = 17;
+  setting_registers[61] = 4096;
+  setting_registers[62] = 0x5678;
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
+  CHECK(setting_registers[60] == 0 && setting_registers[61] == 0);
+  CHECK(setting_registers[62] == 0x5678 && !reboots);
+  CHECK(tx_events[3].function == 16 && tx_events[3].address == 60);
+  CHECK(tx_events[6].address == 59 && tx_events[7].address == 101);
+
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_38400;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(found == SSF_MEMS_BAUDRATE_38400 && serial.baudrate == 38400);
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50) == 0);
+  CHECK(reboots == 1 && sensor_baudrate == SSF_MEMS_BAUDRATE_115200);
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
+  CHECK(found == SSF_MEMS_BAUDRATE_115200 && serial.baudrate == 115200);
+}
+
+/* 手册寄存器描述完整保留，与当前采集策略是否使用它们无关。 */
+static void test_manual_register_descriptions(void) {
+  static const struct {
+    u16 address;
+    u16 protocol_addr;
+    const char *name;
+    unsigned int access;
+    enum ssf_rx_format read_format;
+    bool write_single;
+  } descriptions[] = {
+      {40058, 0x0039, "start_xyz_continuous", SSF_REG_READ, SSF_RX_RAW_XYZ, false},
+      {40059, 0x003a, "stop_xyz_continuous", SSF_REG_WRITE, SSF_RX_HOLDING_REGS, true},
+      {40071, 0x0046, "continuous_raw_sound", SSF_REG_READ | SSF_REG_WRITE,
+       SSF_RX_HOLDING_REGS, false},
+  };
+  u16 value = 0;
+  size_t i;
+
+  reset_sensor();
+  for (i = 0; i < ARRAY_SIZE(descriptions); i++) {
+    const struct ssf_reg_desc *reg =
+        ssf_mems_modbus_find_reg_by_name(descriptions[i].name);
+
+    CHECK(reg != NULL);
+    CHECK(reg == ssf_mems_modbus_find_reg(descriptions[i].address));
+    CHECK(reg->protocol_addr == descriptions[i].protocol_addr);
+    CHECK(reg->access == descriptions[i].access && reg->type == SSF_REG_U16);
+    CHECK(reg->read_format == descriptions[i].read_format);
+    CHECK(reg->write_single == descriptions[i].write_single);
+  }
+  /* 仅记录私有响应类型，不为连续 XYZ 启动提供普通 Modbus 读取流程。 */
+  NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "start_xyz_continuous", &value, 0),
+          -EOPNOTSUPP);
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
+  test_manual_register_descriptions();
+  if (strcmp(argv[1], "relocate_registers") == 0) {
+    test_relocated_registers();
+    goto done;
+  }
+  if (strncmp(argv[1], "nonadjacent_length_", strlen("nonadjacent_length_")) == 0) {
+    finite_sensor();
+    setting_registers[60] = 17;
+    CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EINVAL);
+    CHECK(sends == 1 && !sensor.raw.active && !reboots);
+    CHECK(setting_registers[60] == 17);
+    goto done;
+  }
   test_initialization_and_cleanup();
   test_receive_callback();
   test_unclaimed_frames();
@@ -1736,6 +1822,7 @@ int main(int argc, char **argv) {
   test_raw_session();
   test_raw_recovery();
   test_startup_baudrate_matching();
+done:
   cleanup_sensor();
   printf("PASS %-23s %u checks\n", argv[1], checks);
   return 0;

@@ -66,7 +66,13 @@ core 的 `write_wakeup` 回调转发到 `serdev_device_write_wakeup()`，让同�
 普通请求在非普通模式返回 `-EAGAIN`，不会发送数据；恢复确认使用
 `ssf_mems_modbus_read_reg_recovery_locked()`，由协议层持有总线锁，仅发送读取。
 它也允许卸载期间读取确认，但不解除 `shutting_down`，普通调用仍被拒绝。
-`protocol.baudrate` 保留普通配置速率，原始模式临时切速只改变 `host_baudrate`。
+`protocol.baudrate` 是当前通信速率的固件枚举编码；`host_baudrate` 在初始化时
+是启动提示值，配置 UART 后记录控制器返回的实际 bit/s。现行定长原始采集与
+Modbus 共用速率，不临时切速。
+
+寄存器表按手册保留 40058、40059、40071 的地址、权限和数据格式，
+通用寄存器接口继续遵循表中描述。业务采集仅使用定长入口，
+不提供连续采集的专用启停、请求或解析流程。原始统计不再提供 `raw_stop_attempts`。
 
 ## 接口迁移
 
@@ -88,6 +94,12 @@ ret = ssf_mems_modbus_read_reg_by_name(serdev, "firmware_version", &value, 1000)
 写 `"baudrate"` 只写该寄存器，不能代替 `ssf_mems_protocol_set_baudrate()` 的
 保存、重启等待和主机切速流程。当前仍只有 XYZS 的表，多型号选择尚未实现。
 
+`protocol.c` 的配置项数组保存稳定名称；配置读写、定长触发、长度设置、
+只读恢复和波特率切换都按 `.name` 找表项，业务代码不再固定显示地址。
+长度高低字必须在显示地址和线上地址上都连续，否则返回 `-EINVAL`，不写其他配置。
+寄存器表和块命令表仍负责定义具体地址及连续范围；换型号时还需核对权限、
+数据格式、块布局和固件行为，单纯保留名称不代表已经支持另一型号。
+
 业务接口已从 `ssf_mems_modbus_*` 改为 `ssf_mems_protocol_*`，声明统一在 `protocol.h`：
 
 - `ssf_mems_protocol_decode_features()`
@@ -101,6 +113,9 @@ ret = ssf_mems_modbus_read_reg_by_name(serdev, "firmware_version", &value, 1000)
 通用 `ssf_mems_modbus_read()`、`ssf_mems_modbus_write_reg()` 和 `ssf_mems_modbus_write_regs()` 仍在请求模块。新增 `ssf_mems_modbus_write_block()` 保留块表的功能码、方向、响应格式和固定范围校验，供业务层执行块命令。请求认领接口现在接收 `data, buf, len`，不再依赖接收模块的 `frame_slot`。`ssf_mems_modbus_plan_request()` 也归请求模块，不再属于帧编解码模块。
 
 波特率读取先以当前 serdev 速率读 40102；成功应答所在的速率才是实际通信速率，不能把尚未保存的 40102 暂存值当成已生效速率。只有请求超时（即没有可匹配的正确应答帧）才启动枚举扫描；每个不同实际速率只发送一次读请求，避免 `DEFAULT` 和显式 `9600` 重复。切换前清理旧速率留下的 FIFO/候选帧；成功时保留匹配速率，全部超时或扫描中发生其他错误时恢复入口速率。通用 Modbus 请求、读特征、写工作参数和串口参数操作共用 `bus_lock`；多步操作在整个流程内持锁。发送超时根据当前波特率、校验位和帧长计算，不再固定为 100 ms。
+
+包括 1000000 在内的合法波特率都使用相同的匹配规则；成功应答与暂存配置
+不一致时保留已验证的通信速率，匹配本身只读，不保存或重启传感器。
 
 ## 不再读取某个特征
 

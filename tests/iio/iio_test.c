@@ -371,11 +371,10 @@ static void test_raw_status_attributes(void) {
       &iio_dev_attr_raw_drain_sequence_gaps.dev_attr,
       &iio_dev_attr_raw_drain_crc_errors.dev_attr,
       &iio_dev_attr_raw_start_wait_ms.dev_attr,
-      &iio_dev_attr_raw_stop_attempts.dev_attr,
       &iio_dev_attr_raw_link_mode.dev_attr,
       &iio_dev_attr_raw_publishing.dev_attr,
   };
-  unsigned int expected[] = {417, 1, 2, 4, 85, 5, 6, 6000, 3, 3, 0};
+  unsigned int expected[] = {417, 1, 2, 4, 85, 5, 6, 6000, 3, 0};
   char buf[4096], want[32];
   size_t i;
 
@@ -388,7 +387,6 @@ static void test_raw_status_attributes(void) {
   sensor.raw.drain_discontinuities = 5;
   sensor.raw.drain_crc_errors = 6;
   sensor.raw.start_wait_ms = 6000;
-  sensor.raw.stop_attempts = 3;
   sensor.raw.publishing = false;
   sensor.protocol.mode = SSF_MEMS_LINK_RAW_RECOVERING;
   for (i = 0; i < ARRAY_SIZE(attrs); i++) {

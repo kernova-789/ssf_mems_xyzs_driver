@@ -55,7 +55,7 @@ cache is stale, so link status and sample age have separate meanings.
 | `sensor_raw_duration_ms`（读写） | 原始窗口，十进制 100..60000 ms |
 | `sensor_feature_duration_ms`（读写） | 特征窗口，十进制 100..60000 ms |
 
-`raw` 持续重复完整 1024 点批次，不读取特征，不使用固件 40058 的连续流命令。
+`raw` 持续重复完整 1024 点批次，不读取特征。
 它仍会执行必要的配置读取和批后通信确认，因此不是无间断原始波形。
 `feature` 持续轮询特征，不触发原始批次。`alternating` 从特征窗口开始交替，
 到原始窗口截止时收完在途批次，不为了满足时长截断数据。特征轮询周期仍为 1000 ms。
@@ -143,4 +143,4 @@ shim, so actual kernel buffer operations still require hardware verification.
 
 新增 `ssf_mems_xyzs_raw`，提供 XYZ、包号、包内序号及主机接收时间戳的独立
 buffer，保持特征设备原有布局不变。全部字段启用时扫描记录为 24 字节。
-配置与读取示例见[连续原始采集说明](../protocol/RAW_CAPTURE.md)。
+配置与读取示例见[定长原始采集说明](../protocol/RAW_CAPTURE.md)。

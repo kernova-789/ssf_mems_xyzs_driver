@@ -4,7 +4,7 @@
 [正式驱动验证报告](TEST_REPORT_2026-10-12_PRODUCTION_FINITE.md)。
 驱动独立通信、断电恢复和 IIO 边界验证见
 [完整功能回归报告](TEST_REPORT_2026-10-12_DRIVER_FUNCTIONAL.md)，其中保留了一次尚未定位的配置读取超时。
-正式卸载回归使用 `board_finite_unload.py`；旧 `board_unload_final.py` 仅对应历史连续模式。
+正式卸载回归使用 `board_finite_unload.py`。
 
 ## 驱动独立通信的功能回归
 
@@ -98,55 +98,17 @@ CRC/丢样统计均正常，且没有连续至少 15 秒的恢复未确认状态
 
 ## 卸载时序
 
-将 `board_unload_final.py` 和待测模块 `ssf_mems-final.ko` 放入同一新目录，
-确认当前加载的就是该模块，并确认普通通信目标/传感器均为 9600：
+将 `board_finite_unload.py` 和待测模块 `ssf_mems.ko` 放入同一新目录，
+确认当前加载的就是该模块，并确认普通通信目标/传感器均为 128000：
 
 ```sh
-sudo python3 board_unload_final.py /tmp/本次测试目录
+sudo python3 board_finite_unload.py /tmp/本次测试目录
 ```
 
 脚本分别等待“启动已发出但还没有首包”和“已收到原始包”，执行卸载、
-确认两个 IIO 设备移除、重载并读回 9600。它检查卸载未留下未确认状态，
-重载不需要识别遗留流或重新写波特率，输出 JSON 和各阶段日志。
+确认两个 IIO 设备移除、重载并读回 128000。它检查卸载收完在途定长批次，
+重载可恢复普通通信，输出 JSON 和各阶段日志。
 此测试会暂时中断采集；不能与 buffer 记录程序或其他 IIO 消费者同时运行。
 异常时保留现场和日志，不自动保存 Flash，不自动替用户断电。
 
 硬件异常的根因需要结合供电、接线和串口抓包，不能由上述脚本单独确定。
-
-## 独立采样恢复实验（不是自动恢复功能）
-
-`recovery_lab/` 是针对本次已核实现场的独立 serdev 模块，不链接进正式驱动。
-默认只读，且不发送 40110、不改固件或设备树。必须先停掉 IIO 消费程序并
-卸载正式驱动；两个模块不能同时拥有这个传感器。按实际目标内核交叉编译：
-
-```sh
-make -C /绝对路径/目标内核 M="$PWD/tests/hardware/recovery_lab" \
-    ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- W=1 modules
-```
-
-板端默认只读诊断：
-
-```sh
-sudo insmod ssf_mems_recovery_lab.ko baud=1000000
-# 等待日志出现 bounded diagnostic finished，再保存日志、卸载。
-sudo rmmod ssf_mems_recovery_lab
-```
-
-只有已确认卡在 1 Mbaud、无新原始包，并明确接受写 Flash 副作用时，才运行：
-
-```sh
-sudo insmod ssf_mems_recovery_lab.ko baud=1000000 recover_once=1
-```
-
-工具要求 CRC 正确地核实地址 1、普通速率枚举 3、无校验、附加配置 255/1、
-停止标志 1、采样索引 6/长度索引 0。符合后仅发送一次索引 `6 -> 5`，只读
-寻找通信位置，再最多发送一次 `5 -> 6` 恢复原值。**固件会自行保存采样
-参数，成功执行通常擦写两次 Flash。** 回显丢失不重发写入；读回不能证明
-Flash 持久性已经过断电测试。不能作为 cron/看门狗反复加载。
-另一个限制是固件在采样配置变化后重建特征滤波器时没有释放旧对象；
-反复恢复还会消耗 MCU 堆内存，因此不能用此工具替代长期可靠性修复。
-
-必须看到 `recovery verified at 9600; sampling 6/0 restored`，随后卸载工具，
-重新加载正式驱动，复测双 buffer 和普通通信。如果日志表示配置未核实、
-恢复未确认或需要核查原值，应保存现场并人工处理，不能盲目重复运行。
-工具只适用于这里的固定现场；不是通用的不同地址/校验/采样率恢复程序。

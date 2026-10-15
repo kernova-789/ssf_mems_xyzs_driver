@@ -19,10 +19,11 @@ VARIANTS = {
     "delete_config": {40050},
     "delete_work_parameter": {40064},
     "delete_save_register": {40110},
-    "delete_raw_start": {40058},
-    "delete_raw_stop": {40059},
     "delete_finite_start": {40060},
     "reverse_table": set(),
+    "relocate_registers": set(),
+    "nonadjacent_length_display": set(),
+    "nonadjacent_length_protocol": set(),
 }
 MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream", "ota")
 HEADERS = (
@@ -58,7 +59,7 @@ def check_module_dependencies(objects):
             if owner not in ALLOWED_DEPENDENCIES[module]:
                 raise AssertionError(f"Invalid dependency: {module} -> {symbol} ({owner})")
 
-def configure_table(text, deleted, reverse):
+def configure_table(text, deleted, variant):
     marker = "static const struct ssf_reg_desc ssf_reg_table[] = {"
     start = text.index(marker) + len(marker)
     end = text.index("\n};", start)
@@ -67,8 +68,19 @@ def configure_table(text, deleted, reverse):
     for entry in entries:
         address = int(re.search(r"\.display_reg = (\d+)", entry).group(1))
         if address not in deleted:
+            # Keep wire addresses unchanged while moving the display addresses.
+            # Any high-level literal address now fails, even though names are stable.
+            if variant == "relocate_registers" and address in {
+                40052, 40053, 40060, 40061, 40062, 40070, 40102, 40110, 40121
+            }:
+                entry = entry.replace(f".display_reg = {address}",
+                                      f".display_reg = {address + 1000}")
+            if address == 40062 and variant == "nonadjacent_length_display":
+                entry = entry.replace(".display_reg = 40062", ".display_reg = 41062")
+            if address == 40062 and variant == "nonadjacent_length_protocol":
+                entry = entry.replace(".protocol_addr = 0x003d", ".protocol_addr = 0x013d")
             kept.append(entry)
-    if reverse:
+    if variant == "reverse_table":
         kept.reverse()
     return text[:start] + "\n" + "\n".join(kept) + text[end:]
 
@@ -83,7 +95,7 @@ def main():
             shutil.copytree(ROOT / "acquisition", project / "acquisition")
             table_path = project / "protocol" / "modbus_table.h"
             # Mechanical test-fixture transformation; production table is never edited.
-            table_path.write_text(configure_table(table_path.read_text(), deleted, name == "reverse_table"))
+            table_path.write_text(configure_table(table_path.read_text(), deleted, name))
             executable = project / "protocol_test"
             flags = [
                 compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
