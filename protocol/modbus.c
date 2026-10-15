@@ -5,7 +5,9 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 返回输入字节序列的 Modbus CRC16；初值、多项式和 CRC 长度统一由表头定义。 */
+/* 计算一段数据的 Modbus CRC16。
+ * 返回：CRC16 校验值。
+ */
 u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len) {
   u16 crc = SSF_MEMS_MODBUS_CRC_INIT;
 
@@ -19,7 +21,9 @@ u16 ssf_mems_modbus_crc16(const u8 *buf, size_t len) {
   return crc;
 }
 
-/* 返回请求帧长度；-EINVAL 数量/描述错误，-EOPNOTSUPP 无发送格式，-EMSGSIZE 超出 RTU 帧上限。 */
+/* 计算请求帧长度。
+ * 返回：帧字节数，负数为参数、格式或长度错误。
+ */
 int ssf_mems_modbus_tx_frame_len(const struct ssf_modbus_frame_desc *frame,
                                u16 reg_count) {
   size_t len;
@@ -37,7 +41,9 @@ int ssf_mems_modbus_tx_frame_len(const struct ssf_modbus_frame_desc *frame,
   return len;
 }
 
-/* 返回响应帧长度；-EINVAL 无描述，-EMSGSIZE 普通读取字节数为零、不是整寄存器或超限。 */
+/* 计算响应帧长度。
+ * 返回：帧字节数，负数为描述或长度错误。
+ */
 int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame,
                                u8 byte_count) {
   size_t len;
@@ -55,19 +61,26 @@ int ssf_mems_modbus_rx_frame_len(const struct ssf_modbus_frame_desc *frame,
   return len;
 }
 
-/* 写入大端寄存器值；无返回值，调用前由帧描述和长度校验保证位置有效。 */
+/* 把一个 16 位值按大端写入缓冲区。
+ * 返回：无。
+ * 调用者保证写入位置有效。
+ */
 static void ssf_mems_modbus_put_u16(u8 *buf, size_t offset, u16 value) {
   buf[offset] = value >> 8;
   buf[offset + 1] = value & 0xff;
 }
 
-/* 返回指定位置的大端寄存器值，调用前必须完成帧长度校验。 */
+/* 从缓冲区读取一个大端 16 位值。
+ * 返回：读出的数值。
+ * 调用者保证读取位置有效。
+ */
 static u16 ssf_mems_modbus_get_u16(const u8 *buf, size_t offset) {
   return ((u16)buf[offset] << 8) | buf[offset + 1];
 }
 
-/* 返回组装后的帧长度；-EINVAL 参数/布局错误，-ENOSPC 帧缓冲区不足，
- * -EOPNOTSUPP 无发送格式，-EMSGSIZE 超出 RTU 上限。 */
+/* 组装一个 Modbus 请求帧。
+ * 返回：帧字节数，负数为参数、格式或空间错误。
+ */
 int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
                                  u8 slave_id, const u16 *values,
                                  size_t values_count, u8 *buf, size_t capacity) {
@@ -116,7 +129,9 @@ int ssf_mems_modbus_build_request(const struct ssf_modbus_transfer *transfer,
   return len;
 }
 
-/* 返回 0 CRC 正确，-EINVAL 空帧，-EMSGSIZE 帧过短，-EBADMSG CRC 不匹配。 */
+/* 检查 Modbus 帧的 CRC。
+ * 返回：0 正确，-EINVAL 空帧，-EMSGSIZE 帧过短，-EBADMSG 校验失败。
+ */
 int ssf_mems_modbus_check_crc(const u8 *buf, size_t len) {
   u16 received;
 
@@ -128,7 +143,9 @@ int ssf_mems_modbus_check_crc(const u8 *buf, size_t len) {
   return received == ssf_mems_modbus_crc16(buf, len - SSF_MEMS_MODBUS_CRC_LEN) ? 0 : -EBADMSG;
 }
 
-/* 返回 0 响应成功，-ENOMSG 不匹配当前请求，-EREMOTEIO 从机异常，-EFAULT 结果缓冲区异常，-EINVAL 参数错误，-EMSGSIZE 帧长错误，-EBADMSG CRC 错误。 */
+/* 解析当前请求对应的 Modbus 应答。
+ * 返回：0 成功，-ENOMSG 不匹配，-EREMOTEIO 从机异常，其他负数为帧或参数错误。
+ */
 int ssf_mems_modbus_parse_response(const struct ssf_modbus_transfer *transfer,
                                    u8 slave_id, u16 write_value,
                                    const u8 *buf, size_t len,

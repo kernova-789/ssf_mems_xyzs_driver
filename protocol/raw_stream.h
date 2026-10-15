@@ -5,11 +5,24 @@
 #include <linux/wait.h>
 
 struct ssf_mems_xyzs_data;
+struct ssf_mems_raw_sample;
 
-#define SSF_MEMS_RAW_PACKET_BYTES 392U /* 头、包号、XYZ 载荷、CRC 和结束标记总长度。 */
+typedef int (*ssf_mems_raw_sample_handler_t)(
+    struct ssf_mems_xyzs_data *data, const struct ssf_mems_raw_sample *sample);
+
+#define SSF_MEMS_RAW_HEADER 0x15U
+#define SSF_MEMS_RAW_TAIL 0x17U
+#define SSF_MEMS_RAW_SEQUENCE_OFFSET 1U
+#define SSF_MEMS_RAW_PAYLOAD_OFFSET 5U
+#define SSF_MEMS_RAW_SAMPLE_BYTES (3U * sizeof(s16))
 #define SSF_MEMS_RAW_SAMPLES_PER_PACKET 64U /* 一个私有包内同步 XYZ 样本数。 */
+#define SSF_MEMS_RAW_CRC_OFFSET \
+  (SSF_MEMS_RAW_PAYLOAD_OFFSET + SSF_MEMS_RAW_SAMPLES_PER_PACKET * SSF_MEMS_RAW_SAMPLE_BYTES)
+#define SSF_MEMS_RAW_TAIL_OFFSET (SSF_MEMS_RAW_CRC_OFFSET + 2U)
+#define SSF_MEMS_RAW_PACKET_BYTES (SSF_MEMS_RAW_TAIL_OFFSET + 1U)
 #define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 一批 XYZ 组数；使用固件零长度的默认值。 */
-#define SSF_MEMS_RAW_BATCH_PACKETS 16U /* 1024 / 64，每批包号固定为 0..15。 */
+#define SSF_MEMS_RAW_BATCH_PACKETS \
+  (SSF_MEMS_RAW_BATCH_SAMPLES / SSF_MEMS_RAW_SAMPLES_PER_PACKET)
 
 /* 定长包解析状态；字节缓冲和批次边界由接收模块的 parse_lock 保护。 */
 struct ssf_mems_raw_state {
@@ -19,11 +32,10 @@ struct ssf_mems_raw_state {
   u32 ignored_bytes; /* 未能组成私有包的字节数，不能静默忽略链路异常。 */
   bool active; /* 为 true 时接收字节交给私有流解析器，而非 Modbus 解析器。 */
   bool publishing; /* 卸载/异常排空时仍解析数据，但不再向 IIO 发布样本。 */
-  bool stream_seen; /* 当前批次是否见过 CRC 正确的原始包。 */
+  ssf_mems_raw_sample_handler_t sample_handler; /* core 在采集启动前绑定，此后不修改。 */
   wait_queue_head_t waitq; /* 首包到达或驱动退出时唤醒采集线程。 */
   u8 packet[SSF_MEMS_RAW_PACKET_BYTES]; /* 正在拼接的固定长度数据包。 */
   size_t used; /* 缓冲区中已经接收的字节数。 */
-  bool have_sequence; /* 是否已有一个经过 CRC 校验的包序号。 */
   u32 next_sequence; /* 当前批次下一个期望包号，每批从零开始。 */
   u32 packets; /* 有效采集阶段通过 CRC 校验的包数，不包含停止排空。 */
   u32 discontinuities; /* 有效采集阶段的序号跳变次数。 */
@@ -36,8 +48,13 @@ struct ssf_mems_raw_state {
   u16 sampling_rate_index; /* 本轮启动前读回的采样率索引，用于解释原始序列。 */
 };
 
-/* 初始化私有流状态；无返回值，不发送数据，也不切换串口。 */
+/* 初始化定长原始数据接收状态。
+ * 返回：无。
+ */
 void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data);
 
-/* 消费一个字节；无返回值，仅由接收工作项持 parse_lock 调用，错误计入统计。 */
+/* 用一个字节推进定长原始数据拼包。
+ * 返回：无。
+ * 调用者持 parse_lock；校验失败后定位下一包头。
+ */
 void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);

@@ -37,7 +37,7 @@ enum scenario {
   CHANGING, CONSTANT, LINK_FAILURE, EXCEPTION, NO_SENSOR, MANUAL,
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
   RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
-  RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED
+  RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED, POLL_SWITCH
 };
 static enum scenario scenario;
 static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
@@ -121,6 +121,12 @@ int kthread_stop(struct task_struct *thread) {
   CHECK(thread == &task);
   stop_requested = true;
   return 0;
+}
+
+ssize_t serdev_device_write(struct serdev_device *dev, const u8 *buf,
+                            size_t len, unsigned long timeout) {
+  (void)dev; (void)buf; (void)len; (void)timeout;
+  abort(); /* 采集层测试使用协议替身，不应直接发送串口数据。 */
 }
 
 int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate) {
@@ -289,6 +295,28 @@ void test_acquisition_wait(unsigned long timeout) {
         CHECK(publish_count >= 4);
         stop_requested = true;
       }
+    } else if (scenario == POLL_SWITCH) {
+      if (mode_switch_step == 0) {
+        unsigned long until = device.acquisition.feature_until;
+        CHECK(publish_count == 1);
+        CHECK(ssf_mems_acquisition_set_poll_setting(
+            &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 2500) == 0);
+        CHECK(device.acquisition.poll_changed && !device.acquisition.config_changed);
+        CHECK(device.acquisition.feature_until == until);
+        mode_switch_step++;
+      } else if (mode_switch_step == 1 && publish_count == 4) {
+        CHECK(ssf_mems_acquisition_set_poll_setting(
+            &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_ADAPTIVE) == 0);
+        mode_switch_step++;
+      } else if (mode_switch_step == 2 && publish_count == 40) {
+        CHECK(device.acquisition.policy.interval_ms < 2500);
+        CHECK(ssf_mems_acquisition_set_poll_setting(
+            &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_FIXED) == 0);
+        CHECK(device.acquisition.policy.interval_ms == 2500);
+        mode_switch_step++;
+      } else if (mode_switch_step == 3 && publish_count == 45) {
+        stop_requested = true;
+      }
     } else if (scenario == CHANGING || scenario == CONSTANT) {
       CHECK(device.acquisition.online && device.protocol.valid);
       if (publish_count >= 70)
@@ -299,7 +327,8 @@ void test_acquisition_wait(unsigned long timeout) {
       stop_requested = true;
     } else if (scenario == LINK_FAILURE && publish_count == 2) {
       CHECK(get_count == 2 && set_count == 2);
-      CHECK(device.acquisition.policy.interval_ms == 1000);
+      CHECK(device.acquisition.policy.interval_ms ==
+            device.acquisition.policy.config.fixed_interval_ms);
       stop_requested = true;
     } else if (scenario == EXCEPTION && failure_count >= 20) {
       CHECK(get_count == 1 && set_count == 1);
@@ -497,9 +526,20 @@ static void window(struct ssf_mems_acquisition_policy *policy,
   }
 }
 
+static void adaptive_policy(struct ssf_mems_acquisition_policy *policy,
+                              unsigned long now) {
+  struct ssf_mems_poll_config config;
+
+  ssf_mems_acquisition_policy_init(policy, now);
+  config = policy->config;
+  config.mode = SSF_MEMS_POLL_ADAPTIVE;
+  CHECK(ssf_mems_acquisition_policy_configure(policy, &config, now) == 0);
+}
+
 static void test_policy(void) {
   struct ssf_mems_acquisition_policy policy;
   struct ssf_mems_sensor_data sample = {0};
+  struct ssf_mems_poll_config config;
   unsigned int i;
 
   ssf_mems_acquisition_policy_init(&policy, 0);
@@ -515,24 +555,24 @@ static void test_policy(void) {
   window(&policy, &sample, 0, 501);
   CHECK(policy.interval_ms == 1000);
 
-  ssf_mems_acquisition_policy_init(&policy, 0);
-  policy.interval_ms = SSF_MEMS_POLL_MAX_MS;
+  adaptive_policy(&policy, 0);
+  policy.interval_ms = policy.config.max_interval_ms;
   window(&policy, &sample, 32, 5);
-  CHECK(policy.interval_ms == 1000);
-  ssf_mems_acquisition_policy_init(&policy, 0);
-  policy.interval_ms = SSF_MEMS_POLL_MIN_MS;
+  CHECK(policy.interval_ms == policy.config.max_interval_ms);
+  adaptive_policy(&policy, 0);
+  policy.interval_ms = policy.config.min_interval_ms;
   window(&policy, &sample, 0, 5);
-  CHECK(policy.interval_ms == 1000);
+  CHECK(policy.interval_ms == policy.config.min_interval_ms);
 
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  adaptive_policy(&policy, 0);
   policy.interval_ms = 1000;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 30000);
-  CHECK(policy.interval_ms == 1000 && policy.next_probe == 60000);
+  CHECK(policy.interval_ms == 950 && policy.next_probe == 60000);
 
   /* 每个字段变化都必须判为新数据，未使用的填充字节必须被忽略。 */
   for (i = 0; i < sizeof(sample); i++) {
     memset(&sample, 0, sizeof(sample));
-    ssf_mems_acquisition_policy_init(&policy, 0);
+    adaptive_policy(&policy, 0);
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
     ((u8 *)&sample)[i] = 1;
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
@@ -563,6 +603,172 @@ static void test_policy(void) {
   for (i = 0; i < 4; i++)
     CHECK(!ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 1999UL));
   CHECK(ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 1999UL));
+
+  adaptive_policy(&policy, 0);
+  window(&policy, &sample, 32, 5);
+  CHECK(policy.interval_ms == 1200);
+  adaptive_policy(&policy, 0);
+  window(&policy, &sample, 0, 5);
+  CHECK(policy.interval_ms == 950);
+  adaptive_policy(&policy, 0);
+  window(&policy, &sample, 16, 5);
+  CHECK(policy.interval_ms == 1000);
+  adaptive_policy(&policy, 0);
+  window(&policy, &sample, 0, 501);
+  CHECK(policy.interval_ms == 1000);
+
+  /* 30 秒试探保留已有统计，第 32 次比较仍能按重复率调整。 */
+  adaptive_policy(&policy, 0);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
+  for (i = 1; i <= 30; i++)
+    ssf_mems_acquisition_policy_sample(&policy, &sample, 5, i * 1000UL);
+  CHECK(policy.comparisons == 30 && policy.repeats == 30 && policy.interval_ms == 950);
+  ssf_mems_acquisition_policy_contact(&policy, 30500);
+  CHECK(policy.comparisons == 30 && policy.interval_ms == 950);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 31000);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 32000);
+  CHECK(policy.comparisons == 0 && policy.interval_ms == 1140);
+
+  /* 完整窗口与定期试探同时到期时，只执行窗口决策。 */
+  adaptive_policy(&policy, 0);
+  for (i = 0; i < 32; i++)
+    ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 30000);
+  CHECK(policy.interval_ms == 1200 && policy.next_probe == 60000);
+
+  /* 重连保留学习到的周期和用户配置，配置变更不伪造有效通信。 */
+  ssf_mems_acquisition_policy_restart(&policy, 40000);
+  CHECK(policy.interval_ms == 1200 && policy.config.mode == SSF_MEMS_POLL_ADAPTIVE);
+  CHECK(!policy.have_previous && policy.comparisons == 0);
+  policy.link_failures = 3;
+  policy.last_contact = 123;
+  config = policy.config;
+  config.min_interval_ms = 1500;
+  CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 41000) == 0);
+  CHECK(policy.interval_ms == 1500 && policy.link_failures == 3 && policy.last_contact == 123);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 42000);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 43000);
+  config = policy.config;
+  config.fixed_interval_ms = 2200; /* 非当前模式的配置不清空学习统计。 */
+  CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 44000) == 0);
+  CHECK(policy.comparisons == 1 && policy.interval_ms == 1500);
+  config.mode = SSF_MEMS_POLL_FIXED;
+  CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 45000) == 0);
+  CHECK(policy.interval_ms == 2200);
+  window(&policy, &sample, 32, 5);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 100000);
+  CHECK(policy.interval_ms == 2200 && policy.comparisons == 0);
+}
+
+/* 配置在主机生效；非法写入不改变已设置的周期或上下限。 */
+static void test_poll_configuration(void) {
+  struct ssf_mems_acquisition_config config;
+  unsigned int wakes;
+
+  reset_device(MANUAL);
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == 0);
+  CHECK(config.poll.mode == SSF_MEMS_POLL_FIXED && config.poll.fixed_interval_ms == 1000);
+  CHECK(config.poll.min_interval_ms == 500 && config.poll.max_interval_ms == 5000);
+  wakes = test_wake_count;
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 1000) == 0);
+  CHECK(test_wake_count == wakes && !device.acquisition.poll_changed);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 1700) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 1700 && device.acquisition.poll_changed);
+  CHECK(!device.acquisition.config_changed && !device.acquisition.reconnect);
+  device.acquisition.poll_changed = false;
+  wakes = test_wake_count;
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MIN_INTERVAL, 200) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 1700 && test_wake_count == wakes);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_ADAPTIVE) == 0);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MIN_INTERVAL, 1800) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 1800);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MAX_INTERVAL, 1900) == 0);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MAX_INTERVAL, 1700) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MIN_INTERVAL, 2000) == -EINVAL);
+  for (unsigned int field = SSF_MEMS_POLL_SETTING_FIXED_INTERVAL;
+       field <= SSF_MEMS_POLL_SETTING_MAX_INTERVAL; field++) {
+    CHECK(ssf_mems_acquisition_set_poll_setting(&device, field, 0) == -EINVAL);
+    CHECK(ssf_mems_acquisition_set_poll_setting(&device, field, 99) == -EINVAL);
+    CHECK(ssf_mems_acquisition_set_poll_setting(&device, field, 60001) == -EINVAL);
+    CHECK(ssf_mems_acquisition_set_poll_setting(&device, field, UINT_MAX) == -EINVAL);
+  }
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_MODE_COUNT) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_poll_setting(&device, -1, 1000) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_poll_setting(NULL, SSF_MEMS_POLL_SETTING_MODE, 0) == -EINVAL);
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == 0);
+  CHECK(config.poll.fixed_interval_ms == 1700 && config.poll.min_interval_ms == 1800 &&
+        config.poll.max_interval_ms == 1900 && device.acquisition.policy.interval_ms == 1800);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 60000) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 1800);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_FIXED) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 60000);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 100) == 0);
+  CHECK(device.acquisition.policy.interval_ms == 100);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MAX_INTERVAL, 60000) == 0);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MIN_INTERVAL, 100) == 0);
+  CHECK(get_count == 0 && set_count == 0 && read_count == 0 && setting_calls == 0);
+  device.acquisition.stopping = true;
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 1000) == -ENODEV);
+}
+
+/* 通过真实采集线程验证固定周期、自适应、交替保留统计和运行中切换。 */
+static void test_poll_scheduling(void) {
+  unsigned int i;
+
+  reset_device(CHANGING);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 1750) == 0);
+  run_thread();
+  for (i = 2; i < read_count; i++)
+    CHECK(read_started_at[i] - read_started_at[i - 1] == 1750);
+  CHECK(device.acquisition.policy.config.fixed_interval_ms == 1750);
+
+  reset_device(CHANGING);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_ADAPTIVE) == 0);
+  run_thread();
+  CHECK(device.acquisition.policy.interval_ms < 1000 &&
+        device.acquisition.policy.interval_ms >= 500);
+
+  reset_device(CONSTANT);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_MODE, SSF_MEMS_POLL_ADAPTIVE) == 0);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
+  device.acquisition.raw_duration_ms = 100;
+  device.acquisition.feature_duration_ms = 2000;
+  run_thread();
+  CHECK(raw_captures > 0 && publish_count == 70);
+  CHECK(device.acquisition.policy.interval_ms > 1000 &&
+        device.acquisition.policy.interval_ms <= 5000);
+
+  reset_device(LINK_FAILURE);
+  CHECK(ssf_mems_acquisition_set_poll_setting(
+      &device, SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, 1700) == 0);
+  fail_reads = true;
+  run_thread();
+  CHECK(get_count == 2 && device.acquisition.policy.interval_ms == 1700);
+
+  reset_device(POLL_SWITCH);
+  run_thread();
+  CHECK(mode_switch_step == 3 && publish_count == 45);
+  CHECK(device.acquisition.policy.config.mode == SSF_MEMS_POLL_FIXED);
+  for (i = 41; i < read_count; i++)
+    CHECK(read_started_at[i] - read_started_at[i - 1] == 2500);
 }
 
 static void test_settings(void) {
@@ -718,6 +924,8 @@ int main(void) {
   u16 value;
 
   test_policy();
+  test_poll_configuration();
+  test_poll_scheduling();
   test_thread_scenarios();
   test_settings();
   reset_device(CHANGING);

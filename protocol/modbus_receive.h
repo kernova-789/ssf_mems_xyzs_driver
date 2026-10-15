@@ -11,7 +11,10 @@
 struct ssf_mems_xyzs_data;
 struct ssf_modbus_frame_desc;
 
-/* 帧仅在同步回调期间有效，context 必须存活到接收清理结束，不得保存缓冲区或等待需要同一接收工作项处理的响应；返回 0 已处理，负值处理失败。 */
+/* 处理接收器交出的完整帧。
+ * 返回：0 成功，负数为处理错误。
+ * 帧仅在回调期间有效；context 须保持有效，回调内不能等待接收应答。
+ */
 typedef int (*ssf_mems_frame_handler_t)(void *context, const u8 *buf, size_t len);
 
 #define SSF_MEMS_RX_FIFO_SIZE 16384U /* 容纳定长批次上传时的接收调度抖动。 */
@@ -68,24 +71,38 @@ struct ssf_mems_modbus_receive_state {
   struct ssf_mems_frame_slot frame[SSF_MEMS_FRAME_SLOT_NUM]; // 候选帧上下文
 };
 
-/* 初始化接收状态并注册完整帧回调；返回 0 成功，-EINVAL 驱动数据/回调为空且不修改状态，其他负值来自 FIFO 分配；仅用于尚未投入使用的状态。 */
+/* 初始化接收队列并注册完整帧回调。
+ * 返回：0 成功，-EINVAL 参数无效，其他负数为分配错误。
+ */
 int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
                                ssf_mems_frame_handler_t handler, void *context);
 
-/* 清理已初始化的接收状态；无返回值，停止入队/工作项并释放 FIFO 和候选帧缓冲区，空指针直接退出。 */
+/* 关闭接收并释放队列和候选帧。
+ * 返回：无。
+ * 先停止接收工作项，再释放资源。
+ */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
 
-/* 清空 FIFO 和未完成候选帧；发送准备及波特率切换时调用，不得持请求锁。
- * 无返回值；空指针或已关闭时直接返回。 */
+/* 清空接收队列和未完成的候选帧。
+ * 返回：无。
+ * 清理期间收到的字节会丢弃，调用时不能持请求锁。
+ */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
 
-/* 返回最近接收活动的 jiffies，用于发送前检测空闲；包含 flush 期间丢弃的字节。 */
+/* 读取最近收到串口字节的时间。
+ * 返回：接收时间的 jiffies 值。
+ * 包含清理期间丢弃的字节。
+ */
 unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data);
 
-/* 将解析任务加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
+/* 安排接收队列的解析任务。
+ * 返回：无。
+ */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev);
 
-/* 返回实际入队字节数（0 表示未接收），-EINVAL 空设备/数据，-ENODEV
- * 无驱动数据或接收已关闭；FIFO 空间不足时返回部分入队数，便于 serdev 重送剩余数据。 */
+/* 把串口字节放入接收队列。
+ * 返回：已接收的字节数，负数为参数或接收状态错误。
+ * 队列不足时允许部分入队，清理期间直接丢弃。
+ */
 ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
                          const unsigned char *buf, size_t count);

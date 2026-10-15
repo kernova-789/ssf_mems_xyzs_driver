@@ -3,28 +3,29 @@
 
 #include "core.h"
 #include "modbus.h"
-#include "ssf_mems_iio.h"
 
+#include <asm/unaligned.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 初始化等待队列和计数器，后续启停由协议层在 bus_lock 下负责。
- * 无返回值，不发送数据，也不切换串口。 */
+/* 初始化定长原始数据接收状态。
+ * 返回：无。
+ */
 void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data) {
   memset(&data->raw, 0, sizeof(data->raw));
   init_waitqueue_head(&data->raw.waitq);
 }
 
-/* 拆出并发布一包 64 组 XYZ；保留固件 Y/Z 映射，不做浮点换算。
- * 无返回值，序号异常/IIO 推送失败记录到计数器。 */
+/* 解析一包 XYZ 样本并交给已绑定的样本接收函数。
+ * 返回：无。
+ * 序号和推送错误记入统计，末包标记批次结束。
+ */
 static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
-  u32 sequence = ((u32)raw->packet[1] << 24) |
-                 ((u32)raw->packet[2] << 16) |
-                 ((u32)raw->packet[3] << 8) | raw->packet[4];
+  u32 sequence = get_unaligned_be32(raw->packet + SSF_MEMS_RAW_SEQUENCE_OFFSET);
   unsigned int i;
 
-  WRITE_ONCE(raw->stream_seen, true);
   if (sequence != raw->next_sequence || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
       raw->batch_done == true) {
     if (raw->publishing == true) {
@@ -36,13 +37,12 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
       WRITE_ONCE(raw->drain_discontinuities, raw->drain_discontinuities + 1U);
     }
   }
-  raw->have_sequence = true;
   raw->next_sequence = sequence + 1U;
   WRITE_ONCE(raw->batch_packets, raw->batch_packets + 1U);
   for (i = 0; i < SSF_MEMS_RAW_SAMPLES_PER_PACKET; i++) {
     struct ssf_mems_raw_sample sample;
     unsigned int axis;
-    size_t offset = 5U + i * 6U;
+    size_t offset = SSF_MEMS_RAW_PAYLOAD_OFFSET + i * SSF_MEMS_RAW_SAMPLE_BYTES;
     int ret;
 
     if (raw->publishing == false || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
@@ -51,11 +51,10 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
 
     /* 每组六字节按 X/Y/Z 的大端有符号 16 位值解码。 */
     for (axis = 0; axis < 3U; axis++)
-      sample.xyz[axis] = (s16)(((u16)raw->packet[offset + axis * 2U] << 8) |
-                               raw->packet[offset + axis * 2U + 1U]);
+      sample.xyz[axis] = (s16)get_unaligned_be16(raw->packet + offset + axis * sizeof(s16));
     sample.packet_sequence = sequence;
     sample.sample_index = i;
-    ret = ssf_mems_iio_publish_raw(data, &sample);
+    ret = raw->sample_handler ? raw->sample_handler(data, &sample) : -ENODEV;
     if (ret != 0)
       WRITE_ONCE(raw->buffer_errors, raw->buffer_errors + 1U);
   }
@@ -68,21 +67,23 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
   wake_up_interruptible(&raw->waitq);
 }
 
-/* 私有包是 0x15 + BE32 包号 + 384 字节 XYZ + CRC16 + 0x17；没有从站地址。
- * 损坏后逐字节滑动找下一个通过 CRC 的包，兼容拆包、粘包和任意二进制载荷。
- * 无返回值，仅由接收工作项持 parse_lock 调用，错误计入统计。 */
+/* 用一个字节推进定长原始数据拼包。
+ * 返回：无。
+ * 调用者持 parse_lock；校验失败后定位下一包头。
+ */
 void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_raw_state *raw = &data->raw;
+  const u8 *next;
 
-  if (raw->used == 0 && byte != 0x15) {
+  if (raw->used == 0 && byte != SSF_MEMS_RAW_HEADER) {
     WRITE_ONCE(raw->ignored_bytes, raw->ignored_bytes + 1U);
     return;
   }
   raw->packet[raw->used++] = byte;
   if (raw->used != SSF_MEMS_RAW_PACKET_BYTES)
     return;
-  if (raw->packet[391] == 0x17 &&
-      ssf_mems_modbus_check_crc(raw->packet, 391) == 0) {
+  if (raw->packet[SSF_MEMS_RAW_TAIL_OFFSET] == SSF_MEMS_RAW_TAIL &&
+      ssf_mems_modbus_check_crc(raw->packet, SSF_MEMS_RAW_TAIL_OFFSET) == 0) {
     ssf_mems_raw_publish_packet(data);
     raw->used = 0;
     return;
@@ -91,8 +92,8 @@ void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
     WRITE_ONCE(raw->crc_errors, raw->crc_errors + 1U);
   else
     WRITE_ONCE(raw->drain_crc_errors, raw->drain_crc_errors + 1U);
-  do {
-    raw->used--;
-    memmove(raw->packet, raw->packet + 1, raw->used);
-  } while (raw->used != 0 && raw->packet[0] != 0x15);
+  next = memchr(raw->packet + 1, SSF_MEMS_RAW_HEADER, raw->used - 1U);
+  raw->used = next ? raw->used - (next - raw->packet) : 0;
+  if (raw->used != 0)
+    memmove(raw->packet, next, raw->used);
 }

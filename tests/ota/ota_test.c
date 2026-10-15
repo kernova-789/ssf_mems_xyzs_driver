@@ -221,6 +221,7 @@ static void cleanup(void) {
   pthread_mutex_destroy(&sensor.protocol.bus_lock.native);
   pthread_mutex_destroy(&sensor.protocol.lock.native);
   pthread_mutex_destroy(&sensor.acquisition.lock.native);
+  pthread_mutex_destroy(&sensor.acquisition.status_lock.native);
   pthread_mutex_destroy(&sensor.ota.lock.native);
   pthread_mutex_destroy(&sensor.ota.update_lock.native);
   initialized = false;
@@ -240,6 +241,7 @@ static void reset(size_t size, enum fault selected) {
   CHECK(ssf_mems_modbus_request_init(&sensor) == 0);
   CHECK(ssf_mems_modbus_receive_init(&sensor, ssf_mems_protocol_handle_frame, &sensor) == 0);
   mutex_init(&sensor.acquisition.lock);
+  mutex_init(&sensor.acquisition.status_lock);
   sensor.acquisition.online = true;
   sensor.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
   sensor.acquisition.raw_duration_ms = 5000;

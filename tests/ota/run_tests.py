@@ -20,7 +20,7 @@ def main():
                      ROOT / "iio"):
             command += ["-I" + str(path)]
         command += [str(ROOT / "protocol" / (name + ".c")) for name in
-                    ("modbus", "modbus_request", "modbus_receive", "protocol",
+                    ("modbus_table", "serial_transport", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol",
                      "raw_stream", "ota")]
         command += [str(ROOT / "acquisition/ssf_mems_firmware.c"),
                     str(TEST / "ota_test.c"), "-o", str(executable)]

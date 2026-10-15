@@ -21,23 +21,29 @@ VARIANTS = {
     "delete_save_register": {40110},
     "delete_finite_start": {40060},
     "reverse_table": set(),
+    "feature_scale_x10": set(),
+    "feature_switch_layout": set(),
+    "short_baud_table": set(),
     "relocate_registers": set(),
     "nonadjacent_length_display": set(),
     "nonadjacent_length_protocol": set(),
 }
-MODULES = ("modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream", "ota")
+MODULES = ("modbus_table", "serial_transport", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream", "ota")
 HEADERS = (
     "sensor_data.h", "modbus_types.h", "modbus.h", "modbus_table.h",
     "modbus_request.h", "modbus_receive.h", "protocol.h", "core.h",
-    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h", "ota.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h", "raw_capture.h", "serial_transport.h", "ota.h",
 )
 ALLOWED_DEPENDENCIES = {
-    "modbus": set(),
-    "modbus_request": {"modbus", "modbus_receive"},
-    "modbus_receive": {"modbus", "raw_stream", "ota"},
-    "protocol": {"modbus", "modbus_request", "modbus_receive", "raw_stream", "ota"},
-    "raw_stream": {"modbus", "iio"},
-    "ota": {"modbus_request", "modbus_receive", "protocol"},
+    "modbus_table": set(),
+    "serial_transport": {"modbus_table"},
+    "raw_capture": {"modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
+    "modbus": {"modbus_table"},
+    "modbus_request": {"modbus", "modbus_table", "modbus_receive", "serial_transport"},
+    "modbus_receive": {"modbus", "modbus_table", "raw_stream", "ota", "serial_transport"},
+    "protocol": {"modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
+    "raw_stream": {"modbus"},
+    "ota": {"modbus_request", "modbus_receive", "protocol", "serial_transport"},
 }
 
 def check_module_dependencies(objects):
@@ -60,7 +66,7 @@ def check_module_dependencies(objects):
                 raise AssertionError(f"Invalid dependency: {module} -> {symbol} ({owner})")
 
 def configure_table(text, deleted, variant):
-    marker = "static const struct ssf_reg_desc ssf_reg_table[] = {"
+    marker = "const struct ssf_reg_desc ssf_reg_table[] = {"
     start = text.index(marker) + len(marker)
     end = text.index("\n};", start)
     entries = re.findall(r"    \{\n.*?\n    \},", text[start:end], re.S)
@@ -79,10 +85,22 @@ def configure_table(text, deleted, variant):
                 entry = entry.replace(".display_reg = 40062", ".display_reg = 41062")
             if address == 40062 and variant == "nonadjacent_length_protocol":
                 entry = entry.replace(".protocol_addr = 0x003d", ".protocol_addr = 0x013d")
+            if address == 40007 and variant == "feature_scale_x10":
+                entry = entry.replace('.name = "temperature",',
+                                      '.feature_multiplier = 20,\n        .feature_divisor = 2,\n        .name = "temperature",')
             kept.append(entry)
     if variant == "reverse_table":
         kept.reverse()
-    return text[:start] + "\n" + "\n".join(kept) + text[end:]
+    result = text[:start] + "\n" + "\n".join(kept) + text[end:]
+    if variant == "feature_switch_layout":
+        result = result.replace(".feature_enable_mask = 0xfc00", ".feature_enable_mask = 0x003f")
+        result = result.replace(".feature_enable_shift = 10", ".feature_enable_shift = 0")
+    if variant == "short_baud_table":
+        result = re.sub(r"static const unsigned int ssf_baudrates\[\] = \{.*?\n};",
+                        "static const unsigned int ssf_baudrates[] = {\n"
+                        "    9600, 2400, 4800, 9600, 19200, 38400, 57600, 115200,\n};",
+                        result, flags=re.S)
+    return result
 
 def main():
     compiler = os.environ.get("CC", "cc")

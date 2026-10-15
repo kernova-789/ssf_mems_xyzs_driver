@@ -13,8 +13,10 @@
 #include "modbus_request.h"
 #include "ssf_mems_acquisition.h"
 
-/* Linux 5.10 串口接收回调；返回实际入队字节数，0 表示本次未接收/内部失败。
- * 部分入队时 serdev 可重送剩余字节，不把请求错误码交给串口层。 */
+/* 把串口收到的字节放入接收队列。
+ * 返回：已接收的字节数，失败时为 0。
+ * 未入队的剩余字节由 serdev 重送。
+ */
 static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
                               const unsigned char *buf, size_t count) {
   ssize_t ret;
@@ -29,7 +31,9 @@ static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
   return (int)ret;
 }
 
-/* UART 发送队列有空间时唤醒 serdev 写入者；无返回值。 */
+/* 唤醒等待发送串口数据的线程。
+ * 返回：无。
+ */
 static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {
   serdev_device_write_wakeup(serdev);
 }
@@ -40,8 +44,10 @@ static const struct serdev_device_ops ssf_mems_xyzs_ops = {
     .write_wakeup = ssf_mems_xyzs_ops_write_wakeup,
 };
 
-/* 绑定串口、初始化模块并启动后台线程；返回 0 成功，-EINVAL 启动配置非法，
- * -ENOMEM 分配失败；其他负 errno 由串口打开、IIO 注册或线程创建透传，见各模块接口。 */
+/* 初始化驱动并启动后台采集。
+ * 返回：0 成功，负数为初始化错误。
+ * 传感器通信由后台线程执行。
+ */
 static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   int ret;
@@ -93,6 +99,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
     goto err_receive;
   }
 
+  data->raw.sample_handler = ssf_mems_iio_publish_raw;
   ret = ssf_mems_acquisition_start(data);
   if (ret != 0) {
     dev_err(&serdev->dev, "failed to start sensor acquisition: %d\n", ret);
@@ -114,7 +121,10 @@ err_request:
   return ret;
 }
 
-/* 依次停止升级、请求、采集及接收；无返回值，先等生产者退出再释放资源。 */
+/* 停止驱动并释放设备资源。
+ * 返回：无。
+ * 先停止数据生产者，再释放 IIO 和接收资源。
+ */
 static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   data = serdev_device_get_drvdata(serdev);

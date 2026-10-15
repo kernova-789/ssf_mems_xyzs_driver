@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ota.h"
+#include "serial_transport.h"
 #include "core.h"
 
 #include <linux/delay.h>
@@ -16,15 +17,17 @@
 #define SSF_MEMS_OTA_RETRIES 3U /* 仅用于查询和普通包；末包只发送一次。 */
 #define SSF_MEMS_OTA_GAP_MS 20U /* 相邻升级包发送前的主机等待，ms。 */
 
-/* 手工读小端向量表，避免未对齐访问以及主机字节序差异。
- * 返回四个字节构成的小端 u32；调用者保证 p 指向至少 4 个可读字节。 */
+/* 读取四个字节组成的小端整数。
+ * 返回：读出的 32 位数值。
+ * 调用者保证至少有四个可读字节。
+ */
 static u32 ssf_mems_ota_le32(const u8 *p) {
   return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24;
 }
 
-/* 检查应用区大小、栈指针和 Thumb 复位入口；不证明机型或签名匹配。
- * 返回 0 基础校验通过，-EINVAL 空数据/不足 8 字节，-EFBIG 超过 256 KiB，
- * -ENOEXEC 栈指针/复位入口不满足应用区要求。 */
+/* 检查固件大小和启动向量是否有效。
+ * 返回：0 通过，-EINVAL 数据无效，-EFBIG 过大，-ENOEXEC 启动向量不符。
+ */
 int ssf_mems_ota_validate_image(const u8 *image, size_t size) {
   u32 stack, entry;
 
@@ -45,8 +48,10 @@ int ssf_mems_ota_validate_image(const u8 *image, size_t size) {
   return 0;
 }
 
-/* 解析简单 .bin 文件名；返回 0 成功，-EINVAL 空参数、路径、非法字符/长度/后缀。
- * name 必须提供 SSF_MEMS_OTA_NAME_SIZE 字节空间。 */
+/* 检查并复制 bin 文件名。
+ * 返回：0 成功，-EINVAL 文件名或参数无效。
+ * name 缓冲区须有 SSF_MEMS_OTA_NAME_SIZE 字节。
+ */
 int ssf_mems_ota_parse_name(const char *buf, size_t len, char *name) {
   size_t i;
 
@@ -69,9 +74,10 @@ int ssf_mems_ota_parse_name(const char *buf, size_t len, char *name) {
   return 0;
 }
 
-/* 组包时尾块填充 0xff；最后一个有数据的包使用 0xffffffff 包号。
- * 返回 0 成功，-EINVAL 地址非法、载荷超长或缓冲区指针为空。
- * frame 必须提供 SSF_MEMS_OTA_FRAME_SIZE 字节空间。 */
+/* 组装一个固件升级数据包。
+ * 返回：0 成功，-EINVAL 参数无效。
+ * frame 须有 SSF_MEMS_OTA_FRAME_SIZE 字节，不足一块填 0xff。
+ */
 int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
                               size_t size, u8 *frame) {
   unsigned int i;
@@ -96,7 +102,9 @@ int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
   return 0;
 }
 
-/* 初始化 OTA 状态；无返回值，data 必须有效，不发送串口命令。 */
+/* 初始化固件升级状态。
+ * 返回：无。
+ */
 void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_ota_state *ota = &data->ota;
 
@@ -108,7 +116,9 @@ void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data) {
   ota->status.version = -1;
 }
 
-/* 禁止新升级并唤醒等待者；无返回值，不发送重启命令。 */
+/* 禁止新升级并唤醒升级等待者。
+ * 返回：无。
+ */
 void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data) {
   mutex_lock(&data->ota.lock);
   WRITE_ONCE(data->ota.stopping, true);
@@ -116,7 +126,10 @@ void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data) {
   wake_up_interruptible(&data->ota.waitq);
 }
 
-/* 更新阶段/错误码，开始加载时清旧进度；无返回值，只获取短锁。 */
+/* 更新升级阶段和错误码。
+ * 返回：无。
+ * 开始加载时清空旧进度。
+ */
 void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
                             enum ssf_mems_ota_stage stage, int error) {
   mutex_lock(&data->ota.lock);
@@ -130,7 +143,10 @@ void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
   mutex_unlock(&data->ota.lock);
 }
 
-/* 复制升级进度快照；无返回值，data/status 必须有效，不获取采集锁。 */
+/* 复制当前固件升级进度。
+ * 返回：无。
+ * 只持升级状态锁，升级期间也可读取。
+ */
 void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
                              struct ssf_mems_ota_status *status) {
   mutex_lock(&data->ota.lock);
@@ -138,7 +154,9 @@ void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
   mutex_unlock(&data->ota.lock);
 }
 
-/* 返回静态阶段名称字符串，非法枚举返回 "unknown"，不会返回 NULL。 */
+/* 把升级阶段转换为名称。
+ * 返回：静态名称字符串，无效阶段为 "unknown"。
+ */
 const char *ssf_mems_ota_stage_name(enum ssf_mems_ota_stage stage) {
   static const char *const names[] = {
       "idle", "loading", "waiting", "checking", "sending", "rebooting",
@@ -148,7 +166,10 @@ const char *ssf_mems_ota_stage_name(enum ssf_mems_ota_stage stage) {
   return (unsigned int)stage < ARRAY_SIZE(names) ? names[stage] : "unknown";
 }
 
-/* 接收工作项处理一个 OTA 字节；无返回值，收齐应答后唤醒发送者。 */
+/* 用一个字节拼接固件升级应答。
+ * 返回：无。
+ * 收齐应答后唤醒发送者。
+ */
 void ssf_mems_ota_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_ota_state *ota = &data->ota;
   bool complete = false;
@@ -177,8 +198,9 @@ out:
     wake_up_interruptible(&ota->waitq);
 }
 
-/* 不持应答锁等待；卸载会唤醒，信号只允许在提交末包之前中止。
- * 返回 0 等待结束，-ENODEV 卸载唤醒，-ERESTARTSYS 信号打断；不持应答锁等待。 */
+/* 等待升级所需的时间间隔。
+ * 返回：0 等待结束，-ENODEV 停止，负数也可能是信号中断。
+ */
 static int ssf_mems_ota_pause(struct ssf_mems_xyzs_data *data, unsigned int ms) {
   long ret = wait_event_interruptible_timeout(
       data->ota.waitq, READ_ONCE(data->ota.stopping) == true,
@@ -189,17 +211,14 @@ static int ssf_mems_ota_pause(struct ssf_mems_xyzs_data *data, unsigned int ms) 
   return ret < 0 ? (int)ret : 0;
 }
 
-/* 每包一次同步发送；写入不足时不能简单补发尾部，固件按 IDLE 分帧。
- * 返回 0 收到完整应答，-EIO 串口短写，-ETIMEDOUT 未收齐应答，
- * -ENODEV 停止中，-ERESTARTSYS 信号打断；其他为串口控制器负 errno。 */
+/* 发送一个升级包并等待应答。
+ * 返回：0 收到完整应答，负数为串口、超时、停止或信号错误。
+ * 发送不完整时不补发尾部。
+ */
 static int ssf_mems_ota_exchange(struct ssf_mems_xyzs_data *data,
                                  const u8 *frame, u32 *next) {
   struct ssf_mems_ota_state *ota = &data->ota;
-  unsigned int baud = data->protocol.host_baudrate;
-  unsigned int bits = data->protocol.parity == SSF_MEMS_PARITY_NONE ? 10U : 11U;
-  unsigned int timeout = DIV_ROUND_UP(SSF_MEMS_OTA_FRAME_SIZE * bits * 1000U,
-                                     baud) + 200U;
-  ssize_t written;
+  unsigned int timeout = ssf_mems_serial_wire_ms(data, SSF_MEMS_OTA_FRAME_SIZE) + 200U;
   long waited;
   int ret;
 
@@ -211,13 +230,9 @@ static int ssf_mems_ota_exchange(struct ssf_mems_xyzs_data *data,
   ota->used = 0;
   WRITE_ONCE(ota->pending, true);
   mutex_unlock(&ota->lock);
-  written = serdev_device_write(data->serdev, frame, SSF_MEMS_OTA_FRAME_SIZE,
-                                msecs_to_jiffies(timeout));
-  serdev_device_wait_until_sent(data->serdev, msecs_to_jiffies(timeout));
-  if (written != SSF_MEMS_OTA_FRAME_SIZE) {
-    ret = written < 0 ? (int)written : -EIO;
+  ret = ssf_mems_serial_write(data, frame, SSF_MEMS_OTA_FRAME_SIZE, timeout);
+  if (ret != 0)
     goto out;
-  }
   waited = wait_event_interruptible_timeout(
       ota->waitq, READ_ONCE(ota->pending) == false ||
                      READ_ONCE(ota->stopping) == true,
@@ -239,9 +254,10 @@ out:
   return ret;
 }
 
-/* 普通包的重复序号不会再次写 Flash；末包在固件中不具备这个保护。
- * 返回 0 应答包计数匹配，-EPROTO 计数异常，-ETIMEDOUT 重试后仍无匹配应答；
- * -EIO/-ENODEV/-ERESTARTSYS 及其他串口错误同 ota_exchange()，末包只尝试一次。 */
+/* 发送升级包并核对应答计数。
+ * 返回：0 计数匹配，-EPROTO 计数异常，其他负数为传输错误。
+ * 普通包允许重试，末包只发送一次。
+ */
 static int ssf_mems_ota_send(struct ssf_mems_xyzs_data *data, const u8 *frame,
                              u32 expected, bool final) {
   unsigned int attempt, attempts = final == true ? 1U : SSF_MEMS_OTA_RETRIES;
@@ -264,11 +280,10 @@ static int ssf_mems_ota_send(struct ssf_mems_xyzs_data *data, const u8 *frame,
   return ret;
 }
 
-/* 调用者持 update_lock 和采集锁，函数独占 bus_lock；失败不自动重启。
- * 返回 0 分包应答及重启后通信已确认，不代表整镜像读回验证；
- * -EINVAL 参数非法，-EFBIG 镜像过大，-ENOEXEC 向量表不符，-EBUSY 模式/速率不允许，
- * -ENODEV 停止中，-EPROTO 包计数不符，-EIO 串口短写，-ETIMEDOUT 应答/启动验证超时，
- * -EINTR 被信号打断；其他为版本读取请求错误（见 modbus_request.h）或串口负 errno。 */
+/* 传输固件并确认传感器重启后的通信。
+ * 返回：0 升级应答及通信已确认，负数为镜像、状态或传输错误。
+ * 调用者持 update_lock 和采集锁；末包不重发，结果不明时标记 uncertain。
+ */
 int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
                           const u8 *image, size_t size) {
   u8 frame[SSF_MEMS_OTA_FRAME_SIZE];

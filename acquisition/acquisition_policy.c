@@ -6,7 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 比较单轴的全部特征；返回 true 字段全部相同，false 至少一项不同。 */
+/* 比较两份单轴特征。
+ * 返回：true 相同，false 不同。
+ */
 static bool ssf_mems_axis_equal(const struct ssf_mems_axis_features *a,
                                 const struct ssf_mems_axis_features *b) {
   return a->high_freq_acc_rms_x100 == b->high_freq_acc_rms_x100 &&
@@ -18,8 +20,10 @@ static bool ssf_mems_axis_equal(const struct ssf_mems_axis_features *a,
          a->velocity_rms_x100 == b->velocity_rms_x100;
 }
 
-/* 按字段比较，避免结构体尾部填充字节影响重复判定。
- * 返回 true 两份完整特征相同，false 至少一项不同；不比较填充字节。 */
+/* 比较两份完整特征。
+ * 返回：true 相同，false 不同。
+ * 只比较字段，不比较结构体填充字节。
+ */
 static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
                                   const struct ssf_mems_sensor_data *b) {
   return ssf_mems_axis_equal(&a->x, &b->x) &&
@@ -35,36 +39,107 @@ static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
          a->startup_flags == b->startup_flags;
 }
 
-/* 清空当前调速窗口统计；无返回值，不清除上次样本和连接时间。 */
+/* 清空本轮轮询统计。
+ * 返回：无。
+ */
 static void ssf_mems_reset_window(struct ssf_mems_acquisition_policy *policy) {
   policy->comparisons = 0;
   policy->repeats = 0;
   policy->max_read_ms = 0;
 }
 
-/* 将轮询周期缩短约 5%，受最小周期限制；无返回值。 */
+/* 小幅缩短轮询周期。
+ * 返回：无。
+ * 周期不低于设定下限。
+ */
 static void ssf_mems_poll_faster(struct ssf_mems_acquisition_policy *policy) {
   unsigned int step = max(1U, policy->interval_ms / 20U);
 
-  policy->interval_ms = max(SSF_MEMS_POLL_MIN_MS, policy->interval_ms - step);
+  policy->interval_ms = max(policy->config.min_interval_ms,
+                            policy->interval_ms - step);
 }
 
-/* 重置策略并设置初始周期；无返回值，policy 必须有效。 */
+/* 初始化轮询策略。
+ * 返回：无。
+ */
 void ssf_mems_acquisition_policy_init(
     struct ssf_mems_acquisition_policy *policy, unsigned long now) {
   memset(policy, 0, sizeof(*policy));
-  policy->interval_ms = SSF_MEMS_POLL_INITIAL_MS;
-  policy->last_contact = now;
+  policy->config.mode = SSF_MEMS_POLL_FIXED;
+  policy->config.fixed_interval_ms = SSF_MEMS_POLL_DEFAULT_INTERVAL_MS;
+  policy->config.min_interval_ms = SSF_MEMS_POLL_DEFAULT_MIN_MS;
+  policy->config.max_interval_ms = SSF_MEMS_POLL_DEFAULT_MAX_MS;
+  policy->interval_ms = policy->config.fixed_interval_ms;
+  ssf_mems_acquisition_policy_restart(policy, now);
+}
+
+/* 清空历史统计并保留用户配置和当前周期。
+ * 返回：无。
+ */
+void ssf_mems_acquisition_policy_restart(
+    struct ssf_mems_acquisition_policy *policy, unsigned long now) {
+  policy->have_previous = false;
+  ssf_mems_reset_window(policy);
+  ssf_mems_acquisition_policy_contact(policy, now);
   policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
 }
 
-/* 记录一次成功样本并按窗口调整周期；无返回值，指针必须有效。 */
+/* 更新轮询配置并使当前周期满足新的限制。
+ * 返回：0 成功，-EINVAL 模式、范围或上下限无效。
+ */
+int ssf_mems_acquisition_policy_configure(
+    struct ssf_mems_acquisition_policy *policy,
+    const struct ssf_mems_poll_config *config, unsigned long now) {
+  bool active_changed;
+
+  if (policy == NULL || config == NULL ||
+      (unsigned int)config->mode >= SSF_MEMS_POLL_MODE_COUNT ||
+      config->fixed_interval_ms < SSF_MEMS_POLL_MIN_INTERVAL_MS ||
+      config->fixed_interval_ms > SSF_MEMS_POLL_MAX_INTERVAL_MS ||
+      config->min_interval_ms < SSF_MEMS_POLL_MIN_INTERVAL_MS ||
+      config->max_interval_ms > SSF_MEMS_POLL_MAX_INTERVAL_MS ||
+      config->min_interval_ms > config->max_interval_ms)
+    return -EINVAL;
+
+  active_changed = policy->config.mode != config->mode ||
+      (config->mode == SSF_MEMS_POLL_FIXED &&
+       policy->config.fixed_interval_ms != config->fixed_interval_ms) ||
+      (config->mode == SSF_MEMS_POLL_ADAPTIVE &&
+       (policy->config.min_interval_ms != config->min_interval_ms ||
+        policy->config.max_interval_ms != config->max_interval_ms));
+  policy->config = *config;
+  if (active_changed == false)
+    return 0;
+  policy->interval_ms = config->mode == SSF_MEMS_POLL_FIXED ?
+      config->fixed_interval_ms :
+      min(config->max_interval_ms, max(config->min_interval_ms, policy->interval_ms));
+  policy->have_previous = false;
+  ssf_mems_reset_window(policy);
+  policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
+  return 0;
+}
+
+/* 记录一次有效通信，不清空自适应统计。
+ * 返回：无。
+ */
+void ssf_mems_acquisition_policy_contact(
+    struct ssf_mems_acquisition_policy *policy, unsigned long now) {
+  policy->link_failures = 0;
+  policy->last_contact = now;
+}
+
+/* 记录成功样本并调整轮询周期。
+ * 返回：无。
+ */
 void ssf_mems_acquisition_policy_sample(
     struct ssf_mems_acquisition_policy *policy,
     const struct ssf_mems_sensor_data *sample, unsigned int read_ms,
     unsigned long now) {
-  policy->link_failures = 0;
-  policy->last_contact = now;
+  bool probe_due = time_after_eq(now, policy->next_probe);
+
+  ssf_mems_acquisition_policy_contact(policy, now);
+  if (policy->config.mode == SSF_MEMS_POLL_FIXED)
+    return;
   policy->max_read_ms = max(policy->max_read_ms, read_ms);
   if (policy->have_previous == true) {
     policy->comparisons++;
@@ -74,29 +149,32 @@ void ssf_mems_acquisition_policy_sample(
   policy->previous = *sample;
   policy->have_previous = true;
 
-  /* 静止场景定期小幅提速试探，避免长期停留在最低轮询频率。 */
-  if (time_after_eq(now, policy->next_probe) == true) {
+  /* 完整统计窗口优先，避免同一轮先减速又试探提速。 */
+  if (policy->comparisons >= SSF_MEMS_POLL_WINDOW) {
+    if (policy->repeats * 100U > policy->comparisons * 50U)
+      policy->interval_ms = min(policy->config.max_interval_ms,
+                               policy->interval_ms +
+                                   max(1U, policy->interval_ms / 5U));
+    else if (policy->repeats * 100U < policy->comparisons * 10U &&
+             policy->max_read_ms <= policy->interval_ms / 2U)
+      ssf_mems_poll_faster(policy);
+    ssf_mems_reset_window(policy);
+    if (probe_due == true)
+      policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
+    return;
+  }
+  /* 定期试探不清空未完成的统计，长周期和交替采集也能积满窗口。 */
+  if (probe_due == true) {
     if (policy->max_read_ms <= policy->interval_ms / 2U)
       ssf_mems_poll_faster(policy);
     policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
-    ssf_mems_reset_window(policy);
-    return;
   }
-  if (policy->comparisons < SSF_MEMS_POLL_WINDOW)
-    return;
-
-  if (policy->repeats * 100U > policy->comparisons * 50U)
-    policy->interval_ms = min(SSF_MEMS_POLL_MAX_MS,
-                             policy->interval_ms +
-                                 max(1U, policy->interval_ms / 5U));
-  else if (policy->repeats * 100U < policy->comparisons * 10U &&
-           policy->max_read_ms <= policy->interval_ms / 2U)
-    ssf_mems_poll_faster(policy);
-  ssf_mems_reset_window(policy);
 }
 
-/* 记录错误；返回 true 需重新连接，false 尚未达到次数/时间阈值或非通信错误。
- * -EREMOTEIO 说明收到合法从机异常，清除断线计数。 */
+/* 记录通信错误并判断是否需要重连。
+ * 返回：true 需要重连，false 不需要。
+ * 收到合法从机异常仍视为链路可达。
+ */
 bool ssf_mems_acquisition_policy_error(
     struct ssf_mems_acquisition_policy *policy, int error, unsigned long now) {
   policy->have_previous = false;

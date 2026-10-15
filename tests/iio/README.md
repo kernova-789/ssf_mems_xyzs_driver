@@ -25,3 +25,12 @@ scheduling is covered by `tests/acquisition`, not by this substitute.
 增加原始 XYZ、包号和包内序号全部 31 种非空字段子集测试，各自覆盖带/不带
 时间戳的扫描对齐；同时验证原始 scale、buffer 未启用及错误参数处理。
 只读统计属性测试分别核对有效采集、停止排空、首包等待、停止次数和业务模式。
+# Polling attributes
+
+The production IIO sysfs handlers are tested for fixed/adaptive mode strings,
+all three interval attributes, readback, decimal parsing, invalid input rejection,
+and propagation of configuration errors. The effective interval remains read-only.
+Range validation and scheduling use the production acquisition tests.
+
+可选采样率和波特率列表由生产型号表生成，测试验证其输出及属性绑定。
+发布并发测试同时断言 IIO 推送不会修改协议特征缓存，避免恢复重复缓存写入。

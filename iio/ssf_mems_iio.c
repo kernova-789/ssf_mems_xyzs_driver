@@ -272,8 +272,9 @@ static const struct iio_chan_spec ssf_mems_iio_channels[] = {
     IIO_CHAN_SOFT_TIMESTAMP(SSF_MEMS_IIO_FEATURE_MAX),
 };
 
-/* 只从最新快照取字段；返回 0 成功，-EINVAL 通道/字段宽度非法，
- * -ENODATA 无有效缓存，-ENODEV 未绑定设备；不发送串口帧。 */
+/* 从特征缓存读取一个通道值。
+ * 返回：0 成功，-ENODATA 无有效缓存，其他负数为参数或设备错误。
+ */
 static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
                                      const struct iio_chan_spec *chan,
                                      int *value) {
@@ -307,8 +308,9 @@ static int ssf_mems_iio_read_feature(struct ssf_mems_iio_state *state,
   return 0;
 }
 
-/* 返回 IIO_VAL_INT（整数比例）、IIO_VAL_INT_PLUS_MICRO（整数+微小数）或
- * IIO_VAL_INT_PLUS_NANO（整数+纳小数）；-EINVAL 通道/比例类型非法。 */
+/* 读取特征通道的单位换算比例。
+ * 返回：IIO_VAL_* 表示数值格式，-EINVAL 通道无效。
+ */
 static int ssf_mems_iio_read_scale(const struct iio_chan_spec *chan, int *val,
                                    int *val2) {
   const struct ssf_mems_iio_feature_desc *desc;
@@ -349,8 +351,10 @@ static int ssf_mems_iio_read_scale(const struct iio_chan_spec *chan, int *val,
   return -EINVAL;
 }
 
-/* IIO 直接读回调；返回 IIO_VAL_* 表示 val/val2 的格式，-EINVAL 属性不支持，
- * -ENODATA 无特征缓存，-ENODEV 无设备；其余含义同 read_feature/read_scale。 */
+/* 读取 IIO 通道值或换算比例。
+ * 返回：IIO_VAL_* 表示数值格式，负数为属性或缓存错误。
+ * 特征值来自缓存，不发送串口请求。
+ */
 static int ssf_mems_iio_read_raw(struct iio_dev *indio_dev,
                                  const struct iio_chan_spec *chan, int *val,
                                  int *val2, long mask) {
@@ -370,7 +374,9 @@ static int ssf_mems_iio_read_raw(struct iio_dev *indio_dev,
   }
 }
 
-/* 确认实际通信速率并格式化；返回输出字节数，负值及含义同 acquisition_get_baudrate()。 */
+/* 读取通信波特率并输出文本。
+ * 返回：输出字节数，负数为设备状态或通信错误。
+ */
 static ssize_t ssf_mems_iio_baudrate_show(struct device *dev,
                                            struct device_attribute *attr,
                                            char *buf) {
@@ -389,8 +395,9 @@ static ssize_t ssf_mems_iio_baudrate_show(struct device *dev,
   return sysfs_emit(buf, "%d\n", value);
 }
 
-/* 解析并同步切速；返回 len 成功，-EINVAL 输入/速率非法，-ERANGE 数字溢出，
- * 其余负值及含义同 acquisition_set_baudrate()。 */
+/* 解析用户输入并修改波特率。
+ * 返回：成功返回 len，失败返回负数错误码。
+ */
 static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
                                             struct device_attribute *attr,
                                             const char *buf, size_t len) {
@@ -398,21 +405,15 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
   struct ssf_mems_iio_state *state = iio_priv(indio_dev);
   enum ssf_mems_baudrate baudrate;
   unsigned int value;
-  unsigned int i;
   int ret;
 
-  ret = kstrtouint(buf, 0, &value); //字符串转无符号整数
+  ret = kstrtouint(buf, 0, &value);
   if (ret != 0)
     return ret;
 
-  /* 数值 9600 对应显式 9600 枚举，而不是“默认”别名。 */
-  for (i = SSF_MEMS_BAUDRATE_2400; i < SSF_MEMS_BAUDRATE_MAX; i++) {
-    if (ssf_mems_baudrate_to_value(i) == value)
-      break;
-  }
-  if (i == SSF_MEMS_BAUDRATE_MAX)
-    return -EINVAL;
-  baudrate = i;
+  ret = ssf_mems_baudrate_from_value(value, &baudrate);
+  if (ret != 0)
+    return ret;
 
   ret = ssf_mems_acquisition_set_baudrate(state->data, baudrate);
   if (ret != 0)
@@ -423,53 +424,89 @@ static ssize_t ssf_mems_iio_baudrate_store(struct device *dev,
 static IIO_DEVICE_ATTR(sensor_baudrate, 0644, ssf_mems_iio_baudrate_show,
                        ssf_mems_iio_baudrate_store, 0);
 
-/* 40052 索引对应的 Hz 文本；使用字符串避免内核浮点运算。 */
-static const char *const ssf_mems_sampling_frequencies[] = {
-    "533.34", "888.9", "1066.68", "1333.35", "2666.7",
-    "2963", "5333.4", "8889", "13333.5", "26667",
+/* 属性编号只用于 IIO 分派，与协议配置枚举分开。 */
+enum ssf_mems_iio_setting_attr {
+  SSF_MEMS_IIO_SETTING_RATE,
+  SSF_MEMS_IIO_SETTING_FREQUENCY,
+  SSF_MEMS_IIO_SETTING_LENGTH,
+  SSF_MEMS_IIO_SETTING_SWITCH,
+  SSF_MEMS_IIO_SETTING_ENABLE,
+  SSF_MEMS_IIO_SETTING_VERSION,
+};
+enum ssf_mems_iio_setting_format {
+  SSF_MEMS_IIO_SETTING_DECIMAL,
+  SSF_MEMS_IIO_SETTING_HEX,
+  SSF_MEMS_IIO_SETTING_HZ,
+};
+struct ssf_mems_iio_setting_desc {
+  enum ssf_mems_sensor_setting setting;
+  enum ssf_mems_iio_setting_format format;
+  bool writable;
+};
+static const struct ssf_mems_iio_setting_desc ssf_mems_iio_settings[] = {
+    [SSF_MEMS_IIO_SETTING_RATE] =
+        {SSF_MEMS_SETTING_SAMPLING_RATE, SSF_MEMS_IIO_SETTING_DECIMAL, true},
+    [SSF_MEMS_IIO_SETTING_FREQUENCY] =
+        {SSF_MEMS_SETTING_SAMPLING_RATE, SSF_MEMS_IIO_SETTING_HZ, false},
+    [SSF_MEMS_IIO_SETTING_LENGTH] =
+        {SSF_MEMS_SETTING_SAMPLING_LENGTH, SSF_MEMS_IIO_SETTING_DECIMAL, false},
+    [SSF_MEMS_IIO_SETTING_SWITCH] =
+        {SSF_MEMS_SETTING_PARAMETER_SWITCH, SSF_MEMS_IIO_SETTING_HEX, false},
+    [SSF_MEMS_IIO_SETTING_ENABLE] =
+        {SSF_MEMS_SETTING_FEATURE_ENABLE, SSF_MEMS_IIO_SETTING_DECIMAL, true},
+    [SSF_MEMS_IIO_SETTING_VERSION] =
+        {SSF_MEMS_SETTING_FIRMWARE_VERSION, SSF_MEMS_IIO_SETTING_DECIMAL, false},
 };
 
-/* 读取传感器配置并格式化；返回输出字节数，-EINVAL 采样索引非法，
- * 其余负值及含义同 acquisition_read_setting()。 */
+/* 读取传感器配置并输出文本。
+ * 返回：输出字节数，负数为配置或通信错误。
+ */
 static ssize_t ssf_mems_iio_setting_show(struct device *dev,
                                         struct device_attribute *attr,
                                         char *buf) {
   struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
   unsigned long address = to_iio_dev_attr(attr)->address;
-  enum ssf_mems_sensor_setting setting = address == SSF_MEMS_SETTING_MAX ?
-      SSF_MEMS_SETTING_SAMPLING_RATE : address;
+  const struct ssf_mems_iio_setting_desc *desc;
   u16 value;
   int ret;
 
-  ret = ssf_mems_acquisition_read_setting(state->data, setting, &value);
+  if (address >= ARRAY_SIZE(ssf_mems_iio_settings))
+    return -EINVAL;
+  desc = &ssf_mems_iio_settings[address];
+  ret = ssf_mems_acquisition_read_setting(state->data, desc->setting, &value);
   if (ret != 0)
     return ret;
-  if (address == SSF_MEMS_SETTING_MAX) {
-    if (value >= ARRAY_SIZE(ssf_mems_sampling_frequencies))
+  if (desc->format == SSF_MEMS_IIO_SETTING_HZ) {
+    if (value >= ssf_mems_sensor_profile.sampling_frequency_count)
       return -EINVAL;
-    return sysfs_emit(buf, "%s\n", ssf_mems_sampling_frequencies[value]);
+    return sysfs_emit(buf, "%s\n", ssf_mems_sensor_profile.sampling_frequencies[value]);
   }
-  if (setting == SSF_MEMS_SETTING_PARAMETER_SWITCH)
+  if (desc->format == SSF_MEMS_IIO_SETTING_HEX)
     return sysfs_emit(buf, "0x%04x\n", value);
   return sysfs_emit(buf, "%u\n", value);
 }
 
-/* 解析配置值并交给采集层；返回 len 成功，-EINVAL 非法输入/超出 16 位，
- * -ERANGE 数字溢出；其余负值及含义同 acquisition_write_setting()。 */
+/* 解析用户输入并修改传感器配置。
+ * 返回：成功返回 len，失败返回负数错误码。
+ */
 static ssize_t ssf_mems_iio_setting_store(struct device *dev,
                                          struct device_attribute *attr,
                                          const char *buf, size_t len) {
   struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned long address = to_iio_dev_attr(attr)->address;
   unsigned int value;
   int ret;
 
+  if (address >= ARRAY_SIZE(ssf_mems_iio_settings) ||
+      ssf_mems_iio_settings[address].writable == false)
+    return -EINVAL;
   ret = kstrtouint(buf, 0, &value);
   if (ret != 0)
     return ret;
   if (value > 0xffff)
     return -EINVAL;
   ret = ssf_mems_acquisition_write_setting(
-      state->data, to_iio_dev_attr(attr)->address, value);
+      state->data, ssf_mems_iio_settings[address].setting, value);
   if (ret != 0)
     return ret;
   return len;
@@ -477,22 +514,36 @@ static ssize_t ssf_mems_iio_setting_store(struct device *dev,
 
 static IIO_DEVICE_ATTR(sensor_sampling_rate_index, 0644,
                        ssf_mems_iio_setting_show, ssf_mems_iio_setting_store,
-                       SSF_MEMS_SETTING_SAMPLING_RATE);
+                       SSF_MEMS_IIO_SETTING_RATE);
 static IIO_DEVICE_ATTR(sensor_sampling_frequency, 0444,
-                       ssf_mems_iio_setting_show, NULL, SSF_MEMS_SETTING_MAX);
+                       ssf_mems_iio_setting_show, NULL, SSF_MEMS_IIO_SETTING_FREQUENCY);
 static IIO_DEVICE_ATTR(sensor_sampling_length_index, 0444,
                        ssf_mems_iio_setting_show, NULL,
-                       SSF_MEMS_SETTING_SAMPLING_LENGTH);
+                       SSF_MEMS_IIO_SETTING_LENGTH);
 static IIO_DEVICE_ATTR(sensor_parameter_switch, 0444,
                        ssf_mems_iio_setting_show, NULL,
-                       SSF_MEMS_SETTING_PARAMETER_SWITCH);
+                       SSF_MEMS_IIO_SETTING_SWITCH);
 static IIO_DEVICE_ATTR(sensor_feature_enable, 0644,
                        ssf_mems_iio_setting_show, ssf_mems_iio_setting_store,
-                       SSF_MEMS_SETTING_FEATURE_ENABLE);
+                       SSF_MEMS_IIO_SETTING_ENABLE);
 static IIO_DEVICE_ATTR(sensor_firmware_version, 0444,
                        ssf_mems_iio_setting_show, NULL,
-                       SSF_MEMS_SETTING_FIRMWARE_VERSION);
-static IIO_CONST_ATTR(sensor_sampling_rate_index_available, "0 1 2 3 4 5 6 7 8 9");
+                       SSF_MEMS_IIO_SETTING_VERSION);
+/* 从型号表生成可选采样率编号。
+ * 返回：输出字节数。
+ */
+static ssize_t ssf_mems_iio_rates_available(struct device *dev,
+                                            struct device_attribute *attr,
+                                            char *buf) {
+  size_t i;
+  int len = 0;
+
+  for (i = 0; i < ssf_mems_sensor_profile.sampling_frequency_count; i++)
+    len += sysfs_emit_at(buf, len, "%s%zu", i ? " " : "", i);
+  return len + sysfs_emit_at(buf, len, "\n");
+}
+static IIO_DEVICE_ATTR(sensor_sampling_rate_index_available, 0444,
+                       ssf_mems_iio_rates_available, NULL, 0);
 
 /* 属性地址仅分派主机调度配置，不是 Modbus 寄存器地址。 */
 enum ssf_mems_iio_acquisition_control {
@@ -508,7 +559,9 @@ static const char *const ssf_mems_iio_acquisition_modes[] = {
     [SSF_MEMS_ACQ_MODE_ALTERNATING] = "alternating",  //两种数据交替采集
 };
 
-/* 读取主机配置；返回输出字节数，-EINVAL 属性/模式非法，-ENODEV 停止中。 */
+/* 读取主机采集模式或窗口配置。
+ * 返回：输出字节数，负数为属性或设备状态错误。
+ */
 static ssize_t ssf_mems_iio_control_show(struct device *dev,
                                         struct device_attribute *attr,
                                         char *buf) {
@@ -534,8 +587,9 @@ static ssize_t ssf_mems_iio_control_show(struct device *dev,
   }
 }
 
-/* 修改主机调度；返回 len 成功，-EINVAL 属性/值非法，-ERANGE 数字溢出，
- * -ENODEV 停止中，-EOPNOTSUPP 校验位不支持原始模式；由采集层统一加锁。 */
+/* 修改主机采集模式或窗口配置。
+ * 返回：成功返回 len，失败返回负数错误码。
+ */
 static ssize_t ssf_mems_iio_control_store(struct device *dev,
                                          struct device_attribute *attr,
                                          const char *buf, size_t len) {
@@ -579,8 +633,99 @@ static IIO_DEVICE_ATTR(sensor_feature_duration_ms, 0644,
                        ssf_mems_iio_control_show, ssf_mems_iio_control_store,
                        SSF_MEMS_IIO_ACQ_FEATURE_DURATION);
 
-/* 读取主机在线状态/周期/样本年龄；返回输出字节数，-EINVAL 属性非法，
- * -ENODATA 尚无完整特征时不能提供样本年龄。 */
+static const char *const ssf_mems_poll_modes[] = {
+    [SSF_MEMS_POLL_FIXED] = "fixed",
+    [SSF_MEMS_POLL_ADAPTIVE] = "adaptive",
+};
+
+/* 读取主机特征轮询模式或周期配置。
+ * 返回：输出字节数，负数为属性或设备状态错误。
+ */
+static ssize_t ssf_mems_iio_poll_show(struct device *dev,
+                                      struct device_attribute *attr,
+                                      char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_acquisition_config config;
+  unsigned int value;
+  int ret;
+
+  ret = ssf_mems_acquisition_get_config(state->data, &config);
+  if (ret != 0)
+    return ret;
+  switch (to_iio_dev_attr(attr)->address) {
+  case SSF_MEMS_POLL_SETTING_MODE:
+    if ((unsigned int)config.poll.mode >= ARRAY_SIZE(ssf_mems_poll_modes))
+      return -EINVAL;
+    return sysfs_emit(buf, "%s\n", ssf_mems_poll_modes[config.poll.mode]);
+  case SSF_MEMS_POLL_SETTING_FIXED_INTERVAL:
+    value = config.poll.fixed_interval_ms;
+    break;
+  case SSF_MEMS_POLL_SETTING_MIN_INTERVAL:
+    value = config.poll.min_interval_ms;
+    break;
+  case SSF_MEMS_POLL_SETTING_MAX_INTERVAL:
+    value = config.poll.max_interval_ms;
+    break;
+  default:
+    return -EINVAL;
+  }
+  return sysfs_emit(buf, "%u\n", value);
+}
+
+/* 修改主机特征轮询模式或周期配置。
+ * 返回：成功返回 len，失败返回负数错误码。
+ */
+static ssize_t ssf_mems_iio_poll_store(struct device *dev,
+                                       struct device_attribute *attr,
+                                       const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned long setting = to_iio_dev_attr(attr)->address;
+  unsigned int value;
+  int ret;
+
+  if (setting == SSF_MEMS_POLL_SETTING_MODE) {
+    for (value = 0; value < ARRAY_SIZE(ssf_mems_poll_modes); value++) {
+      if (sysfs_streq(buf, ssf_mems_poll_modes[value]) == true)
+        break;
+    }
+    if (value == ARRAY_SIZE(ssf_mems_poll_modes))
+      return -EINVAL;
+  } else {
+    if (setting != SSF_MEMS_POLL_SETTING_FIXED_INTERVAL &&
+        setting != SSF_MEMS_POLL_SETTING_MIN_INTERVAL &&
+        setting != SSF_MEMS_POLL_SETTING_MAX_INTERVAL)
+      return -EINVAL;
+    ret = kstrtouint(buf, 10, &value);
+    if (ret != 0)
+      return ret;
+  }
+  ret = ssf_mems_acquisition_set_poll_setting(state->data, setting, value);
+  return ret == 0 ? (ssize_t)len : ret;
+}
+
+static IIO_DEVICE_ATTR(sensor_poll_mode, 0644,
+                       ssf_mems_iio_poll_show, ssf_mems_iio_poll_store,
+                       SSF_MEMS_POLL_SETTING_MODE);
+static IIO_CONST_ATTR(sensor_poll_mode_available, "fixed adaptive");
+static IIO_DEVICE_ATTR(sensor_poll_fixed_interval_ms, 0644,
+                       ssf_mems_iio_poll_show, ssf_mems_iio_poll_store,
+                       SSF_MEMS_POLL_SETTING_FIXED_INTERVAL);
+static IIO_DEVICE_ATTR(sensor_poll_min_interval_ms, 0644,
+                       ssf_mems_iio_poll_show, ssf_mems_iio_poll_store,
+                       SSF_MEMS_POLL_SETTING_MIN_INTERVAL);
+static IIO_DEVICE_ATTR(sensor_poll_max_interval_ms, 0644,
+                       ssf_mems_iio_poll_show, ssf_mems_iio_poll_store,
+                       SSF_MEMS_POLL_SETTING_MAX_INTERVAL);
+
+enum ssf_mems_iio_acquisition_status {
+  SSF_MEMS_IIO_STATUS_ONLINE,
+  SSF_MEMS_IIO_STATUS_POLL_INTERVAL,
+  SSF_MEMS_IIO_STATUS_SAMPLE_AGE,
+};
+
+/* 读取在线状态、轮询周期或样本年龄。
+ * 返回：输出字节数，-EINVAL 属性无效，-ENODATA 无样本年龄。
+ */
 static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
                                           struct device_attribute *attr,
                                           char *buf) {
@@ -590,11 +735,11 @@ static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
 
   ssf_mems_acquisition_get_status(state->data, &status);
   switch (iio_attr->address) {
-  case 0:
+  case SSF_MEMS_IIO_STATUS_ONLINE:
     return sysfs_emit(buf, "%u\n", status.online);
-  case 1:
+  case SSF_MEMS_IIO_STATUS_POLL_INTERVAL:
     return sysfs_emit(buf, "%u\n", status.interval_ms);
-  case 2:
+  case SSF_MEMS_IIO_STATUS_SAMPLE_AGE:
     if (status.have_sample == false)
       return -ENODATA;
     return sysfs_emit(buf, "%u\n", status.sample_age_ms);
@@ -603,18 +748,38 @@ static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
   }
 }
 
-static IIO_DEVICE_ATTR(sensor_online, 0444, ssf_mems_iio_acquisition_show, NULL, 0);
+static IIO_DEVICE_ATTR(sensor_online, 0444, ssf_mems_iio_acquisition_show, NULL,
+                       SSF_MEMS_IIO_STATUS_ONLINE);
 static IIO_DEVICE_ATTR(sensor_poll_interval_ms, 0444,
-                       ssf_mems_iio_acquisition_show, NULL, 1);
+                       ssf_mems_iio_acquisition_show, NULL, SSF_MEMS_IIO_STATUS_POLL_INTERVAL);
 static IIO_DEVICE_ATTR(sensor_sample_age_ms, 0444,
-                       ssf_mems_iio_acquisition_show, NULL, 2);
-static IIO_CONST_ATTR(
-    sensor_baudrate_available,
-    "2400 4800 9600 19200 38400 57600 115200 128000 230400 256000 "
-    "460800 500000 512000 600000 750000 921600 1000000");
+                       ssf_mems_iio_acquisition_show, NULL, SSF_MEMS_IIO_STATUS_SAMPLE_AGE);
+/* 从型号表生成可选通信速率，跳过默认别名和重复值。
+ * 返回：输出字节数。
+ */
+static ssize_t ssf_mems_iio_bauds_available(struct device *dev,
+                                            struct device_attribute *attr,
+                                            char *buf) {
+  size_t i, j;
+  int len = 0;
 
-/* 同步启动 bin 升级；返回 len 成功，-EINVAL 文件名非法，
- * 其余负值及含义见 acquisition_update_firmware()，进度由另一个属性读取。 */
+  for (i = 1; i < ssf_mems_sensor_profile.baudrate_count; i++) {
+    for (j = 1; j < i; j++)
+      if (ssf_mems_sensor_profile.baudrates[j] == ssf_mems_sensor_profile.baudrates[i])
+        break;
+    if (j != i)
+      continue;
+    len += sysfs_emit_at(buf, len, "%s%u", len ? " " : "",
+                         ssf_mems_sensor_profile.baudrates[i]);
+  }
+  return len + sysfs_emit_at(buf, len, "\n");
+}
+static IIO_DEVICE_ATTR(sensor_baudrate_available, 0444,
+                       ssf_mems_iio_bauds_available, NULL, 0);
+
+/* 根据用户给出的文件名执行固件升级。
+ * 返回：成功返回 len，失败返回负数错误码。
+ */
 static ssize_t ssf_mems_iio_firmware_store(struct device *dev,
                                           struct device_attribute *attr,
                                           const char *buf, size_t len) {
@@ -629,7 +794,9 @@ static ssize_t ssf_mems_iio_firmware_store(struct device *dev,
   return ret != 0 ? ret : (ssize_t)len;
 }
 
-/* 返回升级状态文本的字节数；只获取 OTA 短锁，升级期间也可读取。 */
+/* 输出当前固件升级进度。
+ * 返回：输出文本的字节数。
+ */
 static ssize_t ssf_mems_iio_firmware_show(struct device *dev,
                                          struct device_attribute *attr,
                                          char *buf) {
@@ -655,18 +822,23 @@ static struct attribute *ssf_mems_iio_attributes[] = {
     &iio_const_attr_sensor_acquisition_mode_available.dev_attr.attr,
     &iio_dev_attr_sensor_raw_duration_ms.dev_attr.attr,
     &iio_dev_attr_sensor_feature_duration_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_poll_mode.dev_attr.attr,
+    &iio_const_attr_sensor_poll_mode_available.dev_attr.attr,
+    &iio_dev_attr_sensor_poll_fixed_interval_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_poll_min_interval_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_poll_max_interval_ms.dev_attr.attr,
     &iio_dev_attr_sensor_baudrate.dev_attr.attr,
     &iio_dev_attr_sensor_online.dev_attr.attr,
     &iio_dev_attr_sensor_poll_interval_ms.dev_attr.attr,
     &iio_dev_attr_sensor_sample_age_ms.dev_attr.attr,
-    &iio_const_attr_sensor_baudrate_available.dev_attr.attr,
+    &iio_dev_attr_sensor_baudrate_available.dev_attr.attr,
     &iio_dev_attr_sensor_sampling_rate_index.dev_attr.attr,
     &iio_dev_attr_sensor_sampling_frequency.dev_attr.attr,
     &iio_dev_attr_sensor_sampling_length_index.dev_attr.attr,
     &iio_dev_attr_sensor_parameter_switch.dev_attr.attr,
     &iio_dev_attr_sensor_feature_enable.dev_attr.attr,
     &iio_dev_attr_sensor_firmware_version.dev_attr.attr,
-    &iio_const_attr_sensor_sampling_rate_index_available.dev_attr.attr,
+    &iio_dev_attr_sensor_sampling_rate_index_available.dev_attr.attr,
     NULL,
 };
 
@@ -688,8 +860,9 @@ static const struct iio_buffer_setup_ops ssf_mems_iio_buffer_ops = {};
 #define SSF_MEMS_IIO_MAX_SCAN_BYTES                                         \
   (ALIGN(SSF_MEMS_IIO_FEATURE_MAX * sizeof(u16), sizeof(s64)) + sizeof(s64))
 
-/* 按启用通道打包；返回 0 成功/未启用 buffer，-EINVAL 无扫描掩码，
- * -EOVERFLOW 布局超出暂存空间；其他负值为 IIO 推送错误，kfifo 满为 -EBUSY。 */
+/* 把启用的特征通道打包推入 IIO 缓冲区。
+ * 返回：0 成功或未启用缓冲区，负数为布局或推送错误。
+ */
 static int ssf_mems_iio_push_buffer(
     struct iio_dev *indio_dev, const struct ssf_mems_sensor_data *features,
     s64 timestamp_ns) {
@@ -721,12 +894,10 @@ static int ssf_mems_iio_push_buffer(
   return iio_push_to_buffers_with_timestamp(indio_dev, scan, timestamp_ns);
 }
 
-/* 发布一份完整特征快照：先替换 read_raw() 使用的缓存，再在
- * buffer 已启用时推送同一份数据。timestamp_ns 为 0 时使用 IIO 当前时间。
- * 调用者必须在注销 IIO 设备前停止数据生产者。
- * 返回 0 推送成功或 buffer 未启用，-EINVAL 空参数/扫描掩码无效，
- * -ENODEV 未注册特征 IIO，-EOVERFLOW 扫描布局超出容量；其他为 IIO 推送错误。
- * 当前 kfifo 满时返回 -EBUSY；其他 buffer 实现的负 errno 原样返回。 */
+/* 把一份特征推入 IIO 缓冲区。
+ * 返回：0 成功或未启用缓冲区，负数为参数、设备或推送错误。
+ * 协议层维护缓存；这里只持 mlock 打包和推送。
+ */
 int ssf_mems_iio_publish_features(
     struct ssf_mems_xyzs_data *data,
     const struct ssf_mems_sensor_data *features, s64 timestamp_ns) {
@@ -735,9 +906,6 @@ int ssf_mems_iio_publish_features(
   if (data == NULL || features == NULL)
     return -EINVAL;
 
-  ret = ssf_mems_protocol_store_features(data, features);
-  if (ret != 0)
-    return ret;
   if (data->indio_dev == NULL)
     return -ENODEV;
 
@@ -750,8 +918,9 @@ int ssf_mems_iio_publish_features(
   return ret;
 }
 
-/* 注册特征 IIO；返回 0 成功，-EINVAL 空设备，-EBUSY 已注册，-ENOMEM 分配失败；
- * 其他负 errno 来自 iio_device_register，由统一入口负责后续失败的回滚。 */
+/* 注册特征 IIO 设备和缓冲区。
+ * 返回：0 成功，负数为参数、分配或注册错误。
+ */
 static int ssf_mems_iio_register_features(struct ssf_mems_xyzs_data *data) {
   struct iio_buffer *buffer;
   struct ssf_mems_iio_state *state;
@@ -830,8 +999,9 @@ static const struct iio_chan_spec ssf_mems_raw_channels[] = {
     IIO_CHAN_SOFT_TIMESTAMP(5),
 };
 
-/* 原始 ADC 单位为 16/32768 g；返回 IIO_VAL_INT_PLUS_NANO 表示 m/s² 比例，
- * -EINVAL 非加速度通道或请求的不是 scale。 */
+/* 读取原始加速度的单位换算比例。
+ * 返回：IIO_VAL_INT_PLUS_NANO，-EINVAL 通道或属性无效。
+ */
 static int ssf_mems_raw_read_scale(struct iio_dev *indio_dev,
                                    const struct iio_chan_spec *chan,
                                    int *val, int *val2, long mask) {
@@ -842,8 +1012,29 @@ static int ssf_mems_raw_read_scale(struct iio_dev *indio_dev,
   return IIO_VAL_INT_PLUS_NANO;
 }
 
-/* 读取原始统计；返回输出字节数，-EINVAL 属性非法，-ENODATA 尚无有效采样率。
- * 不发送串口命令；各计数用 READ_ONCE 读取，不保证它们属于同一个瞬间。 */
+enum ssf_mems_iio_raw_status {
+  SSF_MEMS_IIO_RAW_ACTIVE,
+  SSF_MEMS_IIO_RAW_PACKETS,
+  SSF_MEMS_IIO_RAW_SEQUENCE_GAPS,
+  SSF_MEMS_IIO_RAW_CRC_ERRORS,
+  SSF_MEMS_IIO_RAW_BUFFER_DROPS,
+  SSF_MEMS_IIO_RAW_FREQUENCY,
+  SSF_MEMS_IIO_RAW_DRAIN_PACKETS,
+  SSF_MEMS_IIO_RAW_DRAIN_SEQUENCE_GAPS,
+  SSF_MEMS_IIO_RAW_DRAIN_CRC_ERRORS,
+  SSF_MEMS_IIO_RAW_START_WAIT,
+  SSF_MEMS_IIO_RAW_LINK_MODE,
+  SSF_MEMS_IIO_RAW_PUBLISHING,
+  SSF_MEMS_IIO_RAW_BATCHES,
+  SSF_MEMS_IIO_RAW_BATCH_PACKETS,
+  SSF_MEMS_IIO_RAW_BATCH_SAMPLES,
+  SSF_MEMS_IIO_RAW_IGNORED_BYTES,
+};
+
+/* 读取定长原始采集的统计数据。
+ * 返回：输出字节数，-EINVAL 属性无效，-ENODATA 无有效采样率。
+ * 各统计独立读取，不保证来自同一时刻。
+ */
 static ssize_t ssf_mems_raw_status_show(struct device *dev,
                                        struct device_attribute *attr,
                                        char *buf) {
@@ -852,52 +1043,67 @@ static ssize_t ssf_mems_raw_status_show(struct device *dev,
   unsigned int value;
 
   switch (to_iio_dev_attr(attr)->address) {
-  case 0: value = READ_ONCE(raw->active); break;
-  case 1: value = READ_ONCE(raw->packets); break;
-  case 2: value = READ_ONCE(raw->discontinuities); break;
-  case 3: value = READ_ONCE(raw->crc_errors); break;
-  case 4: value = READ_ONCE(raw->buffer_errors); break;
-  case 5:
+  case SSF_MEMS_IIO_RAW_ACTIVE: value = READ_ONCE(raw->active); break;
+  case SSF_MEMS_IIO_RAW_PACKETS: value = READ_ONCE(raw->packets); break;
+  case SSF_MEMS_IIO_RAW_SEQUENCE_GAPS: value = READ_ONCE(raw->discontinuities); break;
+  case SSF_MEMS_IIO_RAW_CRC_ERRORS: value = READ_ONCE(raw->crc_errors); break;
+  case SSF_MEMS_IIO_RAW_BUFFER_DROPS: value = READ_ONCE(raw->buffer_errors); break;
+  case SSF_MEMS_IIO_RAW_FREQUENCY:
     if (READ_ONCE(raw->packets) == 0 && READ_ONCE(raw->active) == false)
       return -ENODATA;
     value = READ_ONCE(raw->sampling_rate_index);
-    if (value >= ARRAY_SIZE(ssf_mems_sampling_frequencies))
+    if (value >= ssf_mems_sensor_profile.sampling_frequency_count)
       return -ENODATA;
-    return sysfs_emit(buf, "%s\n", ssf_mems_sampling_frequencies[value]);
-  case 6: value = READ_ONCE(raw->drain_packets); break;
-  case 7: value = READ_ONCE(raw->drain_discontinuities); break;
-  case 8: value = READ_ONCE(raw->drain_crc_errors); break;
-  case 9: value = READ_ONCE(raw->start_wait_ms); break;
-  case 11: value = READ_ONCE(state->data->protocol.mode); break;
-  case 12: value = READ_ONCE(raw->publishing); break;
-  case 13: value = READ_ONCE(raw->batches); break;
-  case 14: value = READ_ONCE(raw->batch_packets); break;
-  case 15: value = SSF_MEMS_RAW_BATCH_SAMPLES; break;
-  case 16: value = READ_ONCE(raw->ignored_bytes); break;
+    return sysfs_emit(buf, "%s\n", ssf_mems_sensor_profile.sampling_frequencies[value]);
+  case SSF_MEMS_IIO_RAW_DRAIN_PACKETS: value = READ_ONCE(raw->drain_packets); break;
+  case SSF_MEMS_IIO_RAW_DRAIN_SEQUENCE_GAPS: value = READ_ONCE(raw->drain_discontinuities); break;
+  case SSF_MEMS_IIO_RAW_DRAIN_CRC_ERRORS: value = READ_ONCE(raw->drain_crc_errors); break;
+  case SSF_MEMS_IIO_RAW_START_WAIT: value = READ_ONCE(raw->start_wait_ms); break;
+  case SSF_MEMS_IIO_RAW_LINK_MODE: value = READ_ONCE(state->data->protocol.mode); break;
+  case SSF_MEMS_IIO_RAW_PUBLISHING: value = READ_ONCE(raw->publishing); break;
+  case SSF_MEMS_IIO_RAW_BATCHES: value = READ_ONCE(raw->batches); break;
+  case SSF_MEMS_IIO_RAW_BATCH_PACKETS: value = READ_ONCE(raw->batch_packets); break;
+  case SSF_MEMS_IIO_RAW_BATCH_SAMPLES: value = SSF_MEMS_RAW_BATCH_SAMPLES; break;
+  case SSF_MEMS_IIO_RAW_IGNORED_BYTES: value = READ_ONCE(raw->ignored_bytes); break;
   default: return -EINVAL;
   }
   return sysfs_emit(buf, "%u\n", value);
 }
 
-static IIO_DEVICE_ATTR(raw_active, 0444, ssf_mems_raw_status_show, NULL, 0);
-static IIO_DEVICE_ATTR(raw_packets, 0444, ssf_mems_raw_status_show, NULL, 1);
-static IIO_DEVICE_ATTR(raw_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL, 2);
-static IIO_DEVICE_ATTR(raw_crc_errors, 0444, ssf_mems_raw_status_show, NULL, 3);
-static IIO_DEVICE_ATTR(raw_buffer_drops, 0444, ssf_mems_raw_status_show, NULL, 4);
+static IIO_DEVICE_ATTR(raw_active, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_ACTIVE);
+static IIO_DEVICE_ATTR(raw_packets, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_PACKETS);
+static IIO_DEVICE_ATTR(raw_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_SEQUENCE_GAPS);
+static IIO_DEVICE_ATTR(raw_crc_errors, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_CRC_ERRORS);
+static IIO_DEVICE_ATTR(raw_buffer_drops, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_BUFFER_DROPS);
 static IIO_DEVICE_ATTR(raw_sampling_frequency, 0444,
-                       ssf_mems_raw_status_show, NULL, 5);
+                       ssf_mems_raw_status_show, NULL, SSF_MEMS_IIO_RAW_FREQUENCY);
 /* 有效采集和排空分开观测；这些属性只读，不触发串口请求。 */
-static IIO_DEVICE_ATTR(raw_drain_packets, 0444, ssf_mems_raw_status_show, NULL, 6);
-static IIO_DEVICE_ATTR(raw_drain_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL, 7);
-static IIO_DEVICE_ATTR(raw_drain_crc_errors, 0444, ssf_mems_raw_status_show, NULL, 8);
-static IIO_DEVICE_ATTR(raw_start_wait_ms, 0444, ssf_mems_raw_status_show, NULL, 9);
-static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL, 11);
-static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL, 12);
+static IIO_DEVICE_ATTR(raw_drain_packets, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_DRAIN_PACKETS);
+static IIO_DEVICE_ATTR(raw_drain_sequence_gaps, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_DRAIN_SEQUENCE_GAPS);
+static IIO_DEVICE_ATTR(raw_drain_crc_errors, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_DRAIN_CRC_ERRORS);
+static IIO_DEVICE_ATTR(raw_start_wait_ms, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_START_WAIT);
+static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_LINK_MODE);
+static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_PUBLISHING);
 /* 定长批次状态只读；包号在每批 1024 组 XYZ 后从零重新开始。 */
-static IIO_DEVICE_ATTR(raw_batches, 0444, ssf_mems_raw_status_show, NULL, 13);
-static IIO_DEVICE_ATTR(raw_batch_packets, 0444, ssf_mems_raw_status_show, NULL, 14);
-static IIO_DEVICE_ATTR(raw_batch_samples, 0444, ssf_mems_raw_status_show, NULL, 15);
-static IIO_DEVICE_ATTR(raw_ignored_bytes, 0444, ssf_mems_raw_status_show, NULL, 16);
+static IIO_DEVICE_ATTR(raw_batches, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_BATCHES);
+static IIO_DEVICE_ATTR(raw_batch_packets, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_BATCH_PACKETS);
+static IIO_DEVICE_ATTR(raw_batch_samples, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_BATCH_SAMPLES);
+static IIO_DEVICE_ATTR(raw_ignored_bytes, 0444, ssf_mems_raw_status_show, NULL,
+                       SSF_MEMS_IIO_RAW_IGNORED_BYTES);
 
 static struct attribute *ssf_mems_raw_attributes[] = {
     &iio_dev_attr_raw_active.dev_attr.attr,
@@ -928,12 +1134,14 @@ static const struct iio_info ssf_mems_raw_info = {
     .read_raw = ssf_mems_raw_read_scale,
 };
 
-/* 按 active_scan_mask 打包原始字段；与 buffer 重配置共享 mlock。
- * 返回 0 成功/未启用 buffer，-EINVAL 空参数/扫描布局非法，-ENODEV 未注册原始 IIO；
- * 其他为 IIO 推送错误（当前 kfifo 满返回 -EBUSY）。 */
+/* 把一组 XYZ 原始样本推入 IIO 缓冲区。
+ * 返回：0 成功或未启用缓冲区，负数为参数、设备或推送错误。
+ * 注销 IIO 前须停止生产者；持 mlock 打包和推送。
+ */
 int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
                             const struct ssf_mems_raw_sample *sample) {
-  u8 scan[24] __aligned(sizeof(s64)) = {0};
+  u8 scan[ALIGN(sizeof(*sample), sizeof(s64)) + sizeof(s64)]
+      __aligned(sizeof(s64)) = {0};
   struct iio_dev *indio_dev;
   unsigned int bit;
   size_t offset = 0;
@@ -966,8 +1174,9 @@ out:
   return ret;
 }
 
-/* 注册原始 IIO；返回 0 成功，-ENOMEM 分配对象/buffer 失败；
- * 其他负 errno 来自 iio_device_register，保持特征扫描 ABI 不变。 */
+/* 注册原始数据 IIO 设备和缓冲区。
+ * 返回：0 成功，负数为分配或注册错误。
+ */
 static int ssf_mems_iio_register_raw(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_iio_state *state;
   struct iio_dev *indio_dev;
@@ -998,9 +1207,10 @@ static int ssf_mems_iio_register_raw(struct ssf_mems_xyzs_data *data) {
   return 0;
 }
 
-/* 两个 IIO 设备必须全部注册成功；失败时撤销已注册设备。
- * 返回 0 全部成功，-EINVAL 空设备，-EBUSY 已注册，
- * -ENOMEM 对象/buffer 分配失败；其他负 errno 来自 IIO 注册（如 -EINVAL 配置非法）。 */
+/* 注册特征和原始数据两个 IIO 设备。
+ * 返回：0 全部成功，负数为初始化错误。
+ * 任一设备注册失败时撤销已注册设备。
+ */
 int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
   int ret = ssf_mems_iio_register_features(data);
 
@@ -1012,7 +1222,10 @@ int ssf_mems_iio_register(struct ssf_mems_xyzs_data *data) {
   return ret;
 }
 
-/* 注销 IIO 并释放 buffer；无返回值，空设备/未注册时直接返回，对象由 devm 回收。 */
+/* 注销两个 IIO 设备并释放缓冲区。
+ * 返回：无。
+ * 调用前须停止所有数据生产者。
+ */
 void ssf_mems_iio_unregister(struct ssf_mems_xyzs_data *data) {
   if (data == NULL)
     return;

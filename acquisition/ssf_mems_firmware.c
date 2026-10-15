@@ -7,11 +7,10 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 文件加载在采集锁之外进行；真正传输期间不允许采集或 IIO 配置抢占总线。
- * 返回 0 升级确认完成；-EINVAL 文件名非法，-ENOENT 文件不存在，-ENOMEM 加载内存不足，
- * -EFBIG 镜像过大，-ENOEXEC 向量表不匹配，-EBUSY 升级占用/链路模式不允许，
- * -ENODATA 未上线，-ENODEV 停止中，-EINTR 被信号中断；其余含义见 ota_transfer()。
- * 其他负 errno 原样来自 firmware 加载器（如 -EACCES 文件访问受限、-EIO 读取失败）。 */
+/* 加载 bin 文件并升级传感器固件。
+ * 返回：0 升级已确认，负数为文件、设备状态或传输错误。
+ * 升级期间独占采集流程，末包结果不明时暂停自动重连。
+ */
 int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
                                          const char *name) {
   const struct firmware *firmware = NULL;
@@ -57,8 +56,10 @@ int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
     ret = -ENODATA;
     goto unlock_failed;
   }
+  mutex_lock(&acq->status_lock);
   acq->online = false;
   acq->have_sample = false;
+  mutex_unlock(&acq->status_lock);
   ssf_mems_protocol_invalidate_features(data);
   ret = ssf_mems_ota_transfer(data, firmware->data, firmware->size);
   ssf_mems_ota_get_status(data, &status);

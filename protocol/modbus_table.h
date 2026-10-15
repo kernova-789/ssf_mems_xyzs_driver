@@ -7,8 +7,72 @@
 #include "modbus_types.h"
 #include "sensor_data.h"
 
+/* 只有 modbus_table.c 定义表；其他文件共享同一份只读数据。 */
+extern const struct ssf_modbus_frame_desc ssf_frame_table[];
+extern const struct ssf_reg_desc ssf_reg_table[];
+extern const struct ssf_block_cmd_desc ssf_block_cmd_table[];
+extern const size_t ssf_frame_table_size;
+extern const size_t ssf_reg_table_size;
+extern const size_t ssf_block_cmd_table_size;
+extern const struct ssf_mems_sensor_profile ssf_mems_sensor_profile;
+
+#define SSF_FRAME_TABLE_SIZE ssf_frame_table_size
+#define SSF_REG_TABLE_SIZE ssf_reg_table_size
+#define SSF_BLOCK_CMD_TABLE_SIZE ssf_block_cmd_table_size
+#define SSF_MEMS_SAMPLING_RATE_MAX_INDEX \
+  (ssf_mems_sensor_profile.sampling_frequency_count - 1U)
+#define SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX \
+  (ssf_mems_sensor_profile.raw_max_sampling_rate_index)
+
+/* 按功能码查找请求帧描述。
+ * 返回：描述指针，未找到时为 NULL。
+ */
+const struct ssf_modbus_frame_desc *ssf_mems_modbus_find_frame(u8 function);
+/* 按功能码查找响应帧描述。
+ * 返回：描述指针，未找到时为 NULL。
+ */
+const struct ssf_modbus_frame_desc *ssf_mems_modbus_find_rx_frame(u8 function);
+/* 按手册地址查找寄存器。
+ * 返回：表项指针，未找到时为 NULL。
+ */
+const struct ssf_reg_desc *ssf_mems_modbus_find_reg(u16 display_reg);
+/* 按稳定名称查找寄存器。
+ * 返回：表项指针，名称无效或未找到时为 NULL。
+ */
+const struct ssf_reg_desc *ssf_mems_modbus_find_reg_by_name(const char *name);
+/* 按命令编号查找寄存器块。
+ * 返回：块描述指针，未找到时为 NULL。
+ */
+const struct ssf_block_cmd_desc *
+ssf_mems_modbus_find_block_cmd(enum ssf_block_cmd_id id);
+/* 查找地址范围内的下一个可读特征。
+ * 返回：表项指针，没有剩余特征时为 NULL。
+ */
+const struct ssf_reg_desc *ssf_mems_modbus_next_feature(u32 cursor, u32 end);
+
+#ifdef SSF_MEMS_DEFINE_MODBUS_TABLE
+/* 型号相关的编码、默认配置和位布局集中在这里，不在 IIO 中另建副本。 */
+static const char *const ssf_sampling_frequencies[] = {
+    "533.34", "888.9", "1066.68", "1333.35", "2666.7",
+    "2963", "5333.4", "8889", "13333.5", "26667",
+};
+static const unsigned int ssf_baudrates[] = {
+    9600, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 128000,
+    230400, 256000, 460800, 500000, 512000, 600000, 750000, 921600, 1000000,
+};
+const struct ssf_mems_sensor_profile ssf_mems_sensor_profile = {
+    .sampling_frequencies = ssf_sampling_frequencies,
+    .sampling_frequency_count = ARRAY_SIZE(ssf_sampling_frequencies),
+    .baudrates = ssf_baudrates,
+    .baudrate_count = ARRAY_SIZE(ssf_baudrates),
+    .default_sampling_rate_index = 6, /* 5333.4 Hz。 */
+    .raw_max_sampling_rate_index = 8, /* 索引 9 合法，定长上传尚未验证。 */
+    .feature_enable_mask = 0xfc00,
+    .feature_enable_shift = 10,
+};
+
 /* 帧格式表：描述 0x03/0x06/0x10 和异常响应的长度、字段位置及解析方式。 */
-static const struct ssf_modbus_frame_desc ssf_frame_table[] = {
+const struct ssf_modbus_frame_desc ssf_frame_table[] = {
     {
         .function = SSF_MEMS_MODBUS_FUNC_READ,
         .tx_format = SSF_TX_READ_REGS,
@@ -57,7 +121,7 @@ static const struct ssf_modbus_frame_desc ssf_frame_table[] = {
  * 寄存器表：把手册显示地址映射到线上地址，并记录权限、类型和解码位置。
  * 表项删除后不重编其他地址，稀疏特征由块读取逻辑自动跳过。
  */
-static const struct ssf_reg_desc ssf_reg_table[] = {
+const struct ssf_reg_desc ssf_reg_table[] = {
     /* 40001～40029：只读特征值。 */
     {
         .display_reg = 40001,
@@ -609,7 +673,7 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
 };
 
 /* 块命令表：把“读全部特征”、“写工作参数”这类高层操作组织成固定地址范围。 */
-static const struct ssf_block_cmd_desc ssf_block_cmd_table[] = {
+const struct ssf_block_cmd_desc ssf_block_cmd_table[] = {
     {
         .id = SSF_BLOCK_READ_ALL_FEATURES,
         .function = SSF_MEMS_MODBUS_FUNC_READ,
@@ -633,77 +697,7 @@ static const struct ssf_block_cmd_desc ssf_block_cmd_table[] = {
     },
 };
 
-/* 三个宏分别给出帧表、寄存器表和块命令表的表项数。 */
-#define SSF_FRAME_TABLE_SIZE ARRAY_SIZE(ssf_frame_table)
-#define SSF_REG_TABLE_SIZE ARRAY_SIZE(ssf_reg_table)
-#define SSF_BLOCK_CMD_TABLE_SIZE ARRAY_SIZE(ssf_block_cmd_table)
-
-/* 按功能码查普通请求帧；跳过只用于接收的异常描述，未找到返回 NULL。 */
-static inline const struct ssf_modbus_frame_desc *
-ssf_mems_modbus_find_frame(u8 function) {
-  size_t i;
-
-  for (i = 0; i < SSF_FRAME_TABLE_SIZE; i++) {
-    if (ssf_frame_table[i].tx_format != SSF_TX_NONE &&
-        ssf_frame_table[i].function == function)
-      return &ssf_frame_table[i];
-  }
-  return NULL;
-}
-
-/* 按响应功能码查帧；返回普通/异常描述指针，功能码未支持时返回 NULL。
- * 如 0x83 先确认对应的 0x03 已支持，再返回通用异常描述。 */
-static inline const struct ssf_modbus_frame_desc *
-ssf_mems_modbus_find_rx_frame(u8 function) {
-  const struct ssf_modbus_frame_desc *normal;
-  size_t i;
-
-  normal = ssf_mems_modbus_find_frame(function & ~SSF_MEMS_MODBUS_EXCEPTION_FLAG);
-  if (normal == NULL || (function & SSF_MEMS_MODBUS_EXCEPTION_FLAG) == 0)
-    return normal;
-
-  for (i = 0; i < SSF_FRAME_TABLE_SIZE; i++) {
-    if (ssf_frame_table[i].rx_format == SSF_RX_EXCEPTION)
-      return &ssf_frame_table[i];
-  }
-  return NULL;
-}
-
-/* 按手册显示地址（如 40001）查寄存器表；未入表返回 NULL。 */
-static inline const struct ssf_reg_desc *
-ssf_mems_modbus_find_reg(u16 display_reg) {
-  size_t i;
-
-  for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
-    if (ssf_reg_table[i].display_reg == display_reg)
-      return &ssf_reg_table[i];
-  }
-  return NULL;
-}
-
-/* 名称是稳定的内部标识，区分大小写；仅在当前表查找，未找到返回 NULL。 */
-static inline const struct ssf_reg_desc *
-ssf_mems_modbus_find_reg_by_name(const char *name) {
-  size_t i;
-
-  if (name == NULL || name[0] == '\0')
-    return NULL;
-  for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
-    if (ssf_reg_table[i].name != NULL &&
-        strcmp(ssf_reg_table[i].name, name) == 0)
-      return &ssf_reg_table[i];
-  }
-  return NULL;
-}
-
-/* 按逻辑命令 ID 查块命令表；未入表返回 NULL。 */
-static inline const struct ssf_block_cmd_desc *
-ssf_mems_modbus_find_block_cmd(enum ssf_block_cmd_id id) {
-  size_t i;
-
-  for (i = 0; i < SSF_BLOCK_CMD_TABLE_SIZE; i++) {
-    if (ssf_block_cmd_table[i].id == id)
-      return &ssf_block_cmd_table[i];
-  }
-  return NULL;
-}
+const size_t ssf_frame_table_size = ARRAY_SIZE(ssf_frame_table);
+const size_t ssf_reg_table_size = ARRAY_SIZE(ssf_reg_table);
+const size_t ssf_block_cmd_table_size = ARRAY_SIZE(ssf_block_cmd_table);
+#endif /* SSF_MEMS_DEFINE_MODBUS_TABLE */

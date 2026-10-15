@@ -50,36 +50,53 @@ struct ssf_mems_ota_state {
   u32 next_packet;             /* 当前应答报告的下一包号。 */
 };
 
-/* 初始化 OTA 状态；无返回值，data 必须有效，不发送串口命令。 */
+/* 初始化固件升级状态。
+ * 返回：无。
+ */
 void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data);
-/* 禁止新升级并唤醒等待者；无返回值，不发送重启命令。 */
+/* 禁止新升级并唤醒升级等待者。
+ * 返回：无。
+ */
 void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data);
-/* 检查应用区大小、栈指针和 Thumb 复位入口；不证明机型或签名匹配。
- * 返回 0 基础校验通过，-EINVAL 空数据/不足 8 字节，-EFBIG 超过 256 KiB，
- * -ENOEXEC 栈指针/复位入口不满足应用区要求。 */
+/* 检查固件大小和启动向量是否有效。
+ * 返回：0 通过，-EINVAL 数据无效，-EFBIG 过大，-ENOEXEC 启动向量不符。
+ */
 int ssf_mems_ota_validate_image(const u8 *image, size_t size);
-/* 解析简单 .bin 文件名；返回 0 成功，-EINVAL 空参数、路径、非法字符/长度/后缀。
- * name 必须提供 SSF_MEMS_OTA_NAME_SIZE 字节空间。 */
+/* 检查并复制 bin 文件名。
+ * 返回：0 成功，-EINVAL 文件名或参数无效。
+ * name 缓冲区须有 SSF_MEMS_OTA_NAME_SIZE 字节。
+ */
 int ssf_mems_ota_parse_name(const char *buf, size_t len, char *name);
-/* 组包时尾块填充 0xff；最后一个有数据的包使用 0xffffffff 包号。
- * 返回 0 成功，-EINVAL 地址非法、载荷超长或缓冲区指针为空。
- * frame 必须提供 SSF_MEMS_OTA_FRAME_SIZE 字节空间。 */
+/* 组装一个固件升级数据包。
+ * 返回：0 成功，-EINVAL 参数无效。
+ * frame 须有 SSF_MEMS_OTA_FRAME_SIZE 字节，不足一块填 0xff。
+ */
 int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
                               size_t size, u8 *frame);
-/* 接收工作项处理一个 OTA 字节；无返回值，收齐应答后唤醒发送者。 */
+/* 用一个字节拼接固件升级应答。
+ * 返回：无。
+ * 收齐应答后唤醒发送者。
+ */
 void ssf_mems_ota_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);
-/* 调用者持 update_lock 和采集锁，函数独占 bus_lock；失败不自动重启。
- * 返回 0 分包应答及重启后通信已确认，不代表整镜像读回验证；
- * -EINVAL 参数非法，-EFBIG 镜像过大，-ENOEXEC 向量表不符，-EBUSY 模式/速率不允许，
- * -ENODEV 停止中，-EPROTO 包计数不符，-EIO 串口短写，-ETIMEDOUT 应答/启动验证超时，
- * -EINTR 被信号打断；其他为版本读取请求错误（见 modbus_request.h）或串口负 errno。 */
+/* 传输固件并确认传感器重启后的通信。
+ * 返回：0 升级应答及通信已确认，负数为镜像、状态或传输错误。
+ * 调用者持 update_lock 和采集锁；末包不重发，结果不明时标记 uncertain。
+ */
 int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
                           const u8 *image, size_t size);
-/* 更新阶段/错误码，开始加载时清旧进度；无返回值，只获取短锁。 */
+/* 更新升级阶段和错误码。
+ * 返回：无。
+ * 开始加载时清空旧进度。
+ */
 void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
                             enum ssf_mems_ota_stage stage, int error);
-/* 复制升级进度快照；无返回值，data/status 必须有效，不获取采集锁。 */
+/* 复制当前固件升级进度。
+ * 返回：无。
+ * 只持升级状态锁，升级期间也可读取。
+ */
 void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
                              struct ssf_mems_ota_status *status);
-/* 返回静态阶段名称字符串，非法枚举返回 "unknown"，不会返回 NULL。 */
+/* 把升级阶段转换为名称。
+ * 返回：静态名称字符串，无效阶段为 "unknown"。
+ */
 const char *ssf_mems_ota_stage_name(enum ssf_mems_ota_stage stage);

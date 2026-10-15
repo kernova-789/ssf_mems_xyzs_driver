@@ -12,6 +12,15 @@ thresholds, stale cache invalidation, sensor resets, exponential retry caps,
 Modbus exceptions, manual baud changes, lost write acknowledgments, buffer errors,
 low-baud response budgets, thread creation failure and shutdown guards.
 
+Polling cases cover the default fixed 1000 ms behavior, a custom fixed period's
+actual read-start intervals, adaptive acceleration/deceleration and bounds,
+read-time headroom, and mode/interval changes during the real acquisition loop.
+They check that 30-second probing preserves an unfinished 32-comparison window,
+normal raw windows preserve learned periods, reconnection retains configuration,
+inactive-mode edits preserve statistics, and invalid bounds never change state.
+Configuration tests verify no sensor commands, no restart of the feature window,
+same-value write suppression, and range/shutdown errors.
+
 Sensor-setting cases check offline/shutdown rejection, request timeouts,
 cache invalidation after successful writes or lost acknowledgments, and resetting
 the polling policy after a successful configuration change.
@@ -36,3 +45,6 @@ against the target kernel and validate the device's 40102 change timing on hardw
 纯原始模式检查零特征读写、恢复门禁和 IIO 满队列后继续采集；100 ms 短交替窗口
 检查不会被 1000 ms 特征周期拖长。设备树 raw-duration-ms=0 仍默认仅特征，
 但保存 5000 ms 原始窗口供未来运行时切换。有校验时仅允许特征模式。
+
+另用真实 pthread mutex 验证生产 `get_status()`：持有完整采集事务锁时，
+在线状态、周期和样本年龄仍可读取，调用受 5 秒测试超时保护。

@@ -283,6 +283,7 @@ static void reset_sensor(void) {
   serial.baudrate = 9600;
   test_allocation_failure = false;
   CHECK(ssf_mems_protocol_init(&sensor) == 0);
+  sensor.raw.sample_handler = ssf_mems_iio_publish_raw;
   CHECK(ssf_mems_modbus_request_init(&sensor) == 0);
   CHECK(ssf_mems_modbus_receive_init(&sensor, ssf_mems_protocol_handle_frame, &sensor) == 0);
   sensor_initialized = true;
@@ -1497,6 +1498,11 @@ static void test_raw_parser(void) {
   sensor.raw.active = sensor.raw.publishing = true;
   feed_raw_packet(2);
   CHECK(sensor.raw.discontinuities == 1); /* 首包不是零，也必须报错。 */
+  reset_sensor();
+  sensor.raw.active = sensor.raw.publishing = true;
+  sensor.raw.sample_handler = NULL;
+  feed_raw_packet(0);
+  CHECK(raw_published == 0 && sensor.raw.buffer_errors == 64 && sensor.raw.packets == 1);
 }
 
 /* 等待点交付有限批次；不修改波特率，也不依赖停止命令来结束。 */
@@ -1788,9 +1794,68 @@ static void test_manual_register_descriptions(void) {
           -EOPNOTSUPP);
 }
 
+/* 换表后的单位比例必须同时作用于有符号解码、缓存和越界检查。 */
+static void test_feature_scale_metadata(void) {
+  struct ssf_mems_sensor_data features, cached;
+  u16 values[29] = {0};
+
+  reset_sensor();
+  values[6] = (u16)-123;
+  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == 0);
+  CHECK(features.temperature_x100 == -1230);
+  values[6] = 246;
+  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == 0);
+  CHECK(features.temperature_x100 == 2460);
+  CHECK(ssf_mems_protocol_store_features(&sensor, &features) == 0);
+  cached = features;
+  values[6] = 4000;
+  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == -ERANGE);
+  CHECK(ssf_mems_protocol_get_features(&serial, &features) == 0);
+  CHECK(memcmp(&features, &cached, sizeof(cached)) == 0);
+}
+
+/* 特征开关位变动只改型号表，业务层仍保留其他配置位。 */
+static void test_feature_switch_metadata(void) {
+  u16 value;
+
+  reset_sensor();
+  emulate_settings = true;
+  setting_registers[69] = 0xa5c0;
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, 21, 0) == 0);
+  CHECK(setting_registers[69] == 0xa5d5);
+  CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, &value, 0) == 0);
+  CHECK(value == 21);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, 64, 0), -EINVAL);
+}
+
+/* 型号只提供部分波特率编码时，不向传感器写未提供的编码或越界扫描。 */
+static void test_short_baud_table(void) {
+  enum ssf_mems_baudrate found = SSF_MEMS_BAUDRATE_1000000;
+
+  reset_sensor();
+  CHECK(ssf_mems_sensor_profile.baudrate_count == 8);
+  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_128000) == -EINVAL);
+  NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_128000, 50), -EINVAL);
+  response_mode = REPLY_NONE;
+  CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == -ETIMEDOUT);
+  CHECK(found == SSF_MEMS_BAUDRATE_1000000 && sends == 7 && serial.baudrate == 9600);
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   test_manual_register_descriptions();
+  if (strcmp(argv[1], "short_baud_table") == 0) {
+    test_short_baud_table();
+    goto done;
+  }
+  if (strcmp(argv[1], "feature_scale_x10") == 0) {
+    test_feature_scale_metadata();
+    goto done;
+  }
+  if (strcmp(argv[1], "feature_switch_layout") == 0) {
+    test_feature_switch_metadata();
+    goto done;
+  }
   if (strcmp(argv[1], "relocate_registers") == 0) {
     test_relocated_registers();
     goto done;

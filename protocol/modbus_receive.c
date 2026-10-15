@@ -1,4 +1,5 @@
 #include "modbus_receive.h"
+#include "serial_transport.h"
 #include "core.h"
 #include "modbus.h"
 #include "modbus_table.h"
@@ -10,26 +11,29 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-/* 仅由接收工作项串行消费 FIFO 并拼帧；返回 0 已消费，-EINVAL 空设备，-ENODEV 无驱动数据或接收已关闭。 */
+/* 取出接收队列中的字节并逐个解析。
+ * 返回：0 成功，-EINVAL 设备无效，-ENODEV 接收不可用。
+ * 只由接收工作项调用。
+ */
 static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev);
-/* 释放候选帧内存并归还槽位；无返回值。 */
+/* 释放候选帧缓冲区并归还槽位。
+ * 返回：无。
+ */
 static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot);
 
-/* 串口驱动可能分批交付字节，不能拿交付时间直接当作线上的 t1.5。
- * 使用最长 RTU 帧传输时间加调度余量，避免因工作队列延迟误丢完整帧。
- * 返回候选帧最长存活 jiffies，包含完整线上传输时间和调度余量。 */
+/* 计算半帧的超时长度。
+ * 返回：超时 tick 数。
+ * 按最长帧传输时间加余量计算。
+ */
 static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_xyzs_data *data) {
-  unsigned int baudrate = READ_ONCE(data->protocol.host_baudrate);
-  unsigned int bits = READ_ONCE(data->protocol.parity) == SSF_MEMS_PARITY_NONE ? 10U : 11U;
-  unsigned int wire_ms;
-
-  if (baudrate == 0)
-    baudrate = 9600;
-  wire_ms = DIV_ROUND_UP(SSF_MEMS_MODBUS_MAX_FRAME_LEN * bits * 1000U, baudrate);
-  return msecs_to_jiffies(wire_ms + SSF_MEMS_RX_EXPIRY_MARGIN_MS);
+  return msecs_to_jiffies(ssf_mems_serial_wire_ms(data,
+                         SSF_MEMS_MODBUS_MAX_FRAME_LEN) + SSF_MEMS_RX_EXPIRY_MARGIN_MS);
 }
 
-/* 清理超期半帧，已排队字节优先解析；无返回值，关闭/flush 时跳过。 */
+/* 清理长时间没有收完整的候选帧。
+ * 返回：无。
+ * 队列非空时暂不清理。
+ */
 static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   struct ssf_mems_modbus_receive_state *rx =
       container_of(work, struct ssf_mems_modbus_receive_state, expiry_work.work);
@@ -61,7 +65,9 @@ static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   mutex_unlock(&rx->parse_lock);
 }
 
-/* 接收工作项串行消费 FIFO 并拼帧；无返回值。 */
+/* 执行接收队列的解析任务。
+ * 返回：无。
+ */
 static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
   struct ssf_mems_modbus_receive_state *rx =
       container_of(work, struct ssf_mems_modbus_receive_state, work);
@@ -71,12 +77,16 @@ static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
   ssf_mems_modbus_receive_drain(data->serdev);
 }
 
-/* 返回 true 槽位已占用，false 槽位未占用。 */
+/* 检查候选帧槽位是否被占用。
+ * 返回：true 已占用，false 空闲。
+ */
 static bool ssf_mems_rx_slot_is_used(const struct ssf_mems_frame_slot *slot) {
   return atomic_read(&slot->in_use) == SSF_MEMS_FRAME_SLOT_USED;
 }
 
-/* 返回已认领的槽位；没有空闲槽位返回 NULL。 */
+/* 申请一个空闲候选帧槽位。
+ * 返回：槽位指针，没有空位时为 NULL。
+ */
 static struct ssf_mems_frame_slot *
 ssf_mems_rx_alloc_slot(struct ssf_mems_xyzs_data *data) {
   int i;
@@ -91,7 +101,9 @@ ssf_mems_rx_alloc_slot(struct ssf_mems_xyzs_data *data) {
   return NULL;
 }
 
-/* 释放帧缓冲区并归还槽位；无返回值。 */
+/* 释放候选帧缓冲区并归还槽位。
+ * 返回：无。
+ */
 static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot) {
   kfree(slot->data);
   slot->data = NULL;
@@ -106,7 +118,9 @@ static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot) {
   atomic_set(&slot->in_use, SSF_MEMS_FRAME_SLOT_FREE);
 }
 
-/* 初始化接收模块并注册完整帧回调；返回 0 成功，-EINVAL 驱动数据/回调为空且不修改状态，其他负值来自 FIFO 分配。 */
+/* 初始化接收队列并注册完整帧回调。
+ * 返回：0 成功，-EINVAL 参数无效，其他负数为分配错误。
+ */
 int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
                                ssf_mems_frame_handler_t handler, void *context) {
   struct ssf_mems_modbus_receive_state *rx;
@@ -140,8 +154,10 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   return 0;
 }
 
-/* 清空旧串口参数下的字节和候选帧；清理期间到达的字节也会被丢弃。
- * 无返回值；空指针或已关闭时直接返回。 */
+/* 清空接收队列和未完成的候选帧。
+ * 返回：无。
+ * 清理期间收到的字节会丢弃，调用时不能持请求锁。
+ */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
@@ -175,7 +191,10 @@ void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
 }
 
-/* 清理接收模块；无返回值，先禁止新入队和新工作，再停止工作并释放 FIFO/候选帧，空指针直接退出。 */
+/* 关闭接收并释放队列和候选帧。
+ * 返回：无。
+ * 先停止接收工作项，再释放资源。
+ */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
@@ -199,7 +218,10 @@ void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   mutex_unlock(&rx->parse_lock);
 }
 
-/* 返回最近接收活动的 jiffies，用于发送前检测空闲；包含 flush 期间丢弃的字节。 */
+/* 读取最近收到串口字节的时间。
+ * 返回：接收时间的 jiffies 值。
+ * 包含清理期间丢弃的字节。
+ */
 unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data) {
   unsigned long flags;
   unsigned long last_rx;
@@ -210,7 +232,9 @@ unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *d
   return last_rx;
 }
 
-/* 将接收解析加入工作队列；无返回值，空设备、未绑定驱动数据或接收已关闭时直接退出。 */
+/* 安排接收队列的解析任务。
+ * 返回：无。
+ */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_receive_state *rx;
@@ -228,7 +252,9 @@ void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
 }
 
-/* 初始化候选帧状态；无返回值。 */
+/* 初始化一个候选帧。
+ * 返回：无。
+ */
 static void ssf_mems_rx_init_candidate(struct ssf_mems_frame_slot *slot, u8 slave_id) {
   slot->data = NULL;
   slot->data_len = 0;
@@ -241,7 +267,9 @@ static void ssf_mems_rx_init_candidate(struct ssf_mems_frame_slot *slot, u8 slav
   slot->started = jiffies;
 }
 
-/* 追加一个字节；返回 0 成功，-EINVAL 无缓冲区，-ENOSPC 缓冲区已满。 */
+/* 向候选帧追加一个字节。
+ * 返回：0 成功，-EINVAL 无缓冲区，-ENOSPC 缓冲区已满。
+ */
 static int ssf_mems_rx_append_byte(struct ssf_mems_frame_slot *slot, u8 byte) {
   if (slot->data == NULL)
     return -EINVAL;
@@ -251,7 +279,9 @@ static int ssf_mems_rx_append_byte(struct ssf_mems_frame_slot *slot, u8 byte) {
   return 0;
 }
 
-/* 分配帧缓冲区；返回 0 成功，-ENOMEM 分配失败。 */
+/* 为候选帧分配缓冲区。
+ * 返回：0 成功，-ENOMEM 分配失败。
+ */
 static int ssf_mems_rx_alloc_frame(struct ssf_mems_frame_slot *slot, size_t len) {
   slot->data = kzalloc(len, GFP_KERNEL);
   if (slot->data == NULL)
@@ -262,7 +292,9 @@ static int ssf_mems_rx_alloc_frame(struct ssf_mems_frame_slot *slot, size_t len)
   return 0;
 }
 
-/* 按表选择响应格式；返回 0 成功，-EOPNOTSUPP 功能码/布局不支持；其他负值来自长度计算、分配或追加字节。 */
+/* 根据功能码准备候选帧的接收格式。
+ * 返回：0 成功，负数为格式、分配或缓冲区错误。
+ */
 static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot, u8 function) {
   int ret;
   int len;
@@ -294,7 +326,9 @@ static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot, u8 functio
   return 0;
 }
 
-/* 根据字节数准备读取响应；返回 0 成功，-EMSGSIZE 字节数异常；其他负值来自分配或追加字节。 */
+/* 根据字节数为读取应答准备缓冲区。
+ * 返回：0 成功，负数为长度、分配或缓冲区错误。
+ */
 static int ssf_mems_rx_start_read_frame(struct ssf_mems_frame_slot *slot, u8 byte_count) {
   int len;
   int ret;
@@ -314,7 +348,10 @@ static int ssf_mems_rx_start_read_frame(struct ssf_mems_frame_slot *slot, u8 byt
   return ssf_mems_rx_append_byte(slot, byte_count);
 }
 
-/* 校验并通过同步回调交出完整帧；无返回值，校验/处理失败记录日志，所有路径均释放槽位。 */
+/* 校验完整帧并交给回调处理。
+ * 返回：无。
+ * 回调结束后释放槽位，帧数据只在回调期间有效。
+ */
 static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
                                 struct ssf_mems_frame_slot *slot) {
   int ret;
@@ -336,7 +373,10 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
   ssf_mems_rx_free_slot(slot);
 }
 
-/* 推进候选帧状态；无返回值，准备或追加失败时释放槽位。 */
+/* 用一个字节推进候选帧的解析。
+ * 返回：无。
+ * 解析失败时释放槽位。
+ */
 static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
                                          struct ssf_mems_frame_slot *slot, u8 byte) {
   int ret;
@@ -376,8 +416,9 @@ static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
   }
 }
 
-/* 识别普通 Modbus 从机地址并创建候选帧；私有流在字节入口另行处理。
- * 遇到本机地址时尝试建立候选帧；无返回值，无空槽仅记录限速日志。 */
+/* 遇到本机地址时创建候选帧。
+ * 返回：无。
+ */
 static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byte) {
   struct ssf_mems_frame_slot *slot;
 
@@ -391,7 +432,10 @@ static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byt
   ssf_mems_rx_init_candidate(slot, byte);
 }
 
-/* 先让已有候选帧消费字节，再尝试以该字节建立新帧；无返回值。 */
+/* 解析一个接收字节。
+ * 返回：无。
+ * 原始数据和升级应答按当前模式分流。
+ */
 static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   int i;
 
@@ -418,7 +462,10 @@ static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
   ssf_mems_rx_create_candidate(data, byte);
 }
 
-/* 返回实际入队字节数；FIFO 不足时保留已入队部分，由 serdev 根据返回值重送剩余数据。 */
+/* 把串口字节放入接收队列。
+ * 返回：已接收的字节数，负数为参数或接收状态错误。
+ * 队列不足时允许部分入队，清理期间直接丢弃。
+ */
 ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
                          const unsigned char *buf, size_t count) {
   struct ssf_mems_xyzs_data *data;
@@ -454,7 +501,10 @@ ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
   return (ssize_t)ret;
 }
 
-/* 仅由接收工作项串行消费 FIFO 并拼帧；返回 0 已消费，-EINVAL 空设备，-ENODEV 无驱动数据或接收已关闭，单帧错误内部处理或记录日志。 */
+/* 取出接收队列中的字节并逐个解析。
+ * 返回：0 成功，-EINVAL 设备无效，-ENODEV 接收不可用。
+ * 只由接收工作项调用。
+ */
 static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev) {
   struct ssf_mems_xyzs_data *data;
   struct ssf_mems_modbus_receive_state *rx;

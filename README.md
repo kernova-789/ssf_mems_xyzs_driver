@@ -78,6 +78,10 @@ The IIO device also provides:
 - `sensor_baudrate_available`: supported numeric baud rates.
 - `sensor_online`: whether acquisition has verified the connection (0/1).
 - `sensor_poll_interval_ms`: current polling period in milliseconds.
+- `sensor_poll_mode` (RW): `fixed` (default) or `adaptive`.
+- `sensor_poll_fixed_interval_ms` (RW): fixed period, default 1000 ms.
+- `sensor_poll_min_interval_ms` / `sensor_poll_max_interval_ms` (RW): adaptive
+  bounds, default 500 / 5000 ms. All periods accept 100..60000 ms, with min <= max.
 - `sensor_sample_age_ms`: age of the latest complete sample; `-ENODATA` before
   the first successful acquisition.
 - `sensor_sampling_rate_index` (RW) and `sensor_sampling_frequency` (RO):
@@ -108,9 +112,12 @@ not respond, discovery finds the active rate before saving/rebooting the sensor
 to the target. No responding rate means retrying, not blindly writing a new rate;
 configuration failures use the
 connection retry path before publishing samples.
-It polls at a fixed period of 1000 ms for the measured 4.4–4.8 s feature-update
-interval. The adaptive policy remains available, but equal minimum and maximum
-periods currently keep it at 1000 ms. Sustained communication failure stops polling
+It defaults to a fixed polling period of 1000 ms for the measured 4.4–4.8 s
+feature-update interval. Runtime IIO controls select fixed or adaptive polling,
+set the fixed period, and configure adaptive bounds. Adaptive statistics survive
+normal raw windows, and periodic probing does not discard unfinished statistics.
+Polling configuration survives reconnection but is reset on driver reload.
+See [polling controls](iio/README.md#特征轮询周期). Sustained communication failure stops polling
 and starts baud-rate discovery with exponential retry delays capped at 30 s.
 Stale or disconnected samples become invalid and direct reads return `-ENODATA`.
 See [acquisition/README.md](acquisition/README.md) for the policy and tuning points.
@@ -191,3 +198,5 @@ the `CONFIG_SSF_SENSOR` symbol controls whether the module is included.
 设备 `ssf_mems_xyzs_raw` 中提供，原有特征设备 ABI 不变；暂不计算 FFT。
 设备树时段配置、私有协议限制和 buffer 读取方法见
 [定长原始采集说明](protocol/RAW_CAPTURE.md)。
+
+IIO 全部属性的中文说明和操作示例见 [iio/ATTRIBUTES.md](iio/ATTRIBUTES.md)。

@@ -15,6 +15,7 @@ typedef int16_t s16;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef int64_t s64;
+typedef uint64_t u64;
 #define BIT(n) (1UL << (n))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -109,6 +110,7 @@ long test_wait_timeout(unsigned long timeout);
 #define dev_err_ratelimited(dev, ...) dev_err(dev, __VA_ARGS__)
 #define dev_warn_ratelimited(dev, ...) dev_warn(dev, __VA_ARGS__)
 #define dev_dbg(dev, ...) ((void)(dev))
+#define pr_debug(...) do { if (0) printf(__VA_ARGS__); } while (0)
 #define pr_info(...) ((void)snprintf(NULL, 0, __VA_ARGS__))
 #define dev_info(dev, ...) ((dev)->info_count++, \
                            (void)snprintf((dev)->last_info, \

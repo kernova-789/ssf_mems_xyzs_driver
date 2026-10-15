@@ -16,3 +16,5 @@ struct attribute_group { struct attribute **attrs; };
 #define to_iio_dev_attr(attr) container_of(attr, struct iio_dev_attr, dev_attr)
 int sysfs_emit(char *, const char *, ...);
 int kstrtouint(const char *, unsigned int, unsigned int *);
+
+int sysfs_emit_at(char *buf, int at, const char *fmt, ...);

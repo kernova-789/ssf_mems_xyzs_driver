@@ -1,5 +1,7 @@
 # IIO mapping
 
+完整中文属性说明、权限、取值范围和操作示例见 [IIO 属性使用说明](ATTRIBUTES.md)。
+
 `ssf_mems_iio.c` owns the complete IIO-facing implementation. Core code only
 calls `ssf_mems_iio_register()` after the serdev transport is ready.
 
@@ -13,10 +15,11 @@ than pressure channels. Device-specific dimensionless/spectral fields use named
 `-ENODATA` before the first snapshot is available, during reconnect, or after
 read failures have made it stale; they never initiate Modbus I/O.
 
-`ssf_mems_iio_publish_features()` atomically replaces that snapshot and pushes
-the same sample to the IIO kfifo when the buffer is enabled. The automatic
-producer lives in `acquisition/` and starts after IIO registration. It continues
-updating the cache when the buffer is disabled.
+The protocol layer atomically updates the feature snapshot after a complete
+read. `ssf_mems_iio_publish_features()` only pushes that sample to the IIO kfifo
+when the buffer is enabled. The automatic producer lives in `acquisition/` and
+starts after IIO registration. Protocol reads continue updating the cache when
+the buffer is disabled.
 
 The producer holds `indio_dev->mlock` throughout the enabled-state check, scan
 packing, and buffer push. IIO buffer reconfiguration holds the same mutex, so
@@ -40,7 +43,8 @@ the background thread then verifies communication before polling again.
 
 Read-only `sensor_online`, `sensor_poll_interval_ms`, and `sensor_sample_age_ms`
 report link status, the current target polling period, and the age of the latest
-complete sample. Before the first successful sample, the age returns `-ENODATA`.
+complete sample. These three reads use a short status mutex, independent of
+the acquisition transaction mutex; they do not wait for a raw window or OTA. Before the first successful sample, the age returns `-ENODATA`.
 A reachable device returning Modbus exceptions can be online while its feature
 cache is stale, so link status and sample age have separate meanings.
 
@@ -58,7 +62,8 @@ cache is stale, so link status and sample age have separate meanings.
 `raw` 持续重复完整 1024 点批次，不读取特征。
 它仍会执行必要的配置读取和批后通信确认，因此不是无间断原始波形。
 `feature` 持续轮询特征，不触发原始批次。`alternating` 从特征窗口开始交替，
-到原始窗口截止时收完在途批次，不为了满足时长截断数据。特征轮询周期仍为 1000 ms。
+到原始窗口截止时收完在途批次，不为了满足时长截断数据。特征轮询默认固定为
+1000 ms，也可使用下面的独立轮询配置。
 
 默认是交替模式、原始/特征各 5000 ms；设备树两项时段继续提供初始值。
 旧 `sange-cbm,raw-duration-ms=0` 仍选择仅特征，但原始窗口读回为可供以后切换的
@@ -85,6 +90,50 @@ echo alternating > "$IIO/sensor_acquisition_mode"  # 原始约 2 s / 特征约 3
 时间戳识别。采集模式不自动开启 IIO buffer，仍需应用自行配置并消费对应 buffer。
 设置可在离线时保存于驱动内存并在重连后沿用；卸载后不保留，下一次加载重新使用
 设备树/默认值。新功能只完成离线回归和目标板内核编译，尚未实机验证。
+
+## 特征轮询周期
+
+以下属性位于特征设备 `ssf_mems_xyzs`，控制主机读取特征的间隔，不改变传感器
+采样率、波特率或原始数据采样间隔。它们适用于 `feature` 和 `alternating` 的
+特征阶段；`raw` 模式保存配置但不执行特征轮询。
+
+| 属性 | 权限 | 默认值/取值 |
+| --- | --- | --- |
+| `sensor_poll_mode` | 读写 | `fixed`（默认）或 `adaptive` |
+| `sensor_poll_mode_available` | 只读 | `fixed adaptive` |
+| `sensor_poll_fixed_interval_ms` | 读写 | 1000 ms，范围 100..60000 |
+| `sensor_poll_min_interval_ms` | 读写 | 500 ms，范围 100..60000 |
+| `sensor_poll_max_interval_ms` | 读写 | 5000 ms，范围 100..60000 |
+| `sensor_poll_interval_ms` | 只读 | 当前生效的周期，可能受通信耗时影响 |
+
+以 root 身份操作，X 替换为特征设备编号：
+
+```sh
+IIO=/sys/bus/iio/devices/iio:deviceX
+# 固定模式：两轮读取开始时间的目标间隔为 2000 ms。
+echo 2000 > "$IIO/sensor_poll_fixed_interval_ms"
+echo fixed > "$IIO/sensor_poll_mode"
+
+# 自适应模式：在 500～5000 ms 内调整周期。
+echo 5000 > "$IIO/sensor_poll_max_interval_ms"
+echo 500 > "$IIO/sensor_poll_min_interval_ms"
+echo adaptive > "$IIO/sensor_poll_mode"
+cat "$IIO/sensor_poll_interval_ms"
+```
+
+下限不能超过上限，非法写入返回 `-EINVAL` 并保留旧配置。属性逐项更新，调整范围
+时应按当前值选择顺序：提高下限越过旧上限之前先提高上限，降低上限越过旧下限之前
+先降低下限。数值只接受十进制整数；上下限相等时周期被限定在该值。
+
+固定周期和自适应上下限分别保存，切换模式不会覆盖另一个模式的配置。进入自适应
+时从当前周期开始并限制到上下限；切回固定时使用保存的固定周期。自适应按 32 次
+相邻特征比较调整周期，30 秒定期试探不清空未完成统计；交替采集也保留学习结果。
+只修改非当前模式的参数不会打断当前轮询。
+
+写入与采集共用采集锁，可能等待在途原始窗口完整结束；当前模式的参数变化会唤醒
+调度，不重新开始特征窗口。配置在离线、重连后继续保留，本次驱动卸载后不保留。
+这些操作不发送传感器配置命令。当前周期是调度目标，读取耗时超过周期时不会并行
+发送或补发积压轮次。
 
 ## bin 固件升级
 

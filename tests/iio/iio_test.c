@@ -22,6 +22,8 @@ static enum ssf_mems_sensor_setting last_setting;
 static struct ssf_mems_acquisition_config acquisition_config; /* 模拟采集层配置。 */
 static int control_error; /* 模拟配置层关闭或不支持的错误。 */
 static unsigned int control_writes; /* 检查非法 sysfs 输入不会进入配置层。 */
+static enum ssf_mems_poll_setting last_poll_setting;
+static unsigned int last_poll_value;
 static unsigned int firmware_updates; /* 检查升级属性仅转交合法文件名。 */
 
 int ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
@@ -222,7 +224,30 @@ int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *d,
     acquisition_config.feature_duration_ms = duration;
   return 0;
 }
+/* 记录 IIO 分派结果；范围和上下限由真实 acquisition 用例验证。 */
+int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_xyzs_data *d,
+                                          enum ssf_mems_poll_setting setting,
+                                          unsigned int value) {
+  assert(d == &sensor);
+  control_writes++;
+  last_poll_setting = setting;
+  last_poll_value = value;
+  if (control_error != 0)
+    return control_error;
+  switch (setting) {
+  case SSF_MEMS_POLL_SETTING_MODE: acquisition_config.poll.mode = value; break;
+  case SSF_MEMS_POLL_SETTING_FIXED_INTERVAL:
+    acquisition_config.poll.fixed_interval_ms = value; break;
+  case SSF_MEMS_POLL_SETTING_MIN_INTERVAL:
+    acquisition_config.poll.min_interval_ms = value; break;
+  case SSF_MEMS_POLL_SETTING_MAX_INTERVAL:
+    acquisition_config.poll.max_interval_ms = value; break;
+  default: abort();
+  }
+  return 0;
+}
 int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate b) { abort(); }
+int ssf_mems_baudrate_from_value(unsigned int v, enum ssf_mems_baudrate *b) { abort(); }
 int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
                                          const char *name) {
   assert(data == &sensor && strcmp(name, "update.bin") == 0);
@@ -234,6 +259,15 @@ int sysfs_emit(char *buf, const char *fmt, ...) {
   int count;
   va_start(args, fmt);
   count = vsnprintf(buf, 4096, fmt, args);
+  va_end(args);
+  return count;
+}
+int sysfs_emit_at(char *buf, int at, const char *fmt, ...) {
+  va_list args;
+  int count;
+  assert(at >= 0 && at < 4096);
+  va_start(args, fmt);
+  count = vsnprintf(buf + at, 4096 - at, fmt, args);
   va_end(args);
   return count;
 }
@@ -256,6 +290,13 @@ static void test_configuration_attributes(void) {
   struct device_attribute *attr;
 
   indio.private = &state;
+  attr = &iio_dev_attr_sensor_sampling_rate_index_available.dev_attr;
+  assert(attr->show(&indio.dev, attr, buf) == 20);
+  assert(!strcmp(buf, "0 1 2 3 4 5 6 7 8 9\n"));
+  attr = &iio_dev_attr_sensor_baudrate_available.dev_attr;
+  assert(attr->show(&indio.dev, attr, buf) > 0);
+  assert(!strcmp(buf, "2400 4800 9600 19200 38400 57600 115200 128000 230400 256000 "
+                      "460800 500000 512000 600000 750000 921600 1000000\n"));
   setting_value = 6;
   attr = &iio_dev_attr_sensor_sampling_frequency.dev_attr;
   assert(attr->show(&indio.dev, attr, buf) == 7 && !strcmp(buf, "5333.4\n"));
@@ -332,6 +373,66 @@ static void test_acquisition_controls(void) {
 }
 
 /* 升级期间进度不依赖采集锁；非法名字不触发文件加载或传感器操作。 */
+/* 轮询属性正确分派，非法文本不进入配置层，状态周期仍只读。 */
+static void test_poll_controls(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *mode = &iio_dev_attr_sensor_poll_mode.dev_attr;
+  struct device_attribute *attrs[] = {
+      &iio_dev_attr_sensor_poll_fixed_interval_ms.dev_attr,
+      &iio_dev_attr_sensor_poll_min_interval_ms.dev_attr,
+      &iio_dev_attr_sensor_poll_max_interval_ms.dev_attr,
+  };
+  const enum ssf_mems_poll_setting settings[] = {
+      SSF_MEMS_POLL_SETTING_FIXED_INTERVAL, SSF_MEMS_POLL_SETTING_MIN_INTERVAL,
+      SSF_MEMS_POLL_SETTING_MAX_INTERVAL,
+  };
+  char buf[4096];
+  unsigned int before;
+  size_t i;
+
+  indio.private = &state;
+  acquisition_config.poll = (struct ssf_mems_poll_config){
+      .mode = SSF_MEMS_POLL_FIXED, .fixed_interval_ms = 1000,
+      .min_interval_ms = 500, .max_interval_ms = 5000,
+  };
+  assert(mode->show(&indio.dev, mode, buf) == 6 && !strcmp(buf, "fixed\n"));
+  assert(mode->store(&indio.dev, mode, "adaptive\n", 9) == 9);
+  assert(last_poll_setting == SSF_MEMS_POLL_SETTING_MODE &&
+         last_poll_value == SSF_MEMS_POLL_ADAPTIVE);
+  assert(mode->show(&indio.dev, mode, buf) == 9 && !strcmp(buf, "adaptive\n"));
+  assert(mode->store(&indio.dev, mode, "fixed", 5) == 5);
+  assert(last_poll_value == SSF_MEMS_POLL_FIXED);
+  before = control_writes;
+  assert(mode->store(&indio.dev, mode, "ADAPTIVE", 8) == -EINVAL);
+  assert(mode->store(&indio.dev, mode, "fixed extra", 11) == -EINVAL);
+  assert(mode->store(&indio.dev, mode, "1", 1) == -EINVAL);
+  assert(mode->store(&indio.dev, mode, "", 0) == -EINVAL);
+  assert(control_writes == before);
+  for (i = 0; i < ARRAY_SIZE(attrs); i++) {
+    assert(attrs[i]->store(&indio.dev, attrs[i], "2000\n", 5) == 5);
+    assert(last_poll_setting == settings[i] && last_poll_value == 2000);
+    assert(attrs[i]->show(&indio.dev, attrs[i], buf) == 5 && !strcmp(buf, "2000\n"));
+    before = control_writes;
+    assert(attrs[i]->store(&indio.dev, attrs[i], "-1", 2) == -EINVAL);
+    assert(attrs[i]->store(&indio.dev, attrs[i], "invalid", 7) == -EINVAL);
+    assert(attrs[i]->store(&indio.dev, attrs[i], "0x100", 5) == -EINVAL);
+    assert(attrs[i]->store(&indio.dev, attrs[i], "4294967296", 10) < 0);
+    assert(control_writes == before);
+    control_error = -EINVAL;
+    assert(attrs[i]->store(&indio.dev, attrs[i], "99", 2) == -EINVAL);
+    control_error = -ENODEV;
+    assert(attrs[i]->show(&indio.dev, attrs[i], buf) == -ENODEV);
+    assert(attrs[i]->store(&indio.dev, attrs[i], "1000", 4) == -ENODEV);
+    control_error = 0;
+  }
+  control_error = -ENODEV;
+  assert(mode->show(&indio.dev, mode, buf) == -ENODEV);
+  assert(mode->store(&indio.dev, mode, "adaptive", 8) == -ENODEV);
+  control_error = 0;
+  assert(iio_dev_attr_sensor_poll_interval_ms.dev_attr.store == NULL);
+  indio.private = NULL;
+}
+
 static void test_firmware_attributes(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   struct device_attribute *update = &iio_dev_attr_sensor_firmware_update.dev_attr;
@@ -406,6 +507,7 @@ int main(void) {
 
   test_configuration_attributes();
   test_acquisition_controls();
+  test_poll_controls();
   test_firmware_attributes();
   test_raw_status_attributes();
   memset(&sample, 0, sizeof(sample));
@@ -422,6 +524,8 @@ int main(void) {
   mutex_init(&sensor.protocol.lock);
   mutex_init(&indio.mlock);
   configure_buffer(4);
+  memset(&sensor.protocol.features, 0xa5, sizeof(sensor.protocol.features));
+  struct ssf_mems_sensor_data cached_before = sensor.protocol.features;
   assert(ssf_mems_iio_publish_features(&sensor, &sample, timestamp) == 0);
   assert(pushes == 1);
   assert(pthread_barrier_init(&start, NULL, 2) == 0);
@@ -429,7 +533,7 @@ int main(void) {
   assert(pthread_create(&controller, NULL, reconfigure, NULL) == 0);
   assert(pthread_join(producer, NULL) == 0);
   assert(pthread_join(controller, NULL) == 0);
-  assert(sensor.protocol.valid && memcmp(&sensor.protocol.features, &sample, sizeof(sample)) == 0);
+  assert(!sensor.protocol.valid && memcmp(&sensor.protocol.features, &cached_before, sizeof(cached_before)) == 0);
   free(indio.active_scan_mask);
   pthread_barrier_destroy(&start);
   pthread_mutex_destroy(&indio.mlock.native);
