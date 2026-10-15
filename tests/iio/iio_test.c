@@ -12,7 +12,18 @@ static struct iio_dev raw_indio;
 static struct ssf_mems_raw_sample raw_sample = {
     .xyz = {-2, -32768, 5399}, .packet_sequence = 0x12345678, .sample_index = 63,
 };
-static struct ssf_mems_sensor_data sample;
+/* 独立夹具：每个通道数值等于 scan_index+1，温度和运行位单独指定。 */
+static struct ssf_mems_sensor_data sample = {
+    .x = {1, 2, 8, 11, 14, 17, 20},
+    .y = {3, 4, 9, 12, 15, 18, 21},
+    .z = {5, 6, 10, 13, 16, 19, 22},
+    .temperature_x100 = -321,
+    .sound = {23, 24, 25},
+    .zero_crossing_rate_percent = 26,
+    .spectral_centroid_hz_x10 = 27,
+    .spectral_flux_x100 = 28,
+    .startup_flags = 7,
+};
 static pthread_barrier_t start;
 static unsigned int pushes;
 static const s64 timestamp = 123456789;
@@ -25,6 +36,112 @@ static unsigned int control_writes; /* 检查非法 sysfs 输入不会进入配�
 static enum ssf_mems_poll_setting last_poll_setting;
 static unsigned int last_poll_value;
 static unsigned int firmware_updates; /* 检查升级属性仅转交合法文件名。 */
+
+/* 只模拟资源分配和注册结果，执行生产注册/撤销流程。 */
+static struct iio_dev *allocated_devices[2];
+static size_t allocated_count;
+static unsigned int allocation_calls, buffer_calls, register_calls;
+static unsigned int live_buffers, registered_devices;
+static unsigned int fail_allocation, fail_buffer, fail_register;
+
+struct iio_dev *devm_iio_device_alloc(struct device *dev, int private_size) {
+  struct iio_dev *allocated;
+
+  if (++allocation_calls == fail_allocation)
+    return NULL;
+  assert(allocated_count < ARRAY_SIZE(allocated_devices));
+  allocated = calloc(1, sizeof(*allocated));
+  assert(allocated);
+  allocated->private = calloc(1, private_size);
+  assert(allocated->private);
+  mutex_init(&allocated->mlock);
+  allocated_devices[allocated_count++] = allocated;
+  return allocated;
+}
+
+struct iio_buffer *iio_kfifo_allocate(void) {
+  struct iio_buffer *buffer;
+
+  if (++buffer_calls == fail_buffer)
+    return NULL;
+  buffer = calloc(1, sizeof(*buffer));
+  assert(buffer);
+  live_buffers++;
+  return buffer;
+}
+
+void iio_kfifo_free(struct iio_buffer *buffer) {
+  assert(buffer && live_buffers > 0);
+  live_buffers--;
+  free(buffer);
+}
+
+void iio_device_attach_buffer(struct iio_dev *dev, struct iio_buffer *buffer) {
+  assert(dev->buffer == NULL);
+  dev->buffer = buffer;
+}
+
+int iio_device_register(struct iio_dev *dev) {
+  assert(dev->buffer && dev->channels && dev->info);
+  assert(dev->modes == (INDIO_DIRECT_MODE | INDIO_BUFFER_SOFTWARE));
+  if (++register_calls == fail_register)
+    return -EIO;
+  registered_devices++;
+  return 0;
+}
+
+void iio_device_unregister(struct iio_dev *dev) {
+  assert(dev && registered_devices > 0);
+  registered_devices--;
+}
+
+static void release_test_devices(void) {
+  while (allocated_count != 0) {
+    struct iio_dev *dev = allocated_devices[--allocated_count];
+    pthread_mutex_destroy(&dev->mlock.native);
+    free(dev->private);
+    free(dev);
+  }
+}
+
+/* 验证两设备注册，以及每一步失败后的撤销和重复注册保护。 */
+static void test_registration(void) {
+  struct serdev_device serdev = {0};
+  struct ssf_mems_xyzs_data data = {.serdev = &serdev};
+  unsigned int scenario;
+
+  assert(ssf_mems_iio_register(NULL) == -EINVAL);
+  data.serdev = NULL;
+  assert(ssf_mems_iio_register(&data) == -EINVAL);
+  data.serdev = &serdev;
+  for (scenario = 0; scenario < 7; scenario++) {
+    int expected = scenario == 0 ? 0 : scenario <= 4 ? -ENOMEM : -EIO;
+
+    allocation_calls = buffer_calls = register_calls = 0;
+    fail_allocation = scenario == 1 ? 1 : scenario == 2 ? 2 : 0;
+    fail_buffer = scenario == 3 ? 1 : scenario == 4 ? 2 : 0;
+    fail_register = scenario == 5 ? 1 : scenario == 6 ? 2 : 0;
+    assert(ssf_mems_iio_register(&data) == expected);
+    if (scenario == 0) {
+      assert(registered_devices == 2 && live_buffers == 2);
+      assert(strcmp(data.indio_dev->name, "ssf_mems_xyzs") == 0);
+      assert(strcmp(data.raw_indio_dev->name, "ssf_mems_xyzs_raw") == 0);
+      assert(data.indio_dev->channels == ssf_mems_iio_channels);
+      assert(data.raw_indio_dev->channels == ssf_mems_raw_channels);
+      assert(((struct ssf_mems_iio_state *)iio_priv(data.indio_dev))->data == &data);
+      assert(((struct ssf_mems_iio_state *)iio_priv(data.raw_indio_dev))->data == &data);
+      assert(ssf_mems_iio_register(&data) == -EBUSY);
+      assert(allocation_calls == 2);
+      ssf_mems_iio_unregister(&data);
+      ssf_mems_iio_unregister(&data);
+    }
+    assert(data.indio_dev == NULL && data.raw_indio_dev == NULL);
+    assert(registered_devices == 0 && live_buffers == 0);
+    release_test_devices();
+  }
+  ssf_mems_iio_unregister(NULL);
+  fail_allocation = fail_buffer = fail_register = 0;
+}
 
 int ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
                                    const struct ssf_mems_sensor_data *features) {
@@ -39,7 +156,7 @@ s64 iio_get_time_ns(struct iio_dev *dev) { return timestamp; }
 
 int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) {
   u8 expected[SSF_MEMS_IIO_MAX_SCAN_BYTES] = {0};
-  size_t offset = 0, bit;
+  size_t offset = 0, bit, largest = 0;
 
   /* The same mutex must protect enabled state, mask, size, and the final push. */
   assert(pthread_mutex_trylock(&dev->mlock.native) == EBUSY);
@@ -53,6 +170,7 @@ int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) 
       if ((*dev->active_scan_mask & BIT(bit)) == 0)
         continue;
       offset = ALIGN(offset, width);
+      largest = max(largest, width);
       memcpy(expected + offset, &value, width);
       offset += width;
     }
@@ -61,7 +179,9 @@ int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) 
       memcpy((u8 *)scan + offset, &ts, sizeof(ts));
       memcpy(expected + offset, &ts, sizeof(ts));
       offset += sizeof(ts);
+      largest = sizeof(ts);
     }
+    offset = ALIGN(offset, largest);
     assert(offset == dev->scan_bytes && memcmp(scan, expected, offset) == 0);
     pushes++;
     return 0;
@@ -71,12 +191,14 @@ int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) 
     if (!(*dev->active_scan_mask & BIT(bit)))
       continue;
     assert(chan->scan_index == (int)bit);
-    /* Independent expected values: all 16-bit fields are 0x1234 except temp. */
+    /* Expected channel order is independent of the shared field descriptors. */
     if (bit == SSF_MEMS_IIO_STARTUP_FLAGS) {
       expected[offset++] = 7;
+      largest = max(largest, (size_t)1);
     } else {
-      s16 value = bit == SSF_MEMS_IIO_TEMPERATURE ? -321 : 0x1234;
+      s16 value = bit == SSF_MEMS_IIO_TEMPERATURE ? -321 : bit + 1;
       offset = ALIGN(offset, sizeof(value));
+      largest = max(largest, sizeof(value));
       memcpy(expected + offset, &value, sizeof(value));
       offset += sizeof(value);
     }
@@ -86,7 +208,9 @@ int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) 
     memcpy((u8 *)scan + offset, &ts, sizeof(ts));
     memcpy(expected + offset, &ts, sizeof(ts));
     offset += sizeof(ts);
+    largest = sizeof(ts);
   }
+  offset = ALIGN(offset, largest);
   assert(offset == dev->scan_bytes);
   assert(memcmp(scan, expected, offset) == 0);
   pushes++;
@@ -102,7 +226,8 @@ static void configure_buffer(unsigned int variant) {
 
   assert(mask);
   *mask = masks[variant % ARRAY_SIZE(masks)];
-  bytes = variant % 4 == 0 ? 3 : variant % 4 == 1 ? 2 : variant % 4 == 2 ? 57 : 1;
+  /* 与内核一致：整条记录的末尾也按最大字段宽度对齐。 */
+  bytes = variant % 4 == 0 ? 4 : variant % 4 == 1 ? 2 : variant % 4 == 2 ? 58 : 1;
   mutex_lock(&indio.mlock);
   indio.currentmode = INDIO_DIRECT_MODE;
   free(indio.active_scan_mask);
@@ -145,12 +270,17 @@ static void test_raw_buffer(void) {
   raw_indio.currentmode = INDIO_BUFFER_SOFTWARE;
   raw_indio.active_scan_mask = &mask;
   for (mask = 1; mask < BIT(5); mask++) {
-    size_t bytes = 0;
+    size_t bytes = 0, largest = 0;
     for (bit = 0; bit < 5; bit++) {
       size_t width = bit == 3 ? 4 : 2;
-      if ((mask & BIT(bit)) != 0)
+      if ((mask & BIT(bit)) != 0) {
         bytes = ALIGN(bytes, width) + width;
+        largest = max(largest, width);
+      }
     }
+    bytes = ALIGN(bytes, largest);
+    if (mask == BIT(5) - 1)
+      assert(bytes == 16);
     for (with_timestamp = 0; with_timestamp < 2; with_timestamp++) {
       raw_indio.scan_timestamp = with_timestamp;
       raw_indio.scan_bytes = with_timestamp ? ALIGN(bytes, 8) + 8 : bytes;
@@ -161,7 +291,7 @@ static void test_raw_buffer(void) {
                                  &val, &val2, IIO_CHAN_INFO_SCALE) == IIO_VAL_INT_PLUS_NANO);
   assert(val == 0 && val2 == 4788403);
   raw_indio.scan_bytes = 25;
-  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -EINVAL);
+  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -EOVERFLOW);
   raw_indio.active_scan_mask = NULL;
   assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -EINVAL);
   raw_indio.currentmode = INDIO_DIRECT_MODE;
@@ -174,7 +304,18 @@ static void test_raw_buffer(void) {
 
 /* These unrelated interfaces are linked because sanitizer metadata retains
  * static channel/sysfs descriptors. They are never exercised by this test. */
-int ssf_mems_protocol_get_features(struct serdev_device *s, struct ssf_mems_sensor_data *out) { abort(); }
+int ssf_mems_protocol_get_features(struct serdev_device *s,
+                                    struct ssf_mems_sensor_data *out) {
+  assert(s == sensor.serdev);
+  mutex_lock(&sensor.protocol.lock);
+  if (!sensor.protocol.valid) {
+    mutex_unlock(&sensor.protocol.lock);
+    return -ENODATA;
+  }
+  *out = sensor.protocol.features;
+  mutex_unlock(&sensor.protocol.lock);
+  return 0;
+}
 int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *d, enum ssf_mems_baudrate *b) { abort(); }
 int ssf_mems_acquisition_set_baudrate(struct ssf_mems_xyzs_data *d, enum ssf_mems_baudrate b) { abort(); }
 int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *d,
@@ -501,28 +642,66 @@ static void test_raw_status_attributes(void) {
   indio.private = NULL;
 }
 
+/* 验证公共字段描述没有改变通道顺序、符号和规范单位。 */
+static void test_feature_channels(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  unsigned int bit;
+  int value, value2;
+
+  assert(ssf_mems_sensor_field_desc(SSF_MEMS_FIELD_NONE) == NULL);
+  assert(ssf_mems_sensor_field_desc(SSF_MEMS_FIELD_MAX) == NULL);
+  assert(ssf_mems_sensor_field_desc(-1) == NULL);
+  indio.private = &state;
+  sensor.protocol.valid = true;
+  sensor.protocol.features = sample;
+  assert(SSF_MEMS_IIO_FEATURE_MAX == 29);
+  for (bit = 0; bit < 29; bit++) {
+    const struct iio_chan_spec *chan = &ssf_mems_iio_channels[bit];
+    int expected = bit == 6 ? -321 : bit == 28 ? 7 : bit + 1;
+    int format, scale1 = 0, scale2;
+
+    assert(chan->scan_index == (int)bit && chan->address == bit);
+    assert(chan->scan_type.storagebits == (bit == 28 ? 8 : 16));
+    assert(chan->scan_type.sign == (bit == 6 ? 's' : 'u'));
+    assert(ssf_mems_iio_read_raw(&indio, chan, &value, &value2,
+                                IIO_CHAN_INFO_RAW) == IIO_VAL_INT);
+    assert(value == expected);
+    if (bit == 0 || bit == 2 || bit == 4 || (bit >= 7 && bit <= 15)) {
+      format = IIO_VAL_INT_PLUS_NANO;
+      scale2 = 98066500;
+    } else if (bit == 1 || bit == 3 || bit == 5 || (bit >= 19 && bit <= 21)) {
+      format = IIO_VAL_INT_PLUS_MICRO;
+      scale2 = 10;
+    } else if (bit == 6 || bit == 25 || bit == 28) {
+      format = IIO_VAL_INT;
+      scale1 = bit == 6 ? 10 : 1;
+      scale2 = 0;
+    } else {
+      format = IIO_VAL_INT_PLUS_MICRO;
+      scale2 = bit == 26 ? 100000 : 10000;
+    }
+    assert(ssf_mems_iio_read_scale(chan, &value, &value2) == format);
+    assert(value == scale1 && value2 == scale2);
+  }
+  sensor.protocol.valid = false;
+  assert(ssf_mems_iio_read_raw(&indio, &ssf_mems_iio_channels[0],
+                              &value, &value2, IIO_CHAN_INFO_RAW) == -ENODATA);
+  indio.private = NULL;
+}
+
 int main(void) {
   pthread_t producer, controller;
-  size_t i;
 
+  test_registration();
   test_configuration_attributes();
   test_acquisition_controls();
   test_poll_controls();
   test_firmware_attributes();
   test_raw_status_attributes();
-  memset(&sample, 0, sizeof(sample));
-  for (i = 0; i < SSF_MEMS_IIO_FEATURE_MAX; i++) {
-    const struct ssf_mems_iio_feature_desc *desc = &ssf_mems_iio_feature_descs[i];
-    if (desc->width == 2) {
-      u16 value = 0x1234;
-      memcpy((u8 *)&sample + desc->offset, &value, sizeof(value));
-    }
-  }
-  sample.temperature_x100 = -321;
-  sample.startup_flags = 7;
   sensor.indio_dev = &indio;
   mutex_init(&sensor.protocol.lock);
   mutex_init(&indio.mlock);
+  test_feature_channels();
   configure_buffer(4);
   memset(&sensor.protocol.features, 0xa5, sizeof(sensor.protocol.features));
   struct ssf_mems_sensor_data cached_before = sensor.protocol.features;

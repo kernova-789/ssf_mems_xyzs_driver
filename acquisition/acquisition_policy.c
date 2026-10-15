@@ -1,42 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "acquisition_policy.h"
+#include "model/sensor_fields.h"
 
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-/* 比较两份单轴特征。
- * 返回：true 相同，false 不同。
- */
-static bool ssf_mems_axis_equal(const struct ssf_mems_axis_features *a,
-                                const struct ssf_mems_axis_features *b) {
-  return a->high_freq_acc_rms_x100 == b->high_freq_acc_rms_x100 &&
-         a->low_freq_velocity_rms_x100 == b->low_freq_velocity_rms_x100 &&
-         a->acc_peak_to_peak_x100 == b->acc_peak_to_peak_x100 &&
-         a->acc_peak_x100 == b->acc_peak_x100 &&
-         a->acc_rms_x100 == b->acc_rms_x100 &&
-         a->kurtosis_x100 == b->kurtosis_x100 &&
-         a->velocity_rms_x100 == b->velocity_rms_x100;
-}
-
 /* 比较两份完整特征。
  * 返回：true 相同，false 不同。
- * 只比较字段，不比较结构体填充字节。
+ * 从公共字段清单生成比较，不比较结构体填充字节。
  */
 static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
                                   const struct ssf_mems_sensor_data *b) {
-  return ssf_mems_axis_equal(&a->x, &b->x) &&
-         ssf_mems_axis_equal(&a->y, &b->y) &&
-         ssf_mems_axis_equal(&a->z, &b->z) &&
-         a->temperature_x100 == b->temperature_x100 &&
-         a->sound.rms_db_x100 == b->sound.rms_db_x100 &&
-         a->sound.peak_db_x100 == b->sound.peak_db_x100 &&
-         a->sound.peak_to_peak_db_x100 == b->sound.peak_to_peak_db_x100 &&
-         a->zero_crossing_rate_percent == b->zero_crossing_rate_percent &&
-         a->spectral_centroid_hz_x10 == b->spectral_centroid_hz_x10 &&
-         a->spectral_flux_x100 == b->spectral_flux_x100 &&
-         a->startup_flags == b->startup_flags;
+#define SSF_MEMS_FIELD_EQUAL(_name, _member, _scale) && (a->_member == b->_member)
+  return true SSF_MEMS_SENSOR_FIELDS(SSF_MEMS_FIELD_EQUAL);
+#undef SSF_MEMS_FIELD_EQUAL
 }
 
 /* 清空本轮轮询统计。
@@ -136,6 +115,7 @@ void ssf_mems_acquisition_policy_sample(
     const struct ssf_mems_sensor_data *sample, unsigned int read_ms,
     unsigned long now) {
   bool probe_due = time_after_eq(now, policy->next_probe);
+  bool changed = false;
 
   ssf_mems_acquisition_policy_contact(policy, now);
   if (policy->config.mode == SSF_MEMS_POLL_FIXED)
@@ -143,7 +123,8 @@ void ssf_mems_acquisition_policy_sample(
   policy->max_read_ms = max(policy->max_read_ms, read_ms);
   if (policy->have_previous == true) {
     policy->comparisons++;
-    if (ssf_mems_sample_equal(&policy->previous, sample) == true)
+    changed = !ssf_mems_sample_equal(&policy->previous, sample);
+    if (changed == false)
       policy->repeats++;
   }
   policy->previous = *sample;
@@ -163,9 +144,12 @@ void ssf_mems_acquisition_policy_sample(
       policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
     return;
   }
-  /* 定期试探不清空未完成的统计，长周期和交替采集也能积满窗口。 */
+  /* 只有本轮有变化且当前窗口重复率低时才试探，避免与重复减速相冲突。
+   * 不清空未完成的统计，长周期和交替采集也能积满窗口。 */
   if (probe_due == true) {
-    if (policy->max_read_ms <= policy->interval_ms / 2U)
+    if (changed == true &&
+        policy->repeats * 100U < policy->comparisons * 10U &&
+        policy->max_read_ms <= policy->interval_ms / 2U)
       ssf_mems_poll_faster(policy);
     policy->next_probe = now + msecs_to_jiffies(SSF_MEMS_POLL_PROBE_MS);
   }

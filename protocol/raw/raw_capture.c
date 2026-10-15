@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include "raw_capture.h"
-#include "serial_transport.h"
+#include "raw/raw_capture.h"
+#include "transport/serial_transport.h"
 
 #include "core.h"
-#include "modbus.h"
-#include "modbus_receive.h"
-#include "modbus_request.h"
-#include "modbus_table.h"
+#include "modbus/modbus.h"
+#include "modbus/modbus_receive.h"
+#include "modbus/modbus_request.h"
+#include "model/modbus_table.h"
 
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -255,7 +255,7 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
     ret = -EPROTO;
     goto out;
   }
-  /* 手册允许索引 9，但现行定长原始采集仅验证了 0..8，见 RAW_CAPTURE.md。 */
+  /* 定长采样率范围由型号表限定，当前手册包含索引 9。 */
   if (sampling_index > SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX) {
     ret = -EOPNOTSUPP;
     goto out;

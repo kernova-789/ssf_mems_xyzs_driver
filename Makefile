@@ -2,15 +2,15 @@
 
 obj-m += ssf_mems.o
 ssf_mems-y += core/core.o
-ssf_mems-y += protocol/modbus.o
-ssf_mems-y += protocol/modbus_table.o
-ssf_mems-y += protocol/serial_transport.o
-ssf_mems-y += protocol/modbus_receive.o
-ssf_mems-y += protocol/modbus_request.o
+ssf_mems-y += protocol/modbus/modbus.o
+ssf_mems-y += protocol/model/modbus_table.o
+ssf_mems-y += protocol/transport/serial_transport.o
+ssf_mems-y += protocol/modbus/modbus_receive.o
+ssf_mems-y += protocol/modbus/modbus_request.o
 ssf_mems-y += protocol/protocol.o
-ssf_mems-y += protocol/raw_stream.o
-ssf_mems-y += protocol/raw_capture.o
-ssf_mems-y += protocol/ota.o
+ssf_mems-y += protocol/raw/raw_stream.o
+ssf_mems-y += protocol/raw/raw_capture.o
+ssf_mems-y += protocol/firmware/ota.o
 ssf_mems-y += iio/ssf_mems_iio.o
 ssf_mems-y += acquisition/ssf_mems_acquisition.o
 ssf_mems-y += acquisition/acquisition_policy.o

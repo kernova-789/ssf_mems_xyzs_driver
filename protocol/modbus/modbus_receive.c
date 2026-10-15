@@ -1,14 +1,13 @@
-#include "modbus_receive.h"
-#include "serial_transport.h"
+#include "modbus/modbus_receive.h"
+#include "transport/serial_transport.h"
 #include "core.h"
-#include "modbus.h"
-#include "modbus_table.h"
+#include "modbus/modbus.h"
+#include "model/modbus_table.h"
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
-#include <linux/slab.h>
 #include <linux/string.h>
 
 /* 取出接收队列中的字节并逐个解析。
@@ -16,11 +15,6 @@
  * 只由接收工作项调用。
  */
 static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev);
-/* 释放候选帧缓冲区并归还槽位。
- * 返回：无。
- */
-static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot);
-
 /* 计算半帧的超时长度。
  * 返回：超时 tick 数。
  * 按最长帧传输时间加余量计算。
@@ -43,7 +37,6 @@ static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   unsigned long expiry = ssf_mems_rx_expiry_ticks(data);
   unsigned long now = jiffies;
   bool expired;
-  int i;
 
   mutex_lock(&rx->parse_lock);
   spin_lock_irqsave(&rx->fifo_lock, flags);
@@ -58,10 +51,8 @@ static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   if (expired == false)
     mod_delayed_work(system_wq, &rx->expiry_work, expiry);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
-  if (expired == true) {
-    for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++)
-      ssf_mems_rx_free_slot(&rx->frame[i]);
-  }
+  if (expired == true)
+    rx->frame_used = 0;
   mutex_unlock(&rx->parse_lock);
 }
 
@@ -77,47 +68,6 @@ static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
   ssf_mems_modbus_receive_drain(data->serdev);
 }
 
-/* 检查候选帧槽位是否被占用。
- * 返回：true 已占用，false 空闲。
- */
-static bool ssf_mems_rx_slot_is_used(const struct ssf_mems_frame_slot *slot) {
-  return atomic_read(&slot->in_use) == SSF_MEMS_FRAME_SLOT_USED;
-}
-
-/* 申请一个空闲候选帧槽位。
- * 返回：槽位指针，没有空位时为 NULL。
- */
-static struct ssf_mems_frame_slot *
-ssf_mems_rx_alloc_slot(struct ssf_mems_xyzs_data *data) {
-  int i;
-
-  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++) {
-    struct ssf_mems_frame_slot *slot = &data->modbus_rx.frame[i];
-
-    if (atomic_cmpxchg(&slot->in_use, SSF_MEMS_FRAME_SLOT_FREE,
-                       SSF_MEMS_FRAME_SLOT_USED) == SSF_MEMS_FRAME_SLOT_FREE)
-      return slot;
-  }
-  return NULL;
-}
-
-/* 释放候选帧缓冲区并归还槽位。
- * 返回：无。
- */
-static void ssf_mems_rx_free_slot(struct ssf_mems_frame_slot *slot) {
-  kfree(slot->data);
-  slot->data = NULL;
-  slot->data_len = 0;
-  slot->data_pos = 0;
-  slot->frame_len = 0;
-  slot->state = SSF_MEMS_RX_IDLE;
-  slot->slave_id = 0;
-  slot->function = 0;
-  slot->frame_desc = NULL;
-  slot->started = 0;
-  atomic_set(&slot->in_use, SSF_MEMS_FRAME_SLOT_FREE);
-}
-
 /* 初始化接收队列并注册完整帧回调。
  * 返回：0 成功，-EINVAL 参数无效，其他负数为分配错误。
  */
@@ -125,7 +75,6 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
                                ssf_mems_frame_handler_t handler, void *context) {
   struct ssf_mems_modbus_receive_state *rx;
   int ret;
-  int i;
 
   if (data == NULL || handler == NULL)
     return -EINVAL;
@@ -139,11 +88,7 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   rx->handler_context = NULL;
   INIT_WORK(&rx->work, ssf_mems_modbus_rx_workfn);
   INIT_DELAYED_WORK(&rx->expiry_work, ssf_mems_rx_expiry_workfn);
-  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++) {
-    memset(&rx->frame[i], 0, sizeof(rx->frame[i]));
-    rx->frame[i].state = SSF_MEMS_RX_IDLE;
-    atomic_set(&rx->frame[i].in_use, SSF_MEMS_FRAME_SLOT_FREE);
-  }
+  rx->frame_used = 0;
 
   ret = kfifo_alloc(&rx->fifo, SSF_MEMS_RX_FIFO_SIZE, GFP_KERNEL);
   if (ret != 0)
@@ -154,14 +99,13 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
   return 0;
 }
 
-/* 清空接收队列和未完成的候选帧。
+/* 清空接收队列和未完成的解析窗口。
  * 返回：无。
  * 清理期间收到的字节会丢弃，调用时不能持请求锁。
  */
 void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
-  int i;
 
   if (data == NULL)
     return;
@@ -182,8 +126,7 @@ void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   spin_lock_irqsave(&rx->fifo_lock, flags);
   kfifo_reset(&rx->fifo);
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
-  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++)
-    ssf_mems_rx_free_slot(&rx->frame[i]);
+  rx->frame_used = 0;
   mutex_unlock(&rx->parse_lock);
 
   spin_lock_irqsave(&rx->fifo_lock, flags);
@@ -191,14 +134,13 @@ void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
 }
 
-/* 关闭接收并释放队列和候选帧。
+/* 关闭接收、释放队列并清空解析窗口。
  * 返回：无。
  * 先停止接收工作项，再释放资源。
  */
 void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
-  int i;
 
   if (data == NULL)
     return;
@@ -212,8 +154,7 @@ void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
   mutex_lock(&rx->parse_lock);
   rx->handler = NULL;
   rx->handler_context = NULL;
-  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++)
-    ssf_mems_rx_free_slot(&rx->frame[i]);
+  rx->frame_used = 0;
   kfifo_free(&rx->fifo);
   mutex_unlock(&rx->parse_lock);
 }
@@ -252,214 +193,94 @@ void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
   spin_unlock_irqrestore(&rx->fifo_lock, flags);
 }
 
-/* 初始化一个候选帧。
- * 返回：无。
+/* 判断窗口前缀的完整帧长度。
+ * 返回：正数为帧长，0 等待帧头，负数为无效帧头。
  */
-static void ssf_mems_rx_init_candidate(struct ssf_mems_frame_slot *slot, u8 slave_id) {
-  slot->data = NULL;
-  slot->data_len = 0;
-  slot->data_pos = 0;
-  slot->frame_len = 0;
-  slot->state = SSF_MEMS_RX_FUNC;
-  slot->slave_id = slave_id;
-  slot->function = 0;
-  slot->frame_desc = NULL;
-  slot->started = jiffies;
-}
+static int ssf_mems_rx_candidate_len(const u8 *buf, size_t available) {
+  const struct ssf_modbus_frame_desc *desc;
 
-/* 向候选帧追加一个字节。
- * 返回：0 成功，-EINVAL 无缓冲区，-ENOSPC 缓冲区已满。
- */
-static int ssf_mems_rx_append_byte(struct ssf_mems_frame_slot *slot, u8 byte) {
-  if (slot->data == NULL)
-    return -EINVAL;
-  if (slot->data_pos >= slot->data_len)
-    return -ENOSPC;
-  slot->data[slot->data_pos++] = byte;
-  return 0;
-}
-
-/* 为候选帧分配缓冲区。
- * 返回：0 成功，-ENOMEM 分配失败。
- */
-static int ssf_mems_rx_alloc_frame(struct ssf_mems_frame_slot *slot, size_t len) {
-  slot->data = kzalloc(len, GFP_KERNEL);
-  if (slot->data == NULL)
-    return -ENOMEM;
-  slot->data_len = len;
-  slot->frame_len = len;
-  slot->data_pos = 0;
-  return 0;
-}
-
-/* 根据功能码准备候选帧的接收格式。
- * 返回：0 成功，负数为格式、分配或缓冲区错误。
- */
-static int ssf_mems_rx_set_function(struct ssf_mems_frame_slot *slot, u8 function) {
-  int ret;
-  int len;
-
-  slot->frame_desc = ssf_mems_modbus_find_rx_frame(function);
-  if (slot->frame_desc == NULL)
+  if (available < 2)
+    return 0;
+  desc = ssf_mems_modbus_find_rx_frame(buf[1]);
+  if (desc == NULL)
     return -EOPNOTSUPP;
-  slot->function = function;
-
-  if (slot->frame_desc->rx_bytes_per_reg != 0) {
-    if (slot->frame_desc->rx_byte_count_offset != 2)
-      return -EOPNOTSUPP;
-  } else {
-    len = ssf_mems_modbus_rx_frame_len(slot->frame_desc, 0);
-    if (len < 0)
-      return len;
-    ret = ssf_mems_rx_alloc_frame(slot, len);
-    if (ret != 0)
-      return ret;
-    ret = ssf_mems_rx_append_byte(slot, slot->slave_id);
-    if (ret != 0)
-      return ret;
-    ret = ssf_mems_rx_append_byte(slot, slot->function);
-    if (ret != 0)
-      return ret;
+  if (desc->rx_bytes_per_reg != 0) {
+    if (available <= desc->rx_byte_count_offset)
+      return 0;
+    return ssf_mems_modbus_rx_frame_len(desc, buf[desc->rx_byte_count_offset]);
   }
-
-  slot->state = SSF_MEMS_RX_DATA;
-  return 0;
+  return ssf_mems_modbus_rx_frame_len(desc, 0);
 }
 
-/* 根据字节数为读取应答准备缓冲区。
- * 返回：0 成功，负数为长度、分配或缓冲区错误。
- */
-static int ssf_mems_rx_start_read_frame(struct ssf_mems_frame_slot *slot, u8 byte_count) {
-  int len;
-  int ret;
-
-  len = ssf_mems_modbus_rx_frame_len(slot->frame_desc, byte_count);
-  if (len < 0)
-    return len;
-  ret = ssf_mems_rx_alloc_frame(slot, len);
-  if (ret != 0)
-    return ret;
-  ret = ssf_mems_rx_append_byte(slot, slot->slave_id);
-  if (ret != 0)
-    return ret;
-  ret = ssf_mems_rx_append_byte(slot, slot->function);
-  if (ret != 0)
-    return ret;
-  return ssf_mems_rx_append_byte(slot, byte_count);
-}
-
-/* 校验完整帧并交给回调处理。
+/* 校验完整候选帧并交给回调处理。
  * 返回：无。
- * 回调结束后释放槽位，帧数据只在回调期间有效。
+ * 帧数据仅在回调期间有效。
  */
 static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
-                                struct ssf_mems_frame_slot *slot) {
-  int ret;
+                                const u8 *buf, size_t len) {
+  int ret = ssf_mems_modbus_check_crc(buf, len);
 
-  if (slot->data == NULL || slot->data_pos != slot->frame_len) {
-    ssf_mems_rx_free_slot(slot);
-    return;
-  }
-  ret = ssf_mems_modbus_check_crc(slot->data, slot->data_len);
   if (ret != 0) {
     dev_err_ratelimited(&data->serdev->dev, "invalid frame CRC/length: %d\n", ret);
-    ssf_mems_rx_free_slot(slot);
     return;
   }
-  ret = data->modbus_rx.handler(data->modbus_rx.handler_context,
-                               slot->data, slot->data_len);
+  ret = data->modbus_rx.handler(data->modbus_rx.handler_context, buf, len);
   if (ret < 0)
     dev_err(&data->serdev->dev, "frame handler failed: %d\n", ret);
-  ssf_mems_rx_free_slot(slot);
 }
 
-/* 用一个字节推进候选帧的解析。
+/* 解析普通 Modbus 字节并保留所有可能的帧头。
  * 返回：无。
- * 解析失败时释放槽位。
+ * 窗口最多一帧长；各帧头独立计时，伪帧头不会挤掉合法帧。
  */
-static void ssf_mems_rx_process_candidate(struct ssf_mems_xyzs_data *data,
-                                         struct ssf_mems_frame_slot *slot, u8 byte) {
-  int ret;
+static void ssf_mems_rx_process_modbus(struct ssf_mems_xyzs_data *data, u8 byte) {
+  struct ssf_mems_modbus_receive_state *rx = &data->modbus_rx;
+  size_t offset, keep;
+  unsigned long expiry = ssf_mems_rx_expiry_ticks(data);
+  int len;
 
-  switch (slot->state) {
-  case SSF_MEMS_RX_FUNC:
-    ret = ssf_mems_rx_set_function(slot, byte);
-    if (ret != 0)
-      ssf_mems_rx_free_slot(slot);
-    break;
-  case SSF_MEMS_RX_DATA:
-    if (slot->data == NULL)
-      ret = ssf_mems_rx_start_read_frame(slot, byte);
-    else
-      ret = ssf_mems_rx_append_byte(slot, byte);
-    if (ret != 0) {
-      ssf_mems_rx_free_slot(slot);
-      break;
+  if (rx->frame_used == sizeof(rx->frame)) {
+    rx->frame_used--;
+    memmove(rx->frame, rx->frame + 1, rx->frame_used);
+    memmove(rx->frame_started, rx->frame_started + 1,
+            rx->frame_used * sizeof(rx->frame_started[0]));
+  }
+  rx->frame_started[rx->frame_used] = jiffies;
+  rx->frame[rx->frame_used++] = byte;
+  keep = rx->frame_used;
+  for (offset = 0; offset < rx->frame_used; offset++) {
+    size_t available = rx->frame_used - offset;
+
+    if (rx->frame[offset] != data->slave_id ||
+        time_after_eq(jiffies, rx->frame_started[offset] + expiry))
+      continue;
+    len = ssf_mems_rx_candidate_len(rx->frame + offset, available);
+    if (len == 0 || (len > 0 && available < len)) {
+      if (offset < keep)
+        keep = offset;
+    } else if (len > 0 && available == len) {
+      ssf_mems_rx_complete(data, rx->frame + offset, available);
     }
-    if (slot->data_pos == slot->frame_len - SSF_MEMS_MODBUS_CRC_LEN)
-      slot->state = SSF_MEMS_RX_CRC;
-    break;
-  case SSF_MEMS_RX_CRC:
-    ret = ssf_mems_rx_append_byte(slot, byte);
-    if (ret != 0) {
-      ssf_mems_rx_free_slot(slot);
-      break;
-    }
-    if (slot->data_pos == slot->frame_len) {
-      slot->state = SSF_MEMS_RX_DONE;
-      ssf_mems_rx_complete(data, slot);
-    }
-    break;
-  default:
-    ssf_mems_rx_free_slot(slot);
-    break;
+  }
+  /* 仅删除已完成、过期或不合法的前缀，保留仍有效的外层帧。 */
+  if (keep != 0) {
+    rx->frame_used -= keep;
+    memmove(rx->frame, rx->frame + keep, rx->frame_used);
+    memmove(rx->frame_started, rx->frame_started + keep,
+            rx->frame_used * sizeof(rx->frame_started[0]));
   }
 }
 
-/* 遇到本机地址时创建候选帧。
+/* 按总线模式把一个字节交给对应解析器。
  * 返回：无。
- */
-static void ssf_mems_rx_create_candidate(struct ssf_mems_xyzs_data *data, u8 byte) {
-  struct ssf_mems_frame_slot *slot;
-
-  if (byte != data->slave_id)
-    return;
-  slot = ssf_mems_rx_alloc_slot(data);
-  if (slot == NULL) {
-    dev_warn_ratelimited(&data->serdev->dev, "no free frame slot for new candidate\n");
-    return;
-  }
-  ssf_mems_rx_init_candidate(slot, byte);
-}
-
-/* 解析一个接收字节。
- * 返回：无。
- * 原始数据和升级应答按当前模式分流。
  */
 static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
-  int i;
-
-  if (READ_ONCE(data->protocol.mode) == SSF_MEMS_LINK_OTA) {
+  if (READ_ONCE(data->protocol.mode) == SSF_MEMS_LINK_OTA)
     ssf_mems_ota_receive_byte(data, byte);
-    return;
-  }
-
-  if (READ_ONCE(data->raw.active) == true) {
+  else if (READ_ONCE(data->raw.active) == true)
     ssf_mems_raw_receive_byte(data, byte);
-    return;
-  }
-
-  for (i = 0; i < SSF_MEMS_FRAME_SLOT_NUM; i++) {
-    struct ssf_mems_frame_slot *slot = &data->modbus_rx.frame[i];
-
-    if (ssf_mems_rx_slot_is_used(slot) == false)
-      continue;
-    if (time_after_eq(jiffies, slot->started + ssf_mems_rx_expiry_ticks(data)) == true)
-      ssf_mems_rx_free_slot(slot);
-    else
-      ssf_mems_rx_process_candidate(data, slot, byte);
-  }
-  ssf_mems_rx_create_candidate(data, byte);
+  else
+    ssf_mems_rx_process_modbus(data, byte);
 }
 
 /* 把串口字节放入接收队列。

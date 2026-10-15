@@ -1,6 +1,6 @@
 #pragma once
 
-#include "modbus_types.h"
+#include "modbus/modbus_types.h"
 
 /* 本模块只提供无设备状态的帧编解码；请求归属信息由调用者传入。 */
 /* 计算一段数据的 Modbus CRC16。

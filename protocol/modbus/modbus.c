@@ -1,5 +1,5 @@
-#include "modbus.h"
-#include "modbus_table.h"
+#include "modbus/modbus.h"
+#include "model/modbus_table.h"
 
 #include <linux/errno.h>
 #include <linux/kernel.h>

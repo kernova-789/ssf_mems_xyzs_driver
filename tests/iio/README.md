@@ -24,7 +24,7 @@ scheduling is covered by `tests/acquisition`, not by this substitute.
 
 增加原始 XYZ、包号和包内序号全部 31 种非空字段子集测试，各自覆盖带/不带
 时间戳的扫描对齐；同时验证原始 scale、buffer 未启用及错误参数处理。
-只读统计属性测试分别核对有效采集、停止排空、首包等待、停止次数和业务模式。
+只读统计属性测试分别核对有效采集、停止排空、首包等待和业务模式。
 # Polling attributes
 
 The production IIO sysfs handlers are tested for fixed/adaptive mode strings,
@@ -34,3 +34,13 @@ Range validation and scheduling use the production acquisition tests.
 
 可选采样率和波特率列表由生产型号表生成，测试验证其输出及属性绑定。
 发布并发测试同时断言 IIO 推送不会修改协议特征缓存，避免恢复重复缓存写入。
+独立数值夹具核对全部 29 个通道的顺序、符号和单位，避免测试仅重复公共字段表。
+注册测试覆盖两个设备各阶段失败后的清理，以及重复注册保护。
+
+扫描长度按目标内核 `iio_compute_scan_bytes()` 的规则计算：各字段先按宽度对齐，
+整条记录末尾再按最大字段宽度补齐。全部特征不带时间戳为 58 字节、带时间戳为
+72 字节；原始五个数据字段不带时间戳为 16 字节、带时间戳为 24 字节。
+31 种原始字段子集均检查尾部补齐。
+
+注册测试覆盖特征/原始两设备的分配、buffer 分配和注册失败清理，以及重复注册保护。
+独立的 29 通道数值夹具检查公共字段 schema 重构后的通道顺序、符号和单位比例。

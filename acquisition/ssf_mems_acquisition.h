@@ -51,13 +51,13 @@ enum ssf_mems_acquisition_phase {
   SSF_MEMS_ACQ_STOPPED, /* 线程已退出。 */
 };
 
-/* 每设备的后台采集上下文；普通状态由 lock 保护，等待条件用 READ_ONCE 读取。 */
+/* 后台采集上下文；事务由 lock 串行化，只读快照用 status_lock，等待条件用 READ_ONCE。 */
 struct ssf_mems_acquisition_state {
   struct task_struct *thread; /* 采集内核线程，未启动/已退出时为 NULL。 */
   wait_queue_head_t waitq; /* 休眠、配置变化、重连和停止的唤醒队列。 */
   /* 串行化采集流程和 IIO 波特率操作；定时休眠期间不持锁。 */
   struct mutex lock;
-  struct mutex status_lock; /* 只保护在线、样本年龄和生效周期，不跨越串口等待。 */
+  struct mutex status_lock; /* 保护只读状态和主机配置，不跨越串口等待。 */
   bool stopping; /* 正在卸载，不再开始新采集。 */
   bool reconnect; /* 下轮需要重新匹配并验证设备。 */
   bool online; /* 最近连接验证成功，允许采集和配置请求。 */
@@ -65,6 +65,7 @@ struct ssf_mems_acquisition_state {
   bool have_sample; /* 是否已有可计算年龄的完整特征样本。 */
   enum ssf_mems_acquisition_phase phase; /* 当前连接/采集阶段。 */
   enum ssf_mems_baudrate target_baudrate; /* 启动配置/手动设置的目标，不被扫描覆盖。 */
+  u16 target_sampling_rate_index; /* 初次采用型号默认值，成功手动设置后用于重连。 */
   unsigned int retry_ms; /* 下次连接失败后的退避时长，ms。 */
   unsigned long last_sample; /* 最近成功获取特征的 jiffies。 */
   struct ssf_mems_acquisition_policy policy; /* 轮询周期和断线判定统计。 */
@@ -125,14 +126,14 @@ int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
                                      u16 *value);
 /* 写入一个传感器配置项。
  * 返回：0 成功，负数为参数、设备状态或通信错误。
- * 设备上线后才发送请求。
+ * 设备上线后才发送请求；确认成功的采样率保留为本次运行的重连目标。
  */
 int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
                                       enum ssf_mems_sensor_setting setting,
                                       u16 value);
 /* 复制当前采集配置。
  * 返回：0 成功，-EINVAL 参数无效，-ENODEV 正在停止。
- * 可能等待在途定长采集窗口完成。
+ * 只取短状态锁，不等待在途采集或升级。
  */
 int ssf_mems_acquisition_get_config(
     struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_config *config);

@@ -9,8 +9,8 @@
 #include "core.h"
 #include "ssf_mems_iio.h"
 #include "protocol.h"
-#include "modbus_receive.h"
-#include "modbus_request.h"
+#include "modbus/modbus_receive.h"
+#include "modbus/modbus_request.h"
 #include "ssf_mems_acquisition.h"
 
 /* 把串口收到的字节放入接收队列。

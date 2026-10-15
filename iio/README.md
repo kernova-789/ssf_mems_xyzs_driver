@@ -6,10 +6,9 @@
 calls `ssf_mems_iio_register()` after the serdev transport is ready.
 
 The 40001–40029 feature block is exposed in direct and software-buffer modes.
-Acceleration values use `IIO_ACCEL`, values in mm/s use `IIO_VELOCITY`, and
-signed temperature uses `IIO_TEMP`. The firmware computes sound RMS/peak values
-after converting samples to dB, so these are named `IIO_COUNT` channels rather
-than pressure channels. Device-specific dimensionless/spectral fields use named
+Acceleration values use `IIO_ACCEL`, velocity uses `IIO_VELOCITY`, and
+signed temperature uses `IIO_TEMP`. Sound features are device-defined dB indicators exposed as named `IIO_COUNT`
+channels; they do not expose calibrated pressure in Pa. Device-specific dimensionless/spectral fields use named
 `IIO_INDEX` or `IIO_COUNT` channels.
 `*_raw` reads only copy the latest published feature snapshot and return
 `-ENODATA` before the first snapshot is available, during reconnect, or after
@@ -27,9 +26,9 @@ disabling a buffer or freeing its active scan mask cannot race with publication.
 Acquisition is stopped before unregistering the IIO device. Buffer callbacks
 must not acquire the acquisition mutex while holding `mlock`.
 
-Scale callbacks follow the firmware implementation: acceleration and velocity
-registers use a centi scale, temperature is a signed centi-degree value exposed
-in millidegrees Celsius, and sound dB values use a centi scale. Register 40026
+Scale callbacks convert the normalized cache to IIO units: acceleration uses
+0.0980665 m/s² per count, velocity uses 0.00001 m/s per count, temperature uses
+10 millidegrees Celsius per count, and sound dB values use 0.01 per count. Register 40026
 already contains whole percent, register 40027 contains Hz multiplied by 10,
 and register 40028 is the firmware's unitless spectral-difference sum multiplied
 by 100.
@@ -83,7 +82,8 @@ echo alternating > "$IIO/sensor_acquisition_mode"  # 原始约 2 s / 特征约 3
 ```
 
 这些属性只读写主机状态，不发送保存命令、不重启、不改变波特率或采样率。
-配置与采集共用 `acquisition.lock`；写入可能等待当前原始窗口（最长配置 60 s 加
+主机配置读取使用短状态锁，不等待串口事务；配置写入与采集共用 `acquisition.lock`，
+可能等待当前原始窗口（最长配置 60 s 加
 在途批次/恢复等待）收尾，返回后唤醒调度。模式/窗口变化后交替调度从新的特征窗口
 开始；同值写不重置窗口。两个窗口分别更新，多个属性写入不是一次原子事务。
 纯原始模式不再提供有效特征缓存；特征 buffer 可能仍存有切换前的旧记录，须按
@@ -127,7 +127,8 @@ cat "$IIO/sensor_poll_interval_ms"
 
 固定周期和自适应上下限分别保存，切换模式不会覆盖另一个模式的配置。进入自适应
 时从当前周期开始并限制到上下限；切回固定时使用保存的固定周期。自适应按 32 次
-相邻特征比较调整周期，30 秒定期试探不清空未完成统计；交替采集也保留学习结果。
+相邻特征比较调整周期；30 秒试探只在本次有变化、窗口重复率低且通信耗时有余量时提速，
+不清空未完成统计。交替采集保留学习结果，完全重复数据不会被定时试探反向加速。
 只修改非当前模式的参数不会打断当前轮询。
 
 写入与采集共用采集锁，可能等待在途原始窗口完整结束；当前模式的参数变化会唤醒
@@ -139,12 +140,12 @@ cat "$IIO/sensor_poll_interval_ms"
 
 特征设备新增 root 只写的 `sensor_firmware_update` 和只读的
 `sensor_firmware_update_status`。前者接受放在开发板 `/lib/firmware/` 下的 `.bin`
-简单文件名；后者返回阶段、已应答字节数/总字节数、错误码、重启后版本号和暂停标志。
+简单文件名（不含目录）；后者返回阶段、已应答字节数/总字节数、错误码、重启后版本号和暂停标志。
 升级写入为同步操作，状态读取使用独立短锁，不会因升级占用采集锁而等待。
 升级时暂停两种采集，成功后恢复；末包结果不确定时暂停自动通信。
 
-**必须先阅读 [镜像地址、总线限制和操作说明](../protocol/OTA.md)**。
-这不是对任意 bin 的通用烧录接口；目录内原有 bin 的链接地址不适合这套 OTA。
+**必须先阅读 [镜像地址、总线限制和操作说明](../protocol/firmware/OTA.md)**。
+必须使用匹配当前硬件和 Bootloader 的镜像；仓库中的 bin 属于其他传感器，当前没有适用镜像。
 
 ## Sensor feature register configuration
 
@@ -154,7 +155,8 @@ acquisition and baud-rate recovery. They return `-ENODATA` while offline:
 - `sensor_sampling_rate_index` (RW): register 40052, index 0 through 9.
 - `sensor_sampling_frequency` (RO): the configured frequency in Hz.
 - `sensor_sampling_rate_index_available` (RO): supported indices.
-- `sensor_sampling_length_index` (RO): register 40053, raw-data length index.
+- `sensor_sampling_length_index` (RO): register 40053, feature sampling-length index;
+  it does not set the finite raw batch size.
 - `sensor_parameter_switch` (RO): register 40070, complete switch word in hex.
 - `sensor_feature_enable` (RW): bits 15..10 of 40070, shifted down to 0..63.
   Bit 5/4/3 enables X/Y/Z high-frequency acceleration RMS; bit 2/1/0 enables
@@ -164,22 +166,22 @@ acquisition and baud-rate recovery. They return `-ENODATA` while offline:
 
 Sampling rate indices correspond to `533.34 888.9 1066.68 1333.35 2666.7 2963
 5333.4 8889 13333.5 26667` Hz. Writes use 0x06, skip unchanged register values,
-and read back the result. Automatic connection/reconnection selects the target
-baud rate (`current-speed`, or 9600 if missing/unreadable/unsupported), then sets sampling-rate index 6 (5333.4 Hz) before
-publishing samples. Matching values skip writes; configuration errors use the
-connection retry path. A manual sampling-rate change lasts until the next
-reconnection, which selects index 6 again. MEMS2.0 saves rate changes to Flash in
-`returnSampDataMode()`, so avoid rapidly toggling this setting. Feature enables
-are initialized to all on by that firmware at power-up and are not saved here.
+and read back the result. The first connection selects the model-table target
+baud rate (currently 128000) and sampling-rate index (currently 6, 5333.4 Hz).
+`current-speed` only supplies an initial matching hint. Matching values skip
+writes; configuration errors use the connection retry path. Successful manual
+baud and sampling-rate changes become reconnection targets until driver unload.
+Avoid rapidly toggling persistent device settings. The driver does not send an
+extra save command for sampling rate or feature enables; power-up behavior
+should be confirmed for the target device.
 Readback confirms the register value; a new calculation may take several seconds.
-After configuration, polling returns to its initial 1000 ms period and the old
-cache is invalidated until the next successful register read. That next read
+After configuration, polling clears its comparison history but retains the
+configured/learned period. The old cache is invalidated until the next successful register read. That next read
 can still contain the sensor's previous calculation.
 
 The existing `in_count6_startup_flags_raw` name is retained for compatibility,
-but MEMS2.0 publishes **motor run detection**, not acquisition enable state:
-each XYZ bit is set when the corresponding DC-removed acceleration peak is at
-least 0.06 g. Zero does not mean that measurement is disabled.
+and represents XYZ run-detection flags. Zero does not mean that measurement is
+disabled. Bits 0/1/2 correspond to X/Y/Z.
 
 See [tools/README.md](../tools/README.md#特征值长时间重复的排查) for a board test.
 
@@ -191,5 +193,10 @@ shim, so actual kernel buffer operations still require hardware verification.
 # 原始数据设备
 
 新增 `ssf_mems_xyzs_raw`，提供 XYZ、包号、包内序号及主机接收时间戳的独立
-buffer，保持特征设备原有布局不变。全部字段启用时扫描记录为 24 字节。
-配置与读取示例见[定长原始采集说明](../protocol/RAW_CAPTURE.md)。
+buffer，保持特征设备原有布局不变。全部数据字段和时间戳启用时为 24 字节；
+只启用全部数据字段、不启用时间戳时为 16 字节。
+配置与读取示例见[定长原始采集说明](../protocol/raw/RAW_CAPTURE.md)。
+
+成功设置的采样率会在本次驱动运行期间作为重连目标，卸载后恢复型号表默认值。
+主机模式、窗口与轮询配置读取使用短锁，不等待原始窗口或 OTA；写入继续串行化。
+特征字段/单位统一来自 `protocol/model/sensor_fields.h`，两设备共用缓冲区打包和注册辅助函数。

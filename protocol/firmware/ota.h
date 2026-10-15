@@ -9,7 +9,7 @@ struct ssf_mems_xyzs_data;
 
 #define SSF_MEMS_OTA_BLOCK_SIZE 256U /* 一包写入的固定载荷字节数。 */
 #define SSF_MEMS_OTA_FRAME_SIZE 263U /* 6 字节头 + 256 字节载荷 + 1 字节校验。 */
-#define SSF_MEMS_OTA_APP_ADDRESS 0x08020000U /* Bootloader 的应用区起点。 */
+#define SSF_MEMS_OTA_APP_ADDRESS 0x08020000U /* 升级镜像要求的应用区起点。 */
 #define SSF_MEMS_OTA_MAX_SIZE (256U * 1024U) /* 应用区/暂存区容量，字节。 */
 #define SSF_MEMS_OTA_NAME_SIZE 128U /* 文件名缓冲区容量，包含结尾 NUL。 */
 
@@ -19,7 +19,7 @@ enum ssf_mems_ota_stage {
   SSF_MEMS_OTA_LOADING,     /* 正在从 firmware 目录读取 bin。 */
   SSF_MEMS_OTA_WAITING,     /* 等待当前采集窗口结束。 */
   SSF_MEMS_OTA_CHECKING,    /* 确认普通通信和固件包计数。 */
-  SSF_MEMS_OTA_SENDING,     /* 逐包写入传感器暂存区。 */
+  SSF_MEMS_OTA_SENDING,     /* 逐包发送升级数据。 */
   SSF_MEMS_OTA_REBOOTING,   /* 末包已尝试发送，等待复制和重启。 */
   SSF_MEMS_OTA_VERIFYING,   /* 只读确认重启后的通信和版本号。 */
   SSF_MEMS_OTA_COMPLETE,   /* 所有包获得应答，重启后可通信。 */
@@ -45,7 +45,7 @@ struct ssf_mems_ota_state {
   struct ssf_mems_ota_status status; /* 最近一次升级状态。 */
   bool stopping;               /* 卸载后拒绝新升级并中断等待。 */
   bool pending;                /* 当前有一个包等待应答。 */
-  u8 reply[6];                 /* 固件回复：地址、0x41、下一包号，无 CRC。 */
+  u8 reply[6];                 /* 升级应答：地址、0x41、下一包号，无 CRC。 */
   size_t used;                 /* 已拼接的应答字节数。 */
   u32 next_packet;             /* 当前应答报告的下一包号。 */
 };

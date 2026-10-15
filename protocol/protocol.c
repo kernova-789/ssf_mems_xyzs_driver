@@ -1,10 +1,10 @@
 #include "protocol.h"
 #include "core.h"
-#include "modbus.h"
-#include "modbus_receive.h"
-#include "modbus_request.h"
-#include "modbus_table.h"
-#include "raw_capture.h"
+#include "modbus/modbus.h"
+#include "modbus/modbus_receive.h"
+#include "modbus/modbus_request.h"
+#include "model/modbus_table.h"
+#include "raw/raw_capture.h"
 
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -113,9 +113,16 @@ out:
  */
 int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   struct ssf_mems_protocol_state *state;
+  const char *bad_name;
+  int ret;
 
   if (data == NULL || data->serdev == NULL)
     return -EINVAL;
+  ret = ssf_mems_modbus_validate_tables(&bad_name);
+  if (ret != 0) {
+    dev_err(&data->serdev->dev, "invalid sensor table: %s\n", bad_name);
+    return ret;
+  }
   data->slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
   state = &data->protocol;
   state->baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
@@ -220,30 +227,32 @@ ssf_mems_protocol_decode_feature_range(u16 start_reg, const u16 *registers,
 
   for (i = 0; i < count; i++) {
     const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(start_reg + i);
+    const struct ssf_mems_sensor_field_desc *field;
     u16 stored;
     s64 value;
     u8 *dest;
 
-    if (reg == NULL || reg->feature_width == 0 || (reg->access & SSF_REG_READ) == 0)
+    if (reg == NULL || reg->feature_field == SSF_MEMS_FIELD_NONE || (reg->access & SSF_REG_READ) == 0)
       continue;
-    if (reg->feature_offset > sizeof(*result) ||
-        reg->feature_width > sizeof(*result) - reg->feature_offset)
+    field = ssf_mems_sensor_field_desc(reg->feature_field);
+    if (field == NULL || field->offset > sizeof(*result) ||
+        field->width > sizeof(*result) - field->offset)
       return -EINVAL;
 
     value = registers[i] & reg->value_mask;
     if (reg->type == SSF_REG_S16)
       value = (s16)value;
-    /* 表中比例统一到 sensor_data.h 的单位，上层无需知道固件原始倍率。 */
+    /* 按型号表比例统一到 sensor_data.h 的单位。 */
     value = (s64)value * (reg->feature_multiplier ? reg->feature_multiplier : 1U) /
             (reg->feature_divisor ? reg->feature_divisor : 1U);
-    dest = (u8 *)result + reg->feature_offset;
-    if (reg->feature_width == sizeof(u16)) {
+    dest = (u8 *)result + field->offset;
+    if (field->width == sizeof(u16)) {
       if (reg->type == SSF_REG_S16 ? value < -32768 || value > 32767 :
                                     value < 0 || value > 65535)
         return -ERANGE;
       stored = (u16)value;
       memcpy(dest, &stored, sizeof(stored));
-    } else if (reg->feature_width == sizeof(u8)) {
+    } else if (field->width == sizeof(u8)) {
       if (value < 0 || value > 255)
         return -ERANGE;
       *dest = value;
@@ -406,7 +415,7 @@ int ssf_mems_protocol_read_features(struct serdev_device *serdev,
       const struct ssf_reg_desc *reg =
           ssf_mems_modbus_find_reg(first->display_reg + count);
 
-      if (reg == NULL || reg->feature_width == 0 || (reg->access & SSF_REG_READ) == 0 ||
+      if (reg == NULL || reg->feature_field == SSF_MEMS_FIELD_NONE || (reg->access & SSF_REG_READ) == 0 ||
           reg->read_format != block->rx_format ||
           reg->protocol_addr != (u32)first->protocol_addr + count)
         break;
@@ -717,6 +726,18 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
     return ret;
 
   mutex_lock(&data->protocol.bus_lock);
+  /* 同值也读回确认，防止把主机缓存或未保存的暂存值当作传感器配置。 */
+  if (data->protocol.host_baudrate == ssf_mems_baudrate_to_value(baudrate) &&
+      ssf_mems_baudrate_to_value(data->protocol.baudrate) ==
+          ssf_mems_baudrate_to_value(baudrate)) {
+    ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
+    if (ret != 0)
+      goto out_unlock;
+    if (ssf_mems_baudrate_to_value(found) == ssf_mems_baudrate_to_value(baudrate)) {
+      data->protocol.baudrate = found;
+      goto out_unlock;
+    }
+  }
   dev_info(&serdev->dev,
            "baud change: host %u, requested %d; staging %u=%u\n",
            data->protocol.host_baudrate,

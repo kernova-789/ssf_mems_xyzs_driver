@@ -6,23 +6,26 @@ registers through IIO, and supports sensor baud-rate discovery and updates.
 
 Application-bin OTA is available through `sensor_firmware_update` and
 `sensor_firmware_update_status` on the feature IIO device. See
-[OTA requirements and board commands](protocol/OTA.md): the image must be linked
+[OTA requirements and board commands](protocol/firmware/OTA.md): the image must be linked
 at `0x08020000`, at most 256 KiB, and the RS485 bus must contain only the target
-sensor. The existing reference-tree bin has a different link address and is
-rejected. OTA has offline coverage and a target-kernel build, not a hardware
-flashing result.
+sensor. No matching update image is currently available; the reference-tree bin
+belongs to another sensor and is not used by the driver tests. OTA has synthetic
+offline coverage and a target-kernel build, not a hardware flashing result.
 
 ## Layout
 
 - `core/` — serdev probe/remove and shared device state.
-- `protocol/` — Modbus RTU framing, request matching, register map, feature
-  decoding, and baud-rate operations.
+- `protocol/` — sensor operations and the following protocol components:
+  `model/` for model tables/data, `modbus/` for RTU framing and requests,
+  `transport/` for serial I/O, `raw/` for finite capture, and `firmware/` for OTA.
+  See [protocol layout](protocol/README.md) and [model configuration](protocol/model/README.md).
 - `iio/` — IIO channel definitions, direct reads, registration, and IIO sysfs
   controls.
 - `acquisition/` — automatic startup, polling, adaptive timing, IIO sample
   publishing, and communication recovery.
 - `tests/protocol/` — userspace protocol tests with a Linux/serdev shim.
 - `tests/acquisition/` — deterministic acquisition policy and lifecycle tests.
+- `tests/iio/` — scan layout, attributes, registration and concurrent publication tests.
 - `tests/ota/` — application image validation, staged-Flash transfer and fault tests.
 - `tools/` — userspace IIO polling/printf test for the development board;
   see [tools/README.md](tools/README.md) for build and run instructions.
@@ -53,6 +56,14 @@ build output with:
 make clean KDIR=/path/to/linux/build
 ```
 
+The default `make` target also runs `modules_prepare` and copies the module to
+`INSTALL_DIR` (default `/home/u-yoimiya/nfs/`). Pass `INSTALL_DIR=/your/output`
+to change that destination. To build without copying, invoke Kbuild directly:
+
+```sh
+make -C /path/to/linux/build M="$PWD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
+```
+
 ## IIO interface
 
 After the serdev device binds, the driver registers an IIO device named
@@ -60,10 +71,12 @@ After the serdev device binds, the driver registers an IIO device named
 snapshot. The corresponding `*_scale` file converts the register's fixed-point
 value to the channel unit.
 
-The firmware encodings used by the channels are: acceleration and velocity
-values multiplied by 100, signed temperature multiplied by 100, sound features
-in dB multiplied by 100, zero-crossing rate in whole percent, spectral centroid
-in Hz multiplied by 10, and spectral flux multiplied by 100.
+The normalized feature cache stores acceleration in g ×100, velocity in mm/s ×100,
+temperature in °C ×100, sound in firmware-computed dB ×100, zero-crossing rate
+in whole percent, spectral centroid in Hz ×10, and spectral flux ×100.
+IIO scale converts acceleration to m/s², velocity to m/s, and temperature to
+millidegrees Celsius. Negative temperature behavior on the target device
+still requires confirmation; see [units and measurement limits](iio/ATTRIBUTES.md#12-单位与测量边界).
 
 The IIO device also provides:
 
@@ -71,7 +84,9 @@ The IIO device also provides:
   or write a numeric baud rate to stage 40102, save/reboot via 40110=1, wait
   8000 ms, switch the host UART and verify the new rate. Verification retries
   timed-out reads up to eight times without repeating save writes. The sysfs
-  write may therefore take several seconds. A successful write also
+  write may therefore take several seconds. Writing the active rate first reads
+  back the configuration; matching communication and register values skip saving
+  and rebooting. A successful write also
   changes the recovery target. The reboot wait holds the bus lock and is tunable
   via `SSF_MEMS_SENSOR_REBOOT_DELAY_MS` in `protocol.h`; verification attempts
   and retry delay are configured in the same header.
@@ -87,26 +102,26 @@ The IIO device also provides:
 - `sensor_sampling_rate_index` (RW) and `sensor_sampling_frequency` (RO):
   sensor calculation rate, independent of the host polling period. Index 9
   selects the maximum 26667 Hz, while index 6 selects 5333.4 Hz. Firmware saves
-  changes to Flash and restores them on startup. Automatic connection/reconnection
-  selects index 6 for the current tapping/general-vibration tests.
+  changes to Flash and restores them on startup. The first driver connection
+  selects the model-table default (currently index 6). Later reconnections use
+  the last successfully selected index; reloading the driver resets that target.
 - `sensor_feature_enable` (RW): six frequency-band enables (63 enables all),
   preserving alarm settings; `sensor_parameter_switch` reads the full word.
 - `sensor_sampling_length_index` and `sensor_firmware_version` (RO): sensor
   configuration diagnostics. See [iio/README.md](iio/README.md) and
   [the board test](tools/README.md#特征值长时间重复的排查).
 
-The provided MEMS2.0 firmware computes a whole feature batch before updating
-its holding registers. Successful host reads may repeatedly return that same
-batch. `sensor_sample_age_ms` measures time since a successful register read,
-not time since sensor-side measurement. Its register 40029 (`startup_flags`)
-reports XYZ motor-run detection at a 0.06 g DC-removed peak threshold, rather
-than acquisition enable state.
+Successful host reads may repeatedly return the same feature values.
+`sensor_sample_age_ms` measures time since a successful register read, not time
+since sensor-side measurement. Register 40029 (`startup_flags`) reports XYZ
+run-detection flags; zero does not mean acquisition is disabled.
 
 After registration, a background thread waits one second, matches the sensor's
 baud rate, uses `current-speed` only as a startup hint (9600 if missing, unreadable
-or unsupported), applies the operational target of 128000, sets sampling-rate
-index 6 (5333.4 Hz), and verifies a complete feature read (raw-only mode instead
-starts finite batches after configuration verification). Matching baud rates
+or unsupported), applies the model-table operational target (currently 128000),
+sets the initial sampling-rate index (currently 6, 5333.4 Hz), and verifies a
+complete feature read (raw-only mode instead starts finite batches after
+configuration verification). Matching baud rates
 and unchanged sampling settings skip writes. If the initial target rate does
 not respond, discovery finds the active rate before saving/rebooting the sensor
 to the target. No responding rate means retrying, not blindly writing a new rate;
@@ -115,7 +130,8 @@ connection retry path before publishing samples.
 It defaults to a fixed polling period of 1000 ms for the measured 4.4–4.8 s
 feature-update interval. Runtime IIO controls select fixed or adaptive polling,
 set the fixed period, and configure adaptive bounds. Adaptive statistics survive
-normal raw windows, and periodic probing does not discard unfinished statistics.
+normal raw windows. Periodic probing requires changing samples, a repeat rate
+below 10%, and enough read-time headroom; it preserves unfinished statistics.
 Polling configuration survives reconnection but is reset on driver reload.
 See [polling controls](iio/README.md#特征轮询周期). Sustained communication failure stops polling
 and starts baud-rate discovery with exponential retry delays capped at 30 s.
@@ -133,8 +149,8 @@ has been removed. A newer kernel with a `size_t` callback needs adaptation.
 
 Baud changes stage 40102, save/reboot through 40110=1 at the old rate, wait,
 switch the host UART, and verify. Sampling configuration follows that reboot;
-firmware applies it after its current batch and saves it without an additional
-save/reboot request. Hardware validation of communication and
+the driver reads the setting back without an additional save/reboot request.
+Readback confirms the configured value, not the start of a new measurement. Hardware validation of communication and
 measurement latency is still required. Sensor parity is never changed.
 
 If the first baud-rate-register request times out, the driver scans each unique
@@ -145,7 +161,7 @@ response and restores the entry rate when no rate responds.
 
 The host must already know the slave address and parity before it can exchange
 Modbus frames. Configure them on the serdev child node together with the initial
-and target baud rate:
+baud-rate hint. The operational target comes from the model table:
 
 ```dts
 &uart1 {
@@ -175,28 +191,35 @@ Run the protocol and baud-rate scan tests with:
 ```sh
 python3 tests/protocol/run_tests.py
 python3 tests/acquisition/run_tests.py
+python3 tests/iio/run_tests.py
+python3 tests/ota/run_tests.py
 ```
 
 ## In-tree kernel integration
 
-Copy or link this directory into the kernel source tree, source this `Kconfig`
-from the parent Kconfig, and add the directory to the parent's Kbuild Makefile,
-for example:
+The supplied Makefile uses `obj-m` for external-module builds. For in-tree
+integration, first replace that line with:
+
+```make
+obj-$(CONFIG_SSF_SENSOR) += ssf_mems.o
+```
+
+Then source this directory's `Kconfig` from the parent Kconfig and add the
+directory to the parent's Kbuild Makefile, for example:
 
 ```make
 obj-$(CONFIG_SSF_SENSOR) += ssf_sensor/
 ```
 
-When building in-tree, the same top-level Makefile is evaluated by Kbuild and
-the `CONFIG_SSF_SENSOR` symbol controls whether the module is included.
+After this adjustment, `CONFIG_SSF_SENSOR` controls the in-tree build.
 
 # 定长原始采集
 
 支持 1024 点定长原始 XYZ 批次与特征轮询交替运行，窗口默认各 5 秒，
-窗口到期收完在途批次；两种通信保持 128000，不再临时切到 1 Mbaud。
+窗口到期收完在途批次；两种通信共用工作波特率，默认 128000。
 批次之间有采样时间间隙，不是全时连续波形。原始数据在独立 IIO
 设备 `ssf_mems_xyzs_raw` 中提供，原有特征设备 ABI 不变；暂不计算 FFT。
 设备树时段配置、私有协议限制和 buffer 读取方法见
-[定长原始采集说明](protocol/RAW_CAPTURE.md)。
+[定长原始采集说明](protocol/raw/RAW_CAPTURE.md)。
 
 IIO 全部属性的中文说明和操作示例见 [iio/ATTRIBUTES.md](iio/ATTRIBUTES.md)。

@@ -3,33 +3,10 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 
-#include "sensor_data.h"
-#include "modbus_table.h"
+#include "model/sensor_data.h"
+#include "model/modbus_table.h"
 
-/* 40102 的波特率编码，枚举值不是每秒位数。 */
-enum ssf_mems_baudrate {
-  SSF_MEMS_BAUDRATE_DEFAULT = 0, /* 固件默认速率，实际为 9600 bit/s。 */
-  SSF_MEMS_BAUDRATE_2400 = 1, /* 2400 bit/s。 */
-  SSF_MEMS_BAUDRATE_4800 = 2, /* 4800 bit/s。 */
-  SSF_MEMS_BAUDRATE_9600 = 3, /* 9600 bit/s，显式编码。 */
-  SSF_MEMS_BAUDRATE_19200 = 4, /* 19200 bit/s。 */
-  SSF_MEMS_BAUDRATE_38400 = 5, /* 38400 bit/s。 */
-  SSF_MEMS_BAUDRATE_57600 = 6, /* 57600 bit/s。 */
-  SSF_MEMS_BAUDRATE_115200 = 7, /* 115200 bit/s。 */
-  SSF_MEMS_BAUDRATE_128000 = 8, /* 128000 bit/s，当前正式工作速率。 */
-  SSF_MEMS_BAUDRATE_230400 = 9, /* 230400 bit/s。 */
-  SSF_MEMS_BAUDRATE_256000 = 10, /* 256000 bit/s。 */
-  SSF_MEMS_BAUDRATE_460800 = 11, /* 460800 bit/s。 */
-  SSF_MEMS_BAUDRATE_500000 = 12, /* 500000 bit/s。 */
-  SSF_MEMS_BAUDRATE_512000 = 13, /* 512000 bit/s。 */
-  SSF_MEMS_BAUDRATE_600000 = 14, /* 600000 bit/s。 */
-  SSF_MEMS_BAUDRATE_750000 = 15, /* 750000 bit/s。 */
-  SSF_MEMS_BAUDRATE_921600 = 16, /* 921600 bit/s。 */
-  SSF_MEMS_BAUDRATE_1000000 = 17, /* 1000000 bit/s，固件最高编码速率。 */
-  SSF_MEMS_BAUDRATE_MAX, /* 编码数量/非法值边界，不能写入传感器。 */
-};
-
-/* 与固件 40103 寄存器的数值一致。 */
+/* 与手册 40103 寄存器的编码一致。 */
 enum ssf_mems_parity {
   SSF_MEMS_PARITY_NONE = 0, /* 8N1，无奇偶校验。 */
   SSF_MEMS_PARITY_ODD = 1, /* 8O1，奇校验。 */
@@ -71,14 +48,14 @@ int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
 #define SSF_MEMS_BAUDRATE_VERIFY_ATTEMPTS 8U
 #define SSF_MEMS_BAUDRATE_VERIFY_RETRY_MS 100U
 
-/* 固件先完成当前特征计算，再进行定长采集和上传。 */
+/* 首包等待预算，允许启动后延迟输出数据。 */
 #define SSF_MEMS_RAW_START_TIMEOUT_MS 15000U
 #define SSF_MEMS_RAW_QUIET_MS 300U /* 覆盖最低采样率约 120 ms 的包间隔。 */
 
 /* 总线业务模式与接收格式分开：恢复未确认时不能发普通业务请求。 */
 enum ssf_mems_link_mode {
   SSF_MEMS_LINK_MODBUS, /* 已确认普通 Modbus 通信，可以读写配置。 */
-  SSF_MEMS_LINK_RAW_STARTING, /* 启动已发送，固件可能仍在完成当前计算。 */
+  SSF_MEMS_LINK_RAW_STARTING, /* 启动已发送，正在等待首个原始包。 */
   SSF_MEMS_LINK_RAW_STREAMING, /* 已收到通过 CRC 校验的原始包。 */
   SSF_MEMS_LINK_RAW_RECOVERING, /* 已停止发布，尚未确认恢复普通通信。 */
   SSF_MEMS_LINK_OTA, /* bus_lock 内的固件传输；只解析私有 6 字节应答。 */

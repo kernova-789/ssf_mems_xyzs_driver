@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include "ota.h"
-#include "serial_transport.h"
+#include "firmware/ota.h"
+#include "transport/serial_transport.h"
 #include "core.h"
 
 #include <linux/delay.h>
@@ -10,10 +10,10 @@
 #include <linux/string.h>
 
 #define SSF_MEMS_OTA_FUNCTION 0x41U /* 固件私有升级命令，不属于普通 RTU 编解码。 */
-#define SSF_MEMS_OTA_QUERY 0xfffffffeU /* 不匹配 nextPack，只返回计数，不写 Flash。 */
-#define SSF_MEMS_OTA_FINAL 0xffffffffU /* 末包：写升级标志并触发传感器重启。 */
+#define SSF_MEMS_OTA_QUERY 0xfffffffeU /* 查询下一期望包号，不提交升级数据。 */
+#define SSF_MEMS_OTA_FINAL 0xffffffffU /* 末包：提交升级并等待传感器重新上线。 */
 #define SSF_MEMS_OTA_ACK_MS 5000U /* 首包需擦除两个 128 KiB 扇区。 */
-#define SSF_MEMS_OTA_REBOOT_MS 15000U /* 包含 Bootloader 复制和应用再次启动。 */
+#define SSF_MEMS_OTA_REBOOT_MS 15000U /* 升级后重新上线的等待预算。 */
 #define SSF_MEMS_OTA_RETRIES 3U /* 仅用于查询和普通包；末包只发送一次。 */
 #define SSF_MEMS_OTA_GAP_MS 20U /* 相邻升级包发送前的主机等待，ms。 */
 
@@ -37,7 +37,7 @@ int ssf_mems_ota_validate_image(const u8 *image, size_t size) {
     return -EFBIG;
   stack = ssf_mems_ota_le32(image);
   entry = ssf_mems_ota_le32(image + 4);
-  /* STM32F407 SRAM 128 KiB / CCM 64 KiB；栈顶允许恰好等于区间上界。 */
+  /* 按镜像要求校验栈指针；允许栈顶等于内存区间上界。 */
   if ((stack & 7U) != 0 ||
       !((stack > 0x20000000U && stack <= 0x20020000U) ||
         (stack > 0x10000000U && stack <= 0x10010000U)))
@@ -92,7 +92,7 @@ int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
   frame[3] = sequence >> 16;
   frame[4] = sequence >> 8;
   frame[5] = sequence;
-  /* 固件总是写完整 256 字节；不足一块时以擦除态 0xff 补齐。 */
+  /* 协议载荷固定为 256 字节，不足一块用 0xff 补齐。 */
   memset(frame + 6, 0xff, SSF_MEMS_OTA_BLOCK_SIZE);
   if (size != 0)
     memcpy(frame + 6, payload, size);

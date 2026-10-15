@@ -2,6 +2,7 @@
 
 #include <linux/bitops.h>
 #include <linux/types.h>
+#include "model/sensor_fields.h"
 
 /*
  * Modbus 共用类型：定义功能码、收发格式和各种“描述表项”。
@@ -17,6 +18,29 @@
 #define SSF_MEMS_MODBUS_READ_MAX_REGS 125U /* 一次普通读取的最大寄存器数。 */
 #define SSF_MEMS_MODBUS_WRITE_MAX_REGS 123U /* 一次 0x10 写入的最大寄存器数。 */
 #define SSF_MEMS_MODBUS_MAX_FRAME_LEN 256U /* 标准 RTU 帧容量，不含私有原始/OTA 帧。 */
+
+/* 40102 的波特率编码，枚举值不是每秒位数。 */
+enum ssf_mems_baudrate {
+  SSF_MEMS_BAUDRATE_DEFAULT = 0, /* 默认速率编码，对应 9600 bit/s。 */
+  SSF_MEMS_BAUDRATE_2400 = 1, /* 2400 bit/s。 */
+  SSF_MEMS_BAUDRATE_4800 = 2, /* 4800 bit/s。 */
+  SSF_MEMS_BAUDRATE_9600 = 3, /* 9600 bit/s，显式编码。 */
+  SSF_MEMS_BAUDRATE_19200 = 4, /* 19200 bit/s。 */
+  SSF_MEMS_BAUDRATE_38400 = 5, /* 38400 bit/s。 */
+  SSF_MEMS_BAUDRATE_57600 = 6, /* 57600 bit/s。 */
+  SSF_MEMS_BAUDRATE_115200 = 7, /* 115200 bit/s。 */
+  SSF_MEMS_BAUDRATE_128000 = 8, /* 128000 bit/s，当前正式工作速率。 */
+  SSF_MEMS_BAUDRATE_230400 = 9, /* 230400 bit/s。 */
+  SSF_MEMS_BAUDRATE_256000 = 10, /* 256000 bit/s。 */
+  SSF_MEMS_BAUDRATE_460800 = 11, /* 460800 bit/s。 */
+  SSF_MEMS_BAUDRATE_500000 = 12, /* 500000 bit/s。 */
+  SSF_MEMS_BAUDRATE_512000 = 13, /* 512000 bit/s。 */
+  SSF_MEMS_BAUDRATE_600000 = 14, /* 600000 bit/s。 */
+  SSF_MEMS_BAUDRATE_750000 = 15, /* 750000 bit/s。 */
+  SSF_MEMS_BAUDRATE_921600 = 16, /* 921600 bit/s。 */
+  SSF_MEMS_BAUDRATE_1000000 = 17, /* 1000000 bit/s，当前型号最高编码速率。 */
+  SSF_MEMS_BAUDRATE_MAX, /* 编码数量/非法值边界，不能写入传感器。 */
+};
 
 /* 标准寄存器读写功能码，数值直接出现在 RTU 帧中。 */
 enum ssf_mems_modbus_func {
@@ -95,8 +119,7 @@ struct ssf_reg_desc {
   enum ssf_reg_type type;         // U16/S16 或 U32 的高/低半字
   enum ssf_rx_format read_format; // 读取时预期的响应格式
   bool write_single;              // 是否允许用 0x06 单独写入
-  size_t feature_offset;          // 在 ssf_mems_sensor_data 中的字段偏移
-  u8 feature_width; /* 0 表示该寄存器不映射到特征缓存。 */
+  enum ssf_mems_sensor_field feature_field; /* NONE 表示不映射特征。 */
   u16 value_mask;                 // 写入特征缓存前保留的位
   u16 feature_multiplier; /* 特征单位换算的分子；0 按 1 处理。 */
   u16 feature_divisor; /* 特征单位换算的分母；0 按 1 处理。 */
@@ -107,10 +130,13 @@ struct ssf_reg_desc {
 struct ssf_mems_sensor_profile {
   const char *const *sampling_frequencies; /* Hz 文本，按采样率编码索引。 */
   size_t sampling_frequency_count;
-  const unsigned int *baudrates; /* bit/s，按固件波特率编码索引。 */
+  const unsigned int *baudrates; /* bit/s，按传感器波特率编码索引。 */
   size_t baudrate_count;
+  enum ssf_mems_baudrate default_work_baudrate; /* 驱动首次连接的目标编码。 */
   u16 default_sampling_rate_index;
-  u16 raw_max_sampling_rate_index; /* 当前定长采集已验证的上限。 */
+  u16 raw_max_sampling_rate_index; /* 型号支持的定长采样率上限。 */
+  u32 raw_accel_scale_nano; /* 原始计数换算为 m/s² 的纳米比例。 */
+  u8 raw_axis_order[3]; /* 手册XYZ对应线上三轴的位置，取值0..2。 */
   u16 feature_enable_mask;
   u8 feature_enable_shift;
 };

@@ -4,11 +4,11 @@
 #include <linux/types.h>
 
 #include "protocol.h"
-#include "modbus_receive.h"
-#include "modbus_request.h"
+#include "modbus/modbus_receive.h"
+#include "modbus/modbus_request.h"
 #include "ssf_mems_acquisition.h"
-#include "raw_stream.h"
-#include "ota.h"
+#include "raw/raw_stream.h"
+#include "firmware/ota.h"
 
 struct iio_dev;
 

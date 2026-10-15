@@ -19,14 +19,14 @@ def main():
                      ROOT / "core", ROOT / "protocol", ROOT / "acquisition",
                      ROOT / "iio"):
             command += ["-I" + str(path)]
-        command += [str(ROOT / "protocol" / (name + ".c")) for name in
-                    ("modbus_table", "serial_transport", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol",
-                     "raw_stream", "ota")]
+        command += [str(ROOT / "protocol" / source) for source in
+                    ("model/modbus_table.c", "transport/serial_transport.c", "raw/raw_capture.c",
+                     "modbus/modbus.c", "modbus/modbus_request.c", "modbus/modbus_receive.c",
+                     "protocol.c", "raw/raw_stream.c", "firmware/ota.c")]
         command += [str(ROOT / "acquisition/ssf_mems_firmware.c"),
                     str(TEST / "ota_test.c"), "-o", str(executable)]
         subprocess.run(command, check=True)
-        subprocess.run([str(executable), str(ROOT / "MEMS2.0/Objects/STM32F407IGT6.bin")],
-                       check=True)
+        subprocess.run([str(executable)], check=True)
 
 
 if __name__ == "__main__":

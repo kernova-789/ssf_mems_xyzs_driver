@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include "serial_transport.h"
+#include "transport/serial_transport.h"
 
 #include "core.h"
 

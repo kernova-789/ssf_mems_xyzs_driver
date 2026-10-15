@@ -19,9 +19,9 @@ def main():
                           ROOT / "iio", ROOT / "core", ROOT / "protocol", ROOT / "acquisition"):
             flags += ["-I" + str(directory)]
         subprocess.run(flags + [str(TEST_DIR / "iio_test.c"),
-                               str(ROOT / "protocol/ota.c"),
-                               str(ROOT / "protocol/modbus_table.c"),
-                               str(ROOT / "protocol/serial_transport.c"),
+                               str(ROOT / "protocol/firmware/ota.c"),
+                               str(ROOT / "protocol/model/modbus_table.c"),
+                               str(ROOT / "protocol/transport/serial_transport.c"),
                                "-o", str(executable)], check=True)
         subprocess.run([str(executable)], check=True)
 

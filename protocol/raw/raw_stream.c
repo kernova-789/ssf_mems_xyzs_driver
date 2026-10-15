@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include "raw_stream.h"
+#include "raw/raw_stream.h"
 
 #include "core.h"
-#include "modbus.h"
+#include "modbus/modbus.h"
 
 #include <asm/unaligned.h>
 #include <linux/errno.h>
@@ -51,7 +51,8 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
 
     /* 每组六字节按 X/Y/Z 的大端有符号 16 位值解码。 */
     for (axis = 0; axis < 3U; axis++)
-      sample.xyz[axis] = (s16)get_unaligned_be16(raw->packet + offset + axis * sizeof(s16));
+      sample.xyz[axis] = (s16)get_unaligned_be16(raw->packet + offset +
+          ssf_mems_sensor_profile.raw_axis_order[axis] * sizeof(s16));
     sample.packet_sequence = sequence;
     sample.sample_index = i;
     ret = raw->sample_handler ? raw->sample_handler(data, &sample) : -ENODEV;

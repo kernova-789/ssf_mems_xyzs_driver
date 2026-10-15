@@ -15,7 +15,8 @@ low-baud response budgets, thread creation failure and shutdown guards.
 Polling cases cover the default fixed 1000 ms behavior, a custom fixed period's
 actual read-start intervals, adaptive acceleration/deceleration and bounds,
 read-time headroom, and mode/interval changes during the real acquisition loop.
-They check that 30-second probing preserves an unfinished 32-comparison window,
+They check that 30-second probing requires low repetition and a changed sample,
+constant samples never accelerate, and probing preserves an unfinished 32-comparison window;
 normal raw windows preserve learned periods, reconnection retains configuration,
 inactive-mode edits preserve statistics, and invalid bounds never change state.
 Configuration tests verify no sensor commands, no restart of the feature window,
@@ -23,7 +24,8 @@ same-value write suppression, and range/shutdown errors.
 
 Sensor-setting cases check offline/shutdown rejection, request timeouts,
 cache invalidation after successful writes or lost acknowledgments, and resetting
-the polling policy after a successful configuration change.
+the polling policy after a successful configuration change. Successful sampling
+rate changes become the reconnection target; failed changes leave it unchanged.
 Connection cases check device-tree-derived startup hints and the 128000 baud / index 6 operational defaults, downgrading a
 sensor that still holds the former maximum settings, configuring
 sampling after baud verification and before publishing, skipping already-matching
@@ -46,5 +48,6 @@ against the target kernel and validate the device's 40102 change timing on hardw
 检查不会被 1000 ms 特征周期拖长。设备树 raw-duration-ms=0 仍默认仅特征，
 但保存 5000 ms 原始窗口供未来运行时切换。有校验时仅允许特征模式。
 
-另用真实 pthread mutex 验证生产 `get_status()`：持有完整采集事务锁时，
-在线状态、周期和样本年龄仍可读取，调用受 5 秒测试超时保护。
+另用真实 pthread mutex 验证生产 `get_status()` 和 `get_config()`：持有完整采集事务锁时，
+在线状态、周期、样本年龄和主机配置仍可读取，调用受 5 秒测试超时保护。
+替代型号表将默认工作波特率改为 115200，验证初始化确实采用表中目标。

@@ -15,7 +15,7 @@ The runner compiles each real protocol source as an independent translation unit
 
 Temporary table configurations delete the first, middle, last, several, or all feature entries; they also remove configuration/work-parameter entries and reverse table order. Production files are never changed by the runner.
 
-The harness exercises independent module initialization, FIFO allocation failure, partial-frame cleanup, rejection of new work after receive shutdown, complete-frame callback/context delivery, request encoding, fragmented byte reception through the receive work item, CRC, response matching, exception responses, permission checks, sparse feature reads, unchanged physical addresses, field masks, zeroing removed fields, failed-read cache preservation, and request ownership until the waiter consumes its result. Unclaimed frames must be discarded without changing request state, output buffers, feature caches, or wake counts; completed frame buffers and slots must be released, and a subsequent matching response must still complete the request.
+The harness exercises independent module initialization, FIFO allocation failure, partial-frame cleanup, rejection of new work after receive shutdown, complete-frame callback/context delivery, request encoding, fragmented byte reception through the receive work item, CRC, response matching, exception responses, permission checks, sparse feature reads, unchanged physical addresses, field masks, zeroing removed fields, failed-read cache preservation, and request ownership until the waiter consumes its result. Unclaimed frames must be discarded without changing request state, output buffers, feature caches, or wake counts; consumed prefixes must leave the bounded receive window, and a subsequent matching response must still complete the request.
 
 Baud-rate cases cover a direct 40102 read, switching through unique enum rates,
 skipping the duplicate default/9600 value, keeping the discovered rate,
@@ -55,8 +55,8 @@ staging or Flash save writes. Invalid/mismatched replies must still fail.
 Isolation tests inject a late 40102 response while preparing a 40121 request
 with the same response shape, verify recovery guards after timeout/partial
 write, and check bounded idle waits under continuous noise and shutdown/signal
-interruption. Receive tests occupy all four candidate slots with unfinished
-frames, exercise both timer and per-byte expiration, and ensure a fragmented
+interruption. Receive tests inject multiple unfinished frame prefixes, exercise
+both idle-window and independent frame-head expiration, and ensure a fragmented
 valid frame remains usable within the low-baud wire-time budget. The shim uses
 controlled jiffies; it does not validate real UART delivery latency.
 # 定长原始批次测试
@@ -78,7 +78,7 @@ controlled jiffies; it does not validate real UART delivery latency.
 新增变体迁移配置、定长触发、长度和波特率表项的显示地址，
 验证业务层仅凭稳定名称仍可完成配置读写、16 包采集及波特率扫描/保存/重启验证。
 另两组分别打乱长度高低字的显示地址、线上地址，确认触发和长度写入前即拒绝。
-范围用例区分合法但尚未开放的采样索引 9 与非法索引 10。
+范围用例验证索引 9 可完成定长采集，索引 10 在发送触发前被拒绝。
 模拟测试不能代替实机 UART/RS485 方向时序和 IIO 验证。
 
 新增型号表变体覆盖有符号温度的比例换算、换算越界时保留缓存，
@@ -87,3 +87,8 @@ controlled jiffies; it does not validate real UART delivery latency.
 帧表/寄存器表/块表只在 `modbus_table.c` 实例化一次。
 
 缩短型号的波特率编码表后，测试确认不写未提供的编码、扫描不越界，失败后恢复入口速率。
+
+新增启动期型号表校验用例覆盖空编码表、默认值/范围越界、非法位布局、重复名称和地址、
+重复或非法字段映射。字段描述由公共 schema 生成，表变体测试继续验证删除和迁移行为。
+同值波特率用例验证只读确认、不保存、不重启；暂存值不同仍完整保存，读回错误不盲目成功。
+抗噪接收使用真实 FIFO/解析工作项，覆盖多个伪长帧、最大帧、合法嵌套帧、重复交付和独立帧头过期。

@@ -28,11 +28,23 @@ VARIANTS = {
     "nonadjacent_length_display": set(),
     "nonadjacent_length_protocol": set(),
 }
-MODULES = ("modbus_table", "serial_transport", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol", "raw_stream", "ota")
+MODULES = {
+    "modbus_table": "model/modbus_table.c",
+    "serial_transport": "transport/serial_transport.c",
+    "raw_capture": "raw/raw_capture.c",
+    "modbus": "modbus/modbus.c",
+    "modbus_request": "modbus/modbus_request.c",
+    "modbus_receive": "modbus/modbus_receive.c",
+    "protocol": "protocol.c",
+    "raw_stream": "raw/raw_stream.c",
+    "ota": "firmware/ota.c",
+}
 HEADERS = (
-    "sensor_data.h", "modbus_types.h", "modbus.h", "modbus_table.h",
-    "modbus_request.h", "modbus_receive.h", "protocol.h", "core.h",
-    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw_stream.h", "raw_capture.h", "serial_transport.h", "ota.h",
+    "model/sensor_data.h", "model/sensor_fields.h", "modbus/modbus_types.h",
+    "modbus/modbus.h", "model/modbus_table.h", "modbus/modbus_request.h",
+    "modbus/modbus_receive.h", "protocol.h", "core.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw/raw_stream.h",
+    "raw/raw_capture.h", "transport/serial_transport.h", "firmware/ota.h",
 )
 ALLOWED_DEPENDENCIES = {
     "modbus_table": set(),
@@ -42,7 +54,7 @@ ALLOWED_DEPENDENCIES = {
     "modbus_request": {"modbus", "modbus_table", "modbus_receive", "serial_transport"},
     "modbus_receive": {"modbus", "modbus_table", "raw_stream", "ota", "serial_transport"},
     "protocol": {"modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
-    "raw_stream": {"modbus"},
+    "raw_stream": {"modbus", "modbus_table"},
     "ota": {"modbus_request", "modbus_receive", "protocol", "serial_transport"},
 }
 
@@ -96,6 +108,8 @@ def configure_table(text, deleted, variant):
         result = result.replace(".feature_enable_mask = 0xfc00", ".feature_enable_mask = 0x003f")
         result = result.replace(".feature_enable_shift = 10", ".feature_enable_shift = 0")
     if variant == "short_baud_table":
+        result = result.replace(".default_work_baudrate = SSF_MEMS_BAUDRATE_128000",
+                                ".default_work_baudrate = SSF_MEMS_BAUDRATE_115200")
         result = re.sub(r"static const unsigned int ssf_baudrates\[\] = \{.*?\n};",
                         "static const unsigned int ssf_baudrates[] = {\n"
                         "    9600, 2400, 4800, 9600, 19200, 38400, 57600, 115200,\n};",
@@ -106,12 +120,13 @@ def main():
     compiler = os.environ.get("CC", "cc")
     with tempfile.TemporaryDirectory(prefix="ssf-mems-protocol-tests-") as temp:
         scratch = Path(temp)
+        check_table_validation(compiler, scratch)
         for name, deleted in VARIANTS.items():
             project = scratch / name
             shutil.copytree(ROOT / "protocol", project / "protocol")
             shutil.copytree(ROOT / "core", project / "core")
             shutil.copytree(ROOT / "acquisition", project / "acquisition")
-            table_path = project / "protocol" / "modbus_table.h"
+            table_path = project / "protocol/model/modbus_table.h"
             # Mechanical test-fixture transformation; production table is never edited.
             table_path.write_text(configure_table(table_path.read_text(), deleted, name))
             executable = project / "protocol_test"
@@ -127,11 +142,11 @@ def main():
             for header in HEADERS:
                 subprocess.run(flags + ["-include", header, "-x", "c", "-fsyntax-only", "/dev/null"], check=True)
             objects = {}
-            for module in MODULES:
+            for module, source in MODULES.items():
                 obj = project / (module + ".o")
                 dependency_file = project / (module + ".d")
                 subprocess.run(flags + ["-MMD", "-MF", str(dependency_file), "-c",
-                                       str(project / "protocol" / (module + ".c")), "-o", str(obj)], check=True)
+                                       str(project / "protocol" / source), "-o", str(obj)], check=True)
                 objects[module] = obj
                 if module == "modbus":
                     includes = set(re.findall(r"[\w]+\.h", dependency_file.read_text()))
@@ -145,6 +160,53 @@ def main():
                            ["-o", str(executable)], check=True)
             subprocess.run([str(executable), name], check=True)
     print("All independent-compilation, dependency-boundary, table-removal and protocol cases passed.")
+
+
+def check_table_validation(compiler, scratch):
+    fixtures = {
+        "valid": (None, None, "valid"),
+        "empty_sampling": (".sampling_frequency_count = ARRAY_SIZE(ssf_sampling_frequencies)",
+                           ".sampling_frequency_count = 0", "sensor_profile"),
+        "empty_bauds": (".baudrate_count = ARRAY_SIZE(ssf_baudrates)",
+                        ".baudrate_count = 0", "sensor_profile"),
+        "bad_target_baud": (".default_work_baudrate = SSF_MEMS_BAUDRATE_128000",
+                            ".default_work_baudrate = SSF_MEMS_BAUDRATE_MAX", "sensor_profile"),
+        "bad_sampling_default": (".default_sampling_rate_index = 6",
+                                 ".default_sampling_rate_index = 10", "sensor_profile"),
+        "bad_raw_limit": (".raw_max_sampling_rate_index = 9",
+                          ".raw_max_sampling_rate_index = 10", "sensor_profile"),
+        "bad_shift": (".feature_enable_shift = 10", ".feature_enable_shift = 16", "sensor_profile"),
+        "sparse_mask": (".feature_enable_mask = 0xfc00", ".feature_enable_mask = 0xa400", "sensor_profile"),
+        "bad_axis": (".raw_axis_order = {0, 1, 2}", ".raw_axis_order = {0, 0, 2}", "sensor_profile"),
+        "bad_scale": (".raw_accel_scale_nano = 4788403", ".raw_accel_scale_nano = 0", "sensor_profile"),
+        "duplicate_name": ('.name = "x_low_freq_velocity_rms"', '.name = "x_high_freq_acc_rms"',
+                           "x_high_freq_acc_rms"),
+        "empty_name": ('.name = "x_high_freq_acc_rms"', '.name = ""', "unnamed_register"),
+        "duplicate_display": (".display_reg = 40002", ".display_reg = 40001", "x_low_freq_velocity_rms"),
+        "duplicate_wire": (".protocol_addr = 0x0001", ".protocol_addr = 0x0000", "x_low_freq_velocity_rms"),
+        "duplicate_field": (".feature_field = SSF_MEMS_FIELD_X_LOW_FREQ_VELOCITY_RMS",
+                            ".feature_field = SSF_MEMS_FIELD_X_HIGH_FREQ_ACC_RMS", "x_low_freq_velocity_rms"),
+        "bad_field": (".feature_field = SSF_MEMS_FIELD_TEMPERATURE",
+                      ".feature_field = SSF_MEMS_FIELD_MAX", "temperature"),
+        "bad_field_type": (".type = SSF_REG_S16", ".type = SSF_REG_U32_HIGH", "temperature"),
+        "empty_block": (".reg_count = 29", ".reg_count = 0", "read_all_features"),
+    }
+    for name, (original, replacement, expected) in fixtures.items():
+        project = scratch / ("validation_" + name)
+        shutil.copytree(ROOT / "protocol", project / "protocol")
+        table_path = project / "protocol/model/modbus_table.h"
+        if original is not None:
+            source = table_path.read_text()
+            assert original in source, (name, original)
+            table_path.write_text(source.replace(original, replacement, 1))
+        executable = project / "table_test"
+        command = [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                   "-Wno-sign-compare", "-fsanitize=address,undefined", "-g",
+                   "-I" + str(TEST_DIR / "shim"), "-I" + str(project / "protocol"),
+                   str(project / "protocol/model/modbus_table.c"), str(TEST_DIR / "table_test.c"),
+                   "-o", str(executable)]
+        subprocess.run(command, check=True)
+        subprocess.run([str(executable), expected], check=True)
 
 if __name__ == "__main__":
     main()

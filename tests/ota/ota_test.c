@@ -1,7 +1,7 @@
 /* Production code is linked separately; the model implements the sensor's
- * nextPack/Flash semantics rather than returning unconditional success. */
+ * packet-count and storage behavior rather than returning unconditional success. */
 #include "core.h"
-#include "modbus.h"
+#include "modbus/modbus.h"
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
 #include <assert.h>
@@ -104,7 +104,7 @@ void release_firmware(const struct firmware *fw) {
 }
 
 /* This models Modbus.c's unusual 0x41 branch: query packets do not write,
- * repeated normal sequence numbers do not write, FINAL always writes at nextPack. */
+ * repeated normal sequences are acknowledged; FINAL commits at the expected position. */
 ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
                            size_t len, unsigned long timeout) {
   u32 sequence;
@@ -344,12 +344,11 @@ static void test_failures(void) {
   }
 }
 
-static void test_validation(const char *existing_bin) {
+static void test_validation(void) {
   struct ssf_mems_ota_status status;
   char name[SSF_MEMS_OTA_NAME_SIZE];
   u8 frame[263];
   u16 value;
-  FILE *file;
 
   reset(513, NORMAL);
   sensor.protocol.mode = SSF_MEMS_LINK_OTA;
@@ -402,19 +401,10 @@ static void test_validation(const char *existing_bin) {
   CHECK(ssf_mems_acquisition_update_firmware(&sensor, "update.bin") == -EBUSY);
   mutex_unlock(&sensor.ota.update_lock);
 
-  /* The checked-in-source directory's optional build artifact is only read, never sent. */
-  file = fopen(existing_bin, "rb");
-  if (file != NULL) {
-    size_t size = fread(image, 1, sizeof(image), file);
-    u32 entry = size >= 8 ? (u32)image[4] | (u32)image[5] << 8 |
-                            (u32)image[6] << 16 | (u32)image[7] << 24 : 0;
-
-    fclose(file);
-    if (size >= 8 && entry < SSF_MEMS_OTA_APP_ADDRESS) {
-      CHECK(ssf_mems_ota_validate_image(image, size) == -ENOEXEC);
-      printf("PASS existing MEMS2.0 bin rejected: wrong application link address\n");
-    }
-  }
+  /* 错误链接地址使用合成向量验证，不依赖或读取其他传感器的 bin。 */
+  reset(513, NORMAL);
+  image[4] = 0x0d; image[5] = 0x02; image[6] = 0x00; image[7] = 0x08;
+  CHECK(ssf_mems_ota_validate_image(image, 513) == -ENOEXEC);
 }
 
 /* Run the real entry on a second thread while the current acquisition window owns its lock. */
@@ -457,11 +447,10 @@ static void test_waiting_and_shutdown(void) {
   }
 }
 
-int main(int argc, char **argv) {
-  CHECK(argc == 2);
+int main(void) {
   test_success();
   test_failures();
-  test_validation(argv[1]);
+  test_validation();
   test_waiting_and_shutdown();
   cleanup();
   printf("PASS OTA framing, staged Flash, ACK faults, loader and lifecycle: %u checks\n", checks);

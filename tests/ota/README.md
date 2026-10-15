@@ -1,9 +1,8 @@
 # OTA 离线测试
 
 在本机运行 `python3 tests/ota/run_tests.py`。以 AddressSanitizer / UndefinedBehaviorSanitizer
-编译真实 `protocol/*.c` 和 `acquisition/ssf_mems_firmware.c`，不加载内核模块、
-不连接开发板、不发送真实升级帧。使用 pthread 互斥量和可控时间，模拟固件
-`nextPack`、暂存 Flash、末包提交与重启后版本读取。
+编译 `protocol/` 各子目录的真实生产模块和 `acquisition/ssf_mems_firmware.c`，不加载内核模块、
+不连接开发板、不发送真实升级帧。使用 pthread 互斥量和可控时间，模拟升级包计数、数据存储、末包提交与重启后版本读取。
 
 覆盖：
 
@@ -18,9 +17,10 @@
 - 升级总线模式拒绝普通请求及原始模式恢复读请求；原始 IIO 发布不得认领升级应答。
 
 另外 `tests/acquisition/run_tests.py` 检查不确定结果阻止后台通信及 IIO 传感器配置，
-`tests/iio/run_tests.py` 检查属性分派/错误返回/进度格式，原协议的 13 种表变体继续回归。
-若参考源码目录内存在旧的 `Objects/STM32F407IGT6.bin`，测试只读检查其入口；
-错误应用地址必须拒绝，绝不会将它发送给设备。
+`tests/iio/run_tests.py` 检查属性分派/错误返回/进度格式，原协议的 17 种表变体继续回归。
+错误链接地址使用合成启动向量验证，测试不依赖其他传感器的 bin。
 
 模拟不覆盖真实 Flash 擦写耗时、掉电时的 Bootloader 行为、RS485 电气和 UART 物理
-分帧。正式刷写前仍需正确应用镜像和实机测试；操作说明见 [OTA.md](../../protocol/OTA.md)。
+分帧。正式刷写前仍需正确应用镜像和实机测试；操作说明见 [OTA.md](../../protocol/firmware/OTA.md)。
+
+升级回归只使用合成镜像和错误启动向量，不读取仓库中其他传感器的 bin，也不向实机发送。

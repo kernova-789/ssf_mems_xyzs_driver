@@ -1,8 +1,8 @@
 #include "core.h"
-#include "modbus.h"
-#include "modbus_table.h"
-#include "modbus_request.h"
-#include "modbus_receive.h"
+#include "modbus/modbus.h"
+#include "model/modbus_table.h"
+#include "modbus/modbus_request.h"
+#include "modbus/modbus_receive.h"
 #include "protocol.h"
 #include <linux/jiffies.h>
 
@@ -67,7 +67,7 @@ static unsigned int raw_wait_action;
 static bool raw_sensor_running; /* 模拟有限批次正在采集或上传。 */
 static unsigned long late_raw_packet_at; /* 首包前卸载时，固件稍后才开始输出。 */
 
-enum { REPLY_NORMAL, REPLY_EXCEPTION, REPLY_BAD_CRC, REPLY_WRONG_COUNT, REPLY_NONE, REPLY_MISMATCH_THEN_NORMAL };
+enum { REPLY_NORMAL, REPLY_EXCEPTION, REPLY_BAD_CRC, REPLY_WRONG_COUNT, REPLY_NONE, REPLY_MISMATCH_THEN_NORMAL, REPLY_NOISE_THEN_NORMAL };
 #define CHECK(expr) do { checks++; if (!(expr)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #expr); abort(); } } while (0)
 #define NO_SEND(expr, error) do { unsigned int before = sends; CHECK((expr) == (error)); CHECK(sends == before); } while (0)
 
@@ -115,17 +115,12 @@ static void finish_crc(u8 *buf, size_t len) {
   buf[len - 1] = crc >> 8;
 }
 
-/* 验证完整帧处理后所有候选槽位均已释放。 */
-static void check_released_slots(struct ssf_mems_xyzs_data *data) {
-  size_t i;
-  for (i = 0; i < ARRAY_SIZE(data->modbus_rx.frame); i++) {
-    const struct ssf_mems_frame_slot *slot = &data->modbus_rx.frame[i];
-    CHECK(!slot->data && !slot->frame_desc && !slot->data_pos);
-    CHECK(atomic_read(&slot->in_use) == SSF_MEMS_FRAME_SLOT_FREE);
-  }
+/* 验证没有未完成的帧头留在解析窗口中。 */
+static void check_receive_empty(struct ssf_mems_xyzs_data *data) {
+  CHECK(data->modbus_rx.frame_used == 0);
 }
 
-/* 验证未认领帧不改变请求、输出、缓存或唤醒计数，并释放完整帧缓冲区。 */
+/* 验证未认领帧不改变请求、输出、缓存或唤醒计数，且没有残留半帧。 */
 static void check_discard_preserves_state(struct ssf_mems_xyzs_data *data,
                                          const u8 *frame, size_t len) {
   u8 request_before[sizeof(data->modbus_req)];
@@ -148,7 +143,7 @@ static void check_discard_preserves_state(struct ssf_mems_xyzs_data *data,
   CHECK(data->protocol.valid == valid_before && test_wake_count == wakes_before);
   if (values)
     CHECK(memcmp(values_before, values, values_count * sizeof(*values)) == 0);
-  check_released_slots(data);
+  check_receive_empty(data);
 }
 
 ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
@@ -206,6 +201,14 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     CHECK(data->modbus_req.pending && data->modbus_req.busy);
     finish_crc(unmatched, sizeof(unmatched));
     check_discard_preserves_state(data, unmatched, sizeof(unmatched));
+  }
+
+  if (mode == REPLY_NOISE_THEN_NORMAL) {
+    const u8 noise[] = {1, 3, 250, 1, 3, 250, 1, 3, 250, 1, 3, 250};
+
+    CHECK(data->modbus_req.pending && data->modbus_req.busy);
+    CHECK(ssf_mems_rx_push(s, noise, sizeof(noise)) == sizeof(noise));
+    data->modbus_rx.work.fn(&data->modbus_rx.work);
   }
 
   response[0] = buf[0];
@@ -320,7 +323,6 @@ static void test_initialization_and_cleanup(void) {
   const u8 partial_frame[] = {1, 3, 2, 0x12};
   u8 fifo_data[SSF_MEMS_RX_FIFO_SIZE] = {0};
   u16 output;
-  size_t i;
   unsigned int queued;
 
   CHECK(ssf_mems_protocol_init(NULL) == -EINVAL);
@@ -359,12 +361,7 @@ static void test_initialization_and_cleanup(void) {
   CHECK(local.modbus_rx.fifo.data && local.modbus_rx.fifo.capacity == SSF_MEMS_RX_FIFO_SIZE);
   CHECK(local.modbus_rx.fifo.count == 0 && local.modbus_rx.work.fn != NULL);
   CHECK(local.protocol.valid && local.modbus_req.status == 0);
-  for (i = 0; i < ARRAY_SIZE(local.modbus_rx.frame); i++) {
-    struct ssf_mems_frame_slot *slot = &local.modbus_rx.frame[i];
-    CHECK(!slot->data && !slot->frame_desc && !slot->data_len && !slot->data_pos);
-    CHECK(slot->state == SSF_MEMS_RX_IDLE && !slot->slave_id && !slot->function);
-    CHECK(atomic_read(&slot->in_use) == SSF_MEMS_FRAME_SLOT_FREE);
-  }
+  check_receive_empty(&local);
   ssf_mems_modbus_receive_remove(&local);
   ssf_mems_modbus_request_remove(&local);
 
@@ -380,8 +377,8 @@ static void test_initialization_and_cleanup(void) {
   CHECK(test_queue_count == 1);
   sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
   CHECK(sensor.modbus_rx.fifo.count == 0);
-  CHECK(sensor.modbus_rx.frame[0].data != NULL);
-  CHECK(sensor.modbus_rx.frame[0].data_pos == sizeof(partial_frame));
+  CHECK(sensor.modbus_rx.frame_used == sizeof(partial_frame));
+  CHECK(memcmp(sensor.modbus_rx.frame, partial_frame, sizeof(partial_frame)) == 0);
 
   /* Request teardown must no longer cancel/free the receive module's resources. */
   sensor.modbus_req.pending = true;
@@ -389,16 +386,13 @@ static void test_initialization_and_cleanup(void) {
   ssf_mems_modbus_request_remove(&sensor);
   CHECK(sensor.modbus_req.status == -ENODEV && !sensor.modbus_req.pending);
   CHECK(!sensor.modbus_req.values && test_cancel_count == 0);
-  CHECK(sensor.modbus_rx.fifo.data && sensor.modbus_rx.frame[0].data);
+  CHECK(sensor.modbus_rx.fifo.data && sensor.modbus_rx.frame_used == sizeof(partial_frame));
   CHECK(!sensor.modbus_rx.shutting_down);
 
   ssf_mems_modbus_receive_remove(&sensor);
   CHECK(sensor.modbus_rx.shutting_down && test_cancel_count == 1);
   CHECK(!sensor.modbus_rx.fifo.data);
-  for (i = 0; i < ARRAY_SIZE(sensor.modbus_rx.frame); i++) {
-    CHECK(!sensor.modbus_rx.frame[i].data && !sensor.modbus_rx.frame[i].frame_desc);
-    CHECK(atomic_read(&sensor.modbus_rx.frame[i].in_use) == SSF_MEMS_FRAME_SLOT_FREE);
-  }
+  check_receive_empty(&sensor);
   queued = test_queue_count;
   CHECK(ssf_mems_rx_push(&serial, partial_frame, sizeof(partial_frame)) == -ENODEV);
   sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
@@ -439,7 +433,7 @@ static void test_receive_callback(void) {
   sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
   CHECK(capture.calls == 1 && capture.len == sizeof(frame));
   CHECK(memcmp(capture.bytes, frame, sizeof(frame)) == 0);
-  check_released_slots(&sensor);
+  check_receive_empty(&sensor);
 
   frame[sizeof(frame) - 1] ^= 0x40;
   CHECK(ssf_mems_rx_push(&serial, frame, sizeof(frame)) == sizeof(frame));
@@ -477,7 +471,7 @@ static void test_unclaimed_frames(void) {
   CHECK(!sensor.modbus_req.pending && !sensor.modbus_req.busy && sensor.modbus_req.status == 0);
   CHECK(test_wake_count == wakes_before + 1);
   CHECK(memcmp(&cached, &sensor.protocol.features, sizeof(cached)) == 0 && sensor.protocol.valid);
-  check_released_slots(&sensor);
+  check_receive_empty(&sensor);
 
   response_mode = REPLY_WRONG_COUNT;
   values[0] = 0xabcd;
@@ -488,7 +482,7 @@ static void test_unclaimed_frames(void) {
   CHECK(!sensor.modbus_req.pending && !sensor.modbus_req.busy);
   CHECK(test_wake_count == wakes_before);
   CHECK(memcmp(&cached, &sensor.protocol.features, sizeof(cached)) == 0 && sensor.protocol.valid);
-  check_released_slots(&sensor);
+  check_receive_empty(&sensor);
 }
 
 /* 实机峭度 0x0106 会在合法响应内部形成伪 FC06 帧头；坏候选不能破坏外层帧。 */
@@ -512,6 +506,52 @@ static void test_nested_candidate_payload(void) {
   CHECK(memcmp(values, setting_registers, sizeof(values)) == 0);
   CHECK(serial.dev.error_count == 1); /* 实际回复正确，失败的是数据区里的假候选。 */
   CHECK(sensor.modbus_req.quarantine_until == 0);
+}
+
+/* 任意多个伪帧头不能丢失最大帧，内部合法帧也不能清空未完成的外层。 */
+static void test_receive_window_boundaries(void) {
+  struct callback_capture capture = {0};
+  u8 outer[255], noise[513], inner[] = {1, 6, 0, 100, 0x12, 0x34, 0, 0};
+  const u8 padding[] = {0xff, 0xff, 0xff};
+  size_t i;
+
+  reset_sensor();
+  sensor.modbus_rx.handler = capture_frame;
+  sensor.modbus_rx.handler_context = &capture;
+  for (i = 0; i < sizeof(noise); i++)
+    noise[i] = (const u8[]){1, 3, 250}[i % 3];
+  CHECK(ssf_mems_rx_push(&serial, noise, sizeof(noise)) == sizeof(noise));
+  sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+  CHECK(sensor.modbus_rx.frame_used <= SSF_MEMS_MODBUS_MAX_FRAME_LEN);
+  CHECK(capture.calls == 0);
+
+  memset(outer, 0x55, sizeof(outer));
+  outer[0] = 1;
+  outer[1] = 3;
+  outer[2] = sizeof(outer) - 5;
+  for (i = 6; i + 3 < sizeof(outer) - 2; i += 6) {
+    outer[i] = 1;
+    outer[i + 1] = 3;
+    outer[i + 2] = 250;
+  }
+  finish_crc(inner, sizeof(inner));
+  memcpy(outer + 30, inner, sizeof(inner));
+  finish_crc(outer, sizeof(outer));
+  /* 接收已初始化后不再为候选帧分配内存。 */
+  test_allocation_failure = true;
+  for (i = 0; i < sizeof(outer); i++) {
+    CHECK(ssf_mems_rx_push(&serial, outer + i, 1) == 1);
+    sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+    CHECK(sensor.modbus_rx.frame_used <= SSF_MEMS_MODBUS_MAX_FRAME_LEN);
+    if (i == 37)
+      CHECK(capture.calls == 1 && capture.len == sizeof(inner));
+  }
+  test_allocation_failure = false;
+  CHECK(capture.calls == 2 && capture.len == sizeof(outer));
+  CHECK(memcmp(capture.bytes, outer, sizeof(outer)) == 0);
+  CHECK(ssf_mems_rx_push(&serial, padding, sizeof(padding)) == sizeof(padding));
+  sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+  CHECK(capture.calls == 2); /* 完整帧不能随下一字节被重复交付。 */
 }
 
 struct expected_field { u16 display_reg; size_t offset, width; u16 mask; };
@@ -1310,7 +1350,13 @@ static void test_request_isolation(void) {
   feed_bytes(leftovers, sizeof(leftovers));
   CHECK(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40) == 0);
   CHECK(value == wire_value(120));
-  check_released_slots(&sensor);
+  check_receive_empty(&sensor);
+
+  reset_sensor();
+  response_mode = REPLY_NOISE_THEN_NORMAL;
+  CHECK(ssf_mems_modbus_read_reg(&serial, 40121, &value, 40) == 0);
+  CHECK(value == wire_value(120) && sends == 1);
+  CHECK(sensor.modbus_req.quarantine_until == 0);
 
   reset_sensor();
   wait_hook = deliver_noise;
@@ -1335,26 +1381,24 @@ static void test_receive_expiry(void) {
   u8 response[] = {1, 3, 2, 0x12, 0x34, 0, 0};
   struct callback_capture capture = {0};
   unsigned long expiry;
-  size_t i;
 
   reset_sensor();
   sensor.modbus_rx.handler = capture_frame;
   sensor.modbus_rx.handler_context = &capture;
   finish_crc(response, sizeof(response));
   feed_bytes(leftovers, sizeof(leftovers));
-  for (i = 0; i < ARRAY_SIZE(sensor.modbus_rx.frame); i++)
-    CHECK(atomic_read(&sensor.modbus_rx.frame[i].in_use) == SSF_MEMS_FRAME_SLOT_USED);
+  CHECK(sensor.modbus_rx.frame_used == sizeof(leftovers));
   expiry = sensor.modbus_rx.expiry_work.delay;
   jiffies = expiry - 1;
   sensor.modbus_rx.expiry_work.work.fn(&sensor.modbus_rx.expiry_work.work);
-  CHECK(sensor.modbus_rx.frame[0].data != NULL);
+  CHECK(sensor.modbus_rx.frame_used == sizeof(leftovers));
   jiffies = expiry;
   sensor.modbus_rx.expiry_work.work.fn(&sensor.modbus_rx.expiry_work.work);
-  check_released_slots(&sensor);
+  check_receive_empty(&sensor);
   feed_bytes(response, sizeof(response));
   CHECK(capture.calls == 1 && capture.len == sizeof(response));
 
-  /* 即使定时任务尚未执行，新字节也会主动回收超过绝对寿命的候选帧。 */
+  /* 即使定时任务尚未执行，新字节也会主动淘汰超过绝对寿命的候选帧头。 */
   ssf_mems_modbus_receive_flush(&sensor);
   feed_bytes(leftovers, sizeof(leftovers));
   jiffies += expiry;
@@ -1372,6 +1416,44 @@ static void test_receive_expiry(void) {
   feed_bytes(response + 3, sizeof(response) - 3);
   CHECK(capture.calls == 3);
   CHECK(memcmp(capture.bytes, response, sizeof(response)) == 0);
+}
+
+/* 字节不断到达不能延长旧帧头寿命，旧头过期也不能误删新帧头。 */
+static void test_receive_absolute_expiry(void) {
+  const u8 stale[] = {1, 3, 250};
+  u8 response[] = {1, 3, 2, 0x12, 0x34, 0, 0};
+  struct callback_capture capture = {0};
+  unsigned long expiry;
+  size_t i;
+
+  reset_sensor();
+  sensor.modbus_rx.handler = capture_frame;
+  sensor.modbus_rx.handler_context = &capture;
+  finish_crc(response, sizeof(response));
+  feed_bytes(response, 1);
+  expiry = sensor.modbus_rx.expiry_work.delay;
+  for (i = 1; i < sizeof(response); i++) {
+    jiffies += expiry / 3;
+    feed_bytes(response + i, 1);
+  }
+  CHECK(jiffies > expiry && capture.calls == 0);
+  feed_bytes(response, sizeof(response));
+  CHECK(capture.calls == 1 && capture.len == sizeof(response));
+
+  reset_sensor();
+  memset(&capture, 0, sizeof(capture));
+  sensor.modbus_rx.handler = capture_frame;
+  sensor.modbus_rx.handler_context = &capture;
+  feed_bytes(stale, sizeof(stale));
+  expiry = sensor.modbus_rx.expiry_work.delay;
+  jiffies = expiry - 2;
+  feed_bytes(response, 3);
+  CHECK(sensor.modbus_rx.frame_used == sizeof(stale) + 3);
+  jiffies = expiry + 1;
+  feed_bytes(response + 3, sizeof(response) - 3);
+  CHECK(capture.calls == 1 && capture.len == sizeof(response));
+  CHECK(memcmp(capture.bytes, response, sizeof(response)) == 0);
+  check_receive_empty(&sensor);
 }
 
 static void test_feature_settings(void) {
@@ -1626,8 +1708,9 @@ static void test_raw_session(void) {
     return;
   }
   setting_registers[51] = 9;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EOPNOTSUPP);
-  CHECK(sends == 1 && !sensor.raw.active);
+  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
+  CHECK(sensor.raw.sampling_rate_index == 9 && !reboots);
   finite_sensor();
   setting_registers[51] = SSF_MEMS_SAMPLING_RATE_MAX_INDEX + 1;
   CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EPROTO);
@@ -1828,6 +1911,37 @@ static void test_feature_switch_metadata(void) {
   NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, 64, 0), -EINVAL);
 }
 
+/* 同值波特率只读确认，暂存值不同或应答失败时不能盲目跳过验证。 */
+static void test_unchanged_baudrate(void) {
+  unsigned int before;
+
+  if (ssf_mems_modbus_find_reg_by_name("save_config_and_reboot") == NULL)
+    return;
+  reset_sensor();
+  enforce_sensor_baudrate = true;
+  sensor_baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
+  sensor.protocol.valid = true;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_9600, 50) == 0);
+  CHECK(sends == 1 && tx_events[0].function == 3 && !reboots && !sleep_count);
+  CHECK(sensor.protocol.valid && serial.baudrate_set_count == 0);
+
+  /* 回读与已验证的目标不同，说明存在尚未保存的配置，仍需完整保存。 */
+  staged_baudrate = SSF_MEMS_BAUDRATE_38400;
+  before = sends;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_9600, 50) == 0);
+  CHECK(sends == before + 4 && reboots == 1 && !sensor.protocol.valid);
+  CHECK(tx_events[before].function == 3 && tx_events[before + 1].function == 6);
+
+  reset_sensor();
+  response_mode = REPLY_EXCEPTION;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_9600, 50) == -EREMOTEIO);
+  CHECK(sends == 1 && !reboots && !sleep_count);
+  reset_sensor();
+  response_mode = REPLY_NONE;
+  CHECK(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_9600, 50) == -ETIMEDOUT);
+  CHECK(sends == 1 && !reboots && !sleep_count);
+}
+
 /* 型号只提供部分波特率编码时，不向传感器写未提供的编码或越界扫描。 */
 static void test_short_baud_table(void) {
   enum ssf_mems_baudrate found = SSF_MEMS_BAUDRATE_1000000;
@@ -1844,6 +1958,7 @@ static void test_short_baud_table(void) {
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   test_manual_register_descriptions();
+  test_unchanged_baudrate();
   if (strcmp(argv[1], "short_baud_table") == 0) {
     test_short_baud_table();
     goto done;
@@ -1872,6 +1987,7 @@ int main(int argc, char **argv) {
   test_receive_callback();
   test_unclaimed_frames();
   test_nested_candidate_payload();
+  test_receive_window_boundaries();
   test_codecs();
   test_response_matching();
   test_requests();
@@ -1881,6 +1997,7 @@ int main(int argc, char **argv) {
   test_baudrate_reboot();
   test_request_isolation();
   test_receive_expiry();
+  test_receive_absolute_expiry();
   test_sparse_features();
   test_feature_settings();
   test_raw_parser();

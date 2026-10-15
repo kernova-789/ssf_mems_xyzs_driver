@@ -4,7 +4,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-#include "modbus_types.h"
+#include "modbus/modbus_types.h"
 
 struct serdev_device;
 struct ssf_mems_xyzs_data;

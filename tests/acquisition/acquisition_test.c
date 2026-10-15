@@ -37,7 +37,8 @@ enum scenario {
   CHANGING, CONSTANT, LINK_FAILURE, EXCEPTION, NO_SENSOR, MANUAL,
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
   RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
-  RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED, POLL_SWITCH
+  RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED, POLL_SWITCH,
+  SAMPLING_TARGET_RECONNECT
 };
 static enum scenario scenario;
 static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
@@ -83,13 +84,14 @@ int ssf_mems_protocol_write_setting(struct serdev_device *s,
                                    enum ssf_mems_sensor_setting setting,
                                    u16 value, unsigned int timeout_ms) {
   CHECK(s == &serial && setting == SSF_MEMS_SETTING_SAMPLING_RATE);
-  CHECK(value <= SSF_MEMS_SAMPLING_RATE_MAX_INDEX);
   CHECK(timeout_ms > 200);
+  if (value > SSF_MEMS_SAMPLING_RATE_MAX_INDEX)
+    return -EINVAL;
   setting_calls++;
   if (device.acquisition.phase == SSF_MEMS_ACQ_CONFIGURE) {
     /* 自动配置必须在匹配/切换波特率后、读取和发布样本之前进行。 */
     CHECK(get_count > 0 && !device.acquisition.online);
-    CHECK(value == 6);
+    CHECK(value == device.acquisition.target_sampling_rate_index);
     CHECK(device.protocol.host_baudrate ==
           (unsigned int)ssf_mems_baudrate_to_value(device.acquisition.target_baudrate));
     sampling_config_calls++;
@@ -102,6 +104,9 @@ int ssf_mems_protocol_write_setting(struct serdev_device *s,
     }
     if (scenario == STOP_CONFIGURE)
       stop_requested = true;
+  } else if (!setting_error && value != sensor_sampling_index) {
+    sensor_sampling_index = value;
+    sensor_setting_writes++;
   }
   return setting_error;
 }
@@ -191,7 +196,7 @@ int ssf_mems_protocol_read_features(struct serdev_device *s,
   CHECK(read_count < ARRAY_SIZE(read_started_at));
   read_started_at[read_count++] = jiffies;
   CHECK(sampling_config_calls > 0 &&
-        sensor_sampling_index == 6);
+        sensor_sampling_index == device.acquisition.target_sampling_rate_index);
   if (scenario == STOP_READ)
     stop_requested = true;
   if (fail_reads && read_count > 1) {
@@ -258,7 +263,8 @@ void test_acquisition_wait(unsigned long timeout) {
       CHECK(raw_captures == 1 && get_count == 1 && publish_count == 0);
       CHECK(device.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
     } else {
-      CHECK(scenario == LINK_FAILURE && failure_count >= 5);
+      CHECK((scenario == LINK_FAILURE || scenario == SAMPLING_TARGET_RECONNECT) &&
+            failure_count >= 5);
       CHECK(publish_count == 1);
       /* 模拟传感器掉电，启动后回到默认速率。 */
       sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
@@ -267,7 +273,21 @@ void test_acquisition_wait(unsigned long timeout) {
     }
   } else if (device.acquisition.phase == SSF_MEMS_ACQ_POLL) {
     CHECK(timeout >= 2);
-    if (scenario == RAW_ONLY || scenario == RAW_ONLY_RECOVERY || scenario == RAW_ONLY_DROPS) {
+    if (scenario == SAMPLING_TARGET_RECONNECT && mode_switch_step == 0) {
+      CHECK(ssf_mems_acquisition_write_setting(
+          &device, SSF_MEMS_SETTING_SAMPLING_RATE, 4) == 0);
+      CHECK(device.acquisition.target_sampling_rate_index == 4);
+      setting_error = -ETIMEDOUT;
+      CHECK(ssf_mems_acquisition_write_setting(
+          &device, SSF_MEMS_SETTING_SAMPLING_RATE, 5) == -ETIMEDOUT);
+      CHECK(device.acquisition.target_sampling_rate_index == 4);
+      setting_error = 0;
+      CHECK(ssf_mems_acquisition_write_setting(
+          &device, SSF_MEMS_SETTING_SAMPLING_RATE, 99) == -EINVAL);
+      CHECK(device.acquisition.target_sampling_rate_index == 4);
+      mode_switch_step++;
+      fail_reads = true;
+    } else if (scenario == RAW_ONLY || scenario == RAW_ONLY_RECOVERY || scenario == RAW_ONLY_DROPS) {
       CHECK(device.acquisition.online && !device.protocol.valid);
       CHECK(publish_count == 0 && read_count == 0);
       if (raw_captures == 3)
@@ -325,7 +345,8 @@ void test_acquisition_wait(unsigned long timeout) {
       CHECK(raw_captures == 1 && device.acquisition.online);
       CHECK(device.protocol.mode == SSF_MEMS_LINK_MODBUS);
       stop_requested = true;
-    } else if (scenario == LINK_FAILURE && publish_count == 2) {
+    } else if ((scenario == LINK_FAILURE || scenario == SAMPLING_TARGET_RECONNECT) &&
+               publish_count == 2) {
       CHECK(get_count == 2 && set_count == 2);
       CHECK(device.acquisition.policy.interval_ms ==
             device.acquisition.policy.config.fixed_interval_ms);
@@ -365,6 +386,9 @@ static void reset_device(enum scenario next) {
   first_match_baudrate = 0;
   CHECK(device.acquisition.raw_duration_ms == 5000);
   CHECK(device.acquisition.feature_duration_ms == 5000);
+  CHECK(device.acquisition.target_baudrate == ssf_mems_sensor_profile.default_work_baudrate);
+  CHECK(device.acquisition.target_sampling_rate_index ==
+        ssf_mems_sensor_profile.default_sampling_rate_index);
   device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
   mode_switch_step = 0;
   raw_captures = 0;
@@ -415,6 +439,12 @@ static void test_thread_scenarios(void) {
   run_thread();
   CHECK(backoff_count == 1 && backoffs[0] == 1000 && publish_count == 2);
   CHECK(sampling_config_calls == 2 && sensor_setting_writes == 2);
+
+  reset_device(SAMPLING_TARGET_RECONNECT);
+  run_thread();
+  CHECK(backoff_count == 1 && sampling_config_calls == 2);
+  CHECK(device.acquisition.target_sampling_rate_index == 4 && sensor_sampling_index == 4);
+  CHECK(sensor_setting_writes == 3); /* 首次默认值、手动值、掉电后恢复手动值。 */
 
   reset_device(EXCEPTION);
   fail_reads = true;
@@ -567,7 +597,10 @@ static void test_policy(void) {
   adaptive_policy(&policy, 0);
   policy.interval_ms = 1000;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 30000);
-  CHECK(policy.interval_ms == 950 && policy.next_probe == 60000);
+  CHECK(policy.interval_ms == 1000 && policy.next_probe == 60000);
+  sample.temperature_x100++;
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 60000);
+  CHECK(policy.interval_ms == 950 && policy.next_probe == 90000);
 
   /* 每个字段变化都必须判为新数据，未使用的填充字节必须被忽略。 */
   for (i = 0; i < sizeof(sample); i++) {
@@ -622,12 +655,12 @@ static void test_policy(void) {
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
   for (i = 1; i <= 30; i++)
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, i * 1000UL);
-  CHECK(policy.comparisons == 30 && policy.repeats == 30 && policy.interval_ms == 950);
+  CHECK(policy.comparisons == 30 && policy.repeats == 30 && policy.interval_ms == 1000);
   ssf_mems_acquisition_policy_contact(&policy, 30500);
-  CHECK(policy.comparisons == 30 && policy.interval_ms == 950);
+  CHECK(policy.comparisons == 30 && policy.interval_ms == 1000);
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 31000);
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 32000);
-  CHECK(policy.comparisons == 0 && policy.interval_ms == 1140);
+  CHECK(policy.comparisons == 0 && policy.interval_ms == 1200);
 
   /* 完整窗口与定期试探同时到期时，只执行窗口决策。 */
   adaptive_policy(&policy, 0);
@@ -658,6 +691,78 @@ static void test_policy(void) {
   window(&policy, &sample, 32, 5);
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 100000);
   CHECK(policy.interval_ms == 2200 && policy.comparisons == 0);
+}
+
+/* 每次按生效周期推进时间，验证长周期不会被 30 秒试探反向缩短。 */
+static void test_timed_policy(void) {
+  struct ssf_mems_acquisition_policy policy;
+  struct ssf_mems_sensor_data sample = {0};
+  struct ssf_mems_poll_config config;
+  unsigned long now;
+  unsigned int previous_interval;
+
+  for (unsigned int start = 20000; start <= 60000; start += 40000) {
+    ssf_mems_acquisition_policy_init(&policy, 0);
+    config = policy.config;
+    config.fixed_interval_ms = start;
+    config.max_interval_ms = 60000;
+    CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 0) == 0);
+    config.mode = SSF_MEMS_POLL_ADAPTIVE;
+    CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 0) == 0);
+    now = 0;
+    ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+    for (unsigned int i = 0; i < 96; i++) {
+      previous_interval = policy.interval_ms;
+      now += previous_interval;
+      ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+      CHECK(policy.interval_ms >= previous_interval && policy.interval_ms <= 60000);
+      if (i % 7 == 0) {
+        /* 原始窗口只更新通信状态，不丢弃尚未完成的比较统计。 */
+        unsigned int comparisons = policy.comparisons;
+        now += 5000;
+        ssf_mems_acquisition_policy_contact(&policy, now);
+        CHECK(policy.comparisons == comparisons);
+      }
+    }
+    CHECK(policy.interval_ms == (start == 60000 ? 60000 : 34560));
+  }
+
+  /* 有持续变化且通信有余量时，长周期仍能试探提速。 */
+  adaptive_policy(&policy, 0);
+  config = policy.config;
+  config.max_interval_ms = 60000;
+  CHECK(ssf_mems_acquisition_policy_configure(&policy, &config, 0) == 0);
+  policy.interval_ms = 60000;
+  now = 0;
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+  for (unsigned int i = 0; i < 8; i++) {
+    previous_interval = policy.interval_ms;
+    now += previous_interval;
+    sample.temperature_x100++;
+    ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+    CHECK(policy.interval_ms < previous_interval);
+  }
+  CHECK(policy.comparisons == 8 && policy.repeats == 0);
+
+  /* 少量变化不能绕过窗口中已经明确的高重复率。 */
+  adaptive_policy(&policy, 0);
+  now = 0;
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+  for (unsigned int i = 0; i < 10; i++) {
+    now += policy.interval_ms;
+    ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+  }
+  now = policy.next_probe;
+  sample.temperature_x100++;
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
+  CHECK(policy.interval_ms == 1000 && policy.repeats == 10);
+
+  /* 数据虽变化，读取占用超过半个周期也不能试探提速。 */
+  adaptive_policy(&policy, 0);
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 501, 0);
+  sample.temperature_x100++;
+  ssf_mems_acquisition_policy_sample(&policy, &sample, 501, 30000);
+  CHECK(policy.interval_ms == 1000);
 }
 
 /* 配置在主机生效；非法写入不改变已设置的周期或上下限。 */
@@ -881,7 +986,7 @@ static void test_runtime_controls(void) {
   CHECK(get_count == 0 && set_count == 0 && read_count == 0 && setting_calls == 0);
 }
 
-/* 初次匹配保留启动提示，正式运行始终使用 128000，不随扫描结果改变。 */
+/* 初次匹配保留启动提示，工作目标取自型号表，不随扫描结果改变。 */
 static void test_startup_baudrate_target(void) {
   static const enum ssf_mems_baudrate hints[] = {
       SSF_MEMS_BAUDRATE_DEFAULT, SSF_MEMS_BAUDRATE_57600,
@@ -924,6 +1029,7 @@ int main(void) {
   u16 value;
 
   test_policy();
+  test_timed_policy();
   test_poll_configuration();
   test_poll_scheduling();
   test_thread_scenarios();

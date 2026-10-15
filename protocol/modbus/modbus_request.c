@@ -1,9 +1,9 @@
-#include "modbus_request.h"
-#include "serial_transport.h"
+#include "modbus/modbus_request.h"
+#include "transport/serial_transport.h"
 #include "core.h"
-#include "modbus.h"
-#include "modbus_table.h"
-#include "modbus_receive.h"
+#include "modbus/modbus.h"
+#include "model/modbus_table.h"
+#include "modbus/modbus_receive.h"
 
 #include <linux/errno.h>
 #include <linux/jiffies.h>
