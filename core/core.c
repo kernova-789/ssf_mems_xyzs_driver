@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/property.h>
 #include <linux/serdev.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -17,7 +18,7 @@
  * 返回：已接收的字节数，失败时为 0。
  * 未入队的剩余字节由 serdev 重送。
  */
-static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
+static int ssf_mems_serdev_ops_receive_buf(struct serdev_device *serdev,
                               const unsigned char *buf, size_t count) {
   ssize_t ret;
 
@@ -34,22 +35,22 @@ static int ssf_mems_xyzs_ops_receive_buf(struct serdev_device *serdev,
 /* 唤醒等待发送串口数据的线程。
  * 返回：无。
  */
-static void ssf_mems_xyzs_ops_write_wakeup(struct serdev_device *serdev) {
+static void ssf_mems_serdev_ops_write_wakeup(struct serdev_device *serdev) {
   serdev_device_write_wakeup(serdev);
 }
 
 /* serdev 回调表：接收只入队，发送唤醒交给 serdev 通用实现。 */
-static const struct serdev_device_ops ssf_mems_xyzs_ops = {
-    .receive_buf = ssf_mems_xyzs_ops_receive_buf,
-    .write_wakeup = ssf_mems_xyzs_ops_write_wakeup,
+static const struct serdev_device_ops ssf_mems_serdev_ops = {
+    .receive_buf = ssf_mems_serdev_ops_receive_buf,
+    .write_wakeup = ssf_mems_serdev_ops_write_wakeup,
 };
 
 /* 初始化驱动并启动后台采集。
  * 返回：0 成功，负数为初始化错误。
  * 传感器通信由后台线程执行。
  */
-static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
+static int ssf_mems_probe(struct serdev_device *serdev) {
+  struct ssf_mems_data *data;
   int ret;
 
   data = devm_kzalloc(&serdev->dev, sizeof(*data), GFP_KERNEL);
@@ -57,6 +58,10 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
     return -ENOMEM;
 
   data->serdev = serdev;
+  data->sensor = device_get_match_data(&serdev->dev);
+  if (data->sensor == NULL)
+    return -ENODEV;
+  data->sensor_ops = data->sensor->ops;
 
   /* probe 只初始化主机状态；真正匹配和 Modbus 读写由后台线程执行。 */
   ret = ssf_mems_protocol_init(data);
@@ -77,7 +82,7 @@ static int ssf_mems_xyzs_probe(struct serdev_device *serdev) {
   }
 
   serdev_device_set_drvdata(serdev, data);
-  serdev_device_set_client_ops(serdev, &ssf_mems_xyzs_ops);
+  serdev_device_set_client_ops(serdev, &ssf_mems_serdev_ops);
 
   ret = devm_serdev_device_open(&serdev->dev, serdev);
   if (ret != 0)
@@ -125,8 +130,8 @@ err_request:
  * 返回：无。
  * 先停止数据生产者，再释放 IIO 和接收资源。
  */
-static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
+static void ssf_mems_remove(struct serdev_device *serdev) {
+  struct ssf_mems_data *data;
   data = serdev_device_get_drvdata(serdev);
   ssf_mems_ota_shutdown(data);
   /* 先拒绝新请求并唤醒在途请求，再等待生产者退出，最后释放其使用的资源。 */
@@ -136,11 +141,13 @@ static void ssf_mems_xyzs_remove(struct serdev_device *serdev) {
   ssf_mems_modbus_receive_remove(data);
 }
 
-/* 当前只绑定温振声型号；最后一个空项是 OF 匹配表的结束标记。 */
+/* 按设备树选择型号；最后一个空项是 OF 匹配表的结束标记。 */
 static const struct of_device_id ssf_mems_of_matchs[] = {
     {
         .compatible = "sange-cbm,ssf-mems-xyzs",
+        .data = &ssf_mems_xyzs,
     },
+    { .compatible = "sange-cbm,ssf-mems-xyz", .data = &ssf_mems_xyz },
     {}};
 
 MODULE_DEVICE_TABLE(of, ssf_mems_of_matchs);
@@ -154,8 +161,8 @@ static struct serdev_device_driver ssf_mems_driver = {
             .owner = THIS_MODULE,
         },
 
-    .probe = ssf_mems_xyzs_probe,
-    .remove = ssf_mems_xyzs_remove,
+    .probe = ssf_mems_probe,
+    .remove = ssf_mems_remove,
 };
 
 module_serdev_device_driver(ssf_mems_driver);

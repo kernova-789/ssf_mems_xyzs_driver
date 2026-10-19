@@ -11,10 +11,21 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+/* 仅从当前实例取型号，不使用全局默认表。 */
+static const struct ssf_mems_sensor *
+ssf_mems_modbus_sensor(struct serdev_device *serdev) {
+  struct ssf_mems_data *data;
+
+  if (serdev == NULL)
+    return NULL;
+  data = serdev_device_get_drvdata(serdev);
+  return data ? data->sensor : NULL;
+}
+
 /* 查表校验请求并生成传输描述。
  * 返回：0 成功，负数为参数、缺失表项、权限或格式错误。
  */
-int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
+int ssf_mems_modbus_plan_request(const struct ssf_mems_sensor *sensor, u8 function, u16 display_reg, u16 reg_count,
                                 const struct ssf_block_cmd_desc *block,
                                 struct ssf_modbus_transfer *transfer) {
   const struct ssf_modbus_frame_desc *frame;
@@ -26,6 +37,8 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
       (u32)display_reg + reg_count > 0x10000U)
     return -EINVAL;
 
+  if (sensor == NULL)
+    return -ENODEV;
   frame = ssf_mems_modbus_find_frame(function);
   if (frame == NULL)
     return -EOPNOTSUPP;
@@ -46,14 +59,14 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
       return -EINVAL;
   }
 
-  first = ssf_mems_modbus_find_reg(display_reg);
+  first = ssf_mems_sensor_find_reg(sensor, display_reg);
   if (first == NULL)
     return -ENOENT;
   if ((u32)first->protocol_addr + reg_count > 0x10000U)
     return -EINVAL;
 
   for (i = 0; i < reg_count; i++) {
-    const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(display_reg + i);
+    const struct ssf_reg_desc *reg = ssf_mems_sensor_find_reg(sensor, display_reg + i);
 
     if (reg == NULL)
       return -ENOENT;
@@ -79,7 +92,7 @@ int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
  * 返回：超时毫秒数，至少 100 ms。
  */
 static unsigned int
-ssf_mems_modbus_write_timeout_ms(const struct ssf_mems_xyzs_data *data,
+ssf_mems_modbus_write_timeout_ms(const struct ssf_mems_data *data,
                                  size_t len) {
   return max(SSF_MEMS_MODBUS_MIN_WRITE_TIMEOUT_MS,
              ssf_mems_serial_wire_ms(data, len) + SSF_MEMS_MODBUS_WRITE_MARGIN_MS);
@@ -89,7 +102,7 @@ ssf_mems_modbus_write_timeout_ms(const struct ssf_mems_xyzs_data *data,
  * 返回：0 完整发送，负数为组帧、分配或串口错误。
  */
 static int ssf_mems_modbus_send_request(
-    struct ssf_mems_xyzs_data *data,
+    struct ssf_mems_data *data,
     const struct ssf_modbus_transfer *transfer, u8 slave_id,
     const u16 *values, size_t values_count) {
   unsigned int write_timeout_ms;
@@ -117,7 +130,7 @@ out:
 /* 初始化请求状态和等待队列。
  * 返回：0 成功，-EINVAL 设备无效。
  */
-int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_modbus_request_init(struct ssf_mems_data *data) {
   struct ssf_mems_modbus_request_state *req;
 
   if (data == NULL)
@@ -142,7 +155,7 @@ int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 在途请求以 -ENODEV 结束。
  */
-void ssf_mems_modbus_request_remove(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_modbus_request_remove(struct ssf_mems_data *data) {
   struct ssf_mems_modbus_request_state *req;
 
   if (data == NULL)
@@ -199,7 +212,7 @@ static int ssf_mems_modbus_wait_request(struct ssf_mems_modbus_request_state *re
  * 返回：静默 tick 数。
  * 按 3.5 个字符时间估算，至少按 2 ms 换算。
  */
-static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_xyzs_data *data) {
+static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_data *data) {
   return msecs_to_jiffies(ssf_mems_serial_gap_ms(data));
 }
 
@@ -207,7 +220,7 @@ static unsigned long ssf_mems_modbus_silent_ticks(struct ssf_mems_xyzs_data *dat
  * 返回：0 可以发送，-ENODEV 停止，-ETIMEDOUT 超时，负数也可能是信号中断。
  * 调用者持总线锁，不能持请求锁。
  */
-static int ssf_mems_modbus_prepare_request(struct ssf_mems_xyzs_data *data,
+static int ssf_mems_modbus_prepare_request(struct ssf_mems_data *data,
                                            bool recovery_read) {
   struct ssf_mems_modbus_request_state *req = &data->modbus_req;
   unsigned long silent = ssf_mems_modbus_silent_ticks(data);
@@ -261,7 +274,7 @@ static int ssf_mems_modbus_execute(struct serdev_device *serdev,
                                   u16 *rx_values, size_t rx_values_count,
                                   unsigned int timeout_ms,
                                   bool bus_locked, bool recovery_read) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_modbus_request_state *req;
   int ret;
 
@@ -350,7 +363,8 @@ static int ssf_mems_modbus_read_block_range_common(
 
   if (serdev == NULL || values == NULL || values_count < reg_count)
     return -EINVAL;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_READ, display_reg,
+  ret = ssf_mems_modbus_plan_request(
+      ssf_mems_modbus_sensor(serdev), SSF_MEMS_MODBUS_FUNC_READ, display_reg,
                                      reg_count, block, &transfer);
   if (ret != 0)
     return ret;
@@ -426,7 +440,8 @@ int ssf_mems_modbus_read_reg_recovery_locked(struct serdev_device *serdev,
 
   if (serdev == NULL || value == NULL)
     return -EINVAL;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_READ, display_reg,
+  ret = ssf_mems_modbus_plan_request(
+      ssf_mems_modbus_sensor(serdev), SSF_MEMS_MODBUS_FUNC_READ, display_reg,
                                      1, NULL, &transfer);
   if (ret != 0)
     return ret;
@@ -447,7 +462,8 @@ static int ssf_mems_modbus_write_reg_common(struct serdev_device *serdev,
 
   if (serdev == NULL)
     return -EINVAL;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
+  ret = ssf_mems_modbus_plan_request(
+      ssf_mems_modbus_sensor(serdev), SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
                                      display_reg, 1, NULL, &transfer);
   if (ret != 0)
     return ret;
@@ -487,7 +503,10 @@ static int ssf_mems_modbus_read_name(struct serdev_device *serdev,
 
   if (serdev == NULL || name == NULL || name[0] == '\0' || value == NULL)
     return -EINVAL;
-  reg = ssf_mems_modbus_find_reg_by_name(name);
+  if (ssf_mems_modbus_sensor(serdev) == NULL)
+    return -ENODEV;
+  reg = ssf_mems_sensor_find_reg_by_name(
+      ssf_mems_modbus_sensor(serdev), name);
   if (reg == NULL)
     return -ENOENT;
   if (bus_locked == true)
@@ -526,7 +545,10 @@ static int ssf_mems_modbus_write_name(struct serdev_device *serdev,
 
   if (serdev == NULL || name == NULL || name[0] == '\0')
     return -EINVAL;
-  reg = ssf_mems_modbus_find_reg_by_name(name);
+  if (ssf_mems_modbus_sensor(serdev) == NULL)
+    return -ENODEV;
+  reg = ssf_mems_sensor_find_reg_by_name(
+      ssf_mems_modbus_sensor(serdev), name);
   if (reg == NULL)
     return -ENOENT;
   return ssf_mems_modbus_write_reg_common(serdev, reg->display_reg, value,
@@ -566,7 +588,8 @@ static int ssf_mems_modbus_write_regs_common(
 
   if (serdev == NULL || values == NULL || values_count < reg_count)
     return -EINVAL;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_MULTI,
+  ret = ssf_mems_modbus_plan_request(
+      ssf_mems_modbus_sensor(serdev), SSF_MEMS_MODBUS_FUNC_WRITE_MULTI,
                                      display_reg, reg_count, NULL, &transfer);
   if (ret != 0)
     return ret;
@@ -610,7 +633,8 @@ static int ssf_mems_modbus_write_block_common(
     return -EINVAL;
   if (block->direction != SSF_CMD_WRITE)
     return -EOPNOTSUPP;
-  ret = ssf_mems_modbus_plan_request(block->function, block->start_display_reg,
+  ret = ssf_mems_modbus_plan_request(
+      ssf_mems_modbus_sensor(serdev), block->function, block->start_display_reg,
                                      block->reg_count, block, &transfer);
   if (ret != 0)
     return ret;
@@ -644,7 +668,7 @@ int ssf_mems_modbus_write_block_locked(
  * 返回：true 已认领，false 未认领。
  * 认领从机异常帧也返回 true，不表示请求成功。
  */
-bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
+bool ssf_mems_modbus_claim_frame(struct ssf_mems_data *data,
                                  const u8 *buf, size_t len) {
   struct ssf_mems_modbus_request_state *req;
   int ret;

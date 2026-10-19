@@ -105,7 +105,7 @@ int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
 /* 初始化固件升级状态。
  * 返回：无。
  */
-void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_ota_init(struct ssf_mems_data *data) {
   struct ssf_mems_ota_state *ota = &data->ota;
 
   memset(ota, 0, sizeof(*ota));
@@ -119,7 +119,7 @@ void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data) {
 /* 禁止新升级并唤醒升级等待者。
  * 返回：无。
  */
-void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_ota_shutdown(struct ssf_mems_data *data) {
   mutex_lock(&data->ota.lock);
   WRITE_ONCE(data->ota.stopping, true);
   mutex_unlock(&data->ota.lock);
@@ -130,7 +130,7 @@ void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 开始加载时清空旧进度。
  */
-void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
+void ssf_mems_ota_set_stage(struct ssf_mems_data *data,
                             enum ssf_mems_ota_stage stage, int error) {
   mutex_lock(&data->ota.lock);
   data->ota.status.stage = stage;
@@ -147,7 +147,7 @@ void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
  * 返回：无。
  * 只持升级状态锁，升级期间也可读取。
  */
-void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
+void ssf_mems_ota_get_status(struct ssf_mems_data *data,
                              struct ssf_mems_ota_status *status) {
   mutex_lock(&data->ota.lock);
   *status = data->ota.status;
@@ -170,7 +170,7 @@ const char *ssf_mems_ota_stage_name(enum ssf_mems_ota_stage stage) {
  * 返回：无。
  * 收齐应答后唤醒发送者。
  */
-void ssf_mems_ota_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
+void ssf_mems_ota_receive_byte(struct ssf_mems_data *data, u8 byte) {
   struct ssf_mems_ota_state *ota = &data->ota;
   bool complete = false;
 
@@ -201,7 +201,7 @@ out:
 /* 等待升级所需的时间间隔。
  * 返回：0 等待结束，-ENODEV 停止，负数也可能是信号中断。
  */
-static int ssf_mems_ota_pause(struct ssf_mems_xyzs_data *data, unsigned int ms) {
+static int ssf_mems_ota_pause(struct ssf_mems_data *data, unsigned int ms) {
   long ret = wait_event_interruptible_timeout(
       data->ota.waitq, READ_ONCE(data->ota.stopping) == true,
       msecs_to_jiffies(ms));
@@ -215,7 +215,7 @@ static int ssf_mems_ota_pause(struct ssf_mems_xyzs_data *data, unsigned int ms) 
  * 返回：0 收到完整应答，负数为串口、超时、停止或信号错误。
  * 发送不完整时不补发尾部。
  */
-static int ssf_mems_ota_exchange(struct ssf_mems_xyzs_data *data,
+static int ssf_mems_ota_exchange(struct ssf_mems_data *data,
                                  const u8 *frame, u32 *next) {
   struct ssf_mems_ota_state *ota = &data->ota;
   unsigned int timeout = ssf_mems_serial_wire_ms(data, SSF_MEMS_OTA_FRAME_SIZE) + 200U;
@@ -258,7 +258,7 @@ out:
  * 返回：0 计数匹配，-EPROTO 计数异常，其他负数为传输错误。
  * 普通包允许重试，末包只发送一次。
  */
-static int ssf_mems_ota_send(struct ssf_mems_xyzs_data *data, const u8 *frame,
+static int ssf_mems_ota_send(struct ssf_mems_data *data, const u8 *frame,
                              u32 expected, bool final) {
   unsigned int attempt, attempts = final == true ? 1U : SSF_MEMS_OTA_RETRIES;
   u32 next = 0;
@@ -284,7 +284,7 @@ static int ssf_mems_ota_send(struct ssf_mems_xyzs_data *data, const u8 *frame,
  * 返回：0 升级应答及通信已确认，负数为镜像、状态或传输错误。
  * 调用者持 update_lock 和采集锁；末包不重发，结果不明时标记 uncertain。
  */
-int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
+int ssf_mems_ota_transfer(struct ssf_mems_data *data,
                           const u8 *image, size_t size) {
   u8 frame[SSF_MEMS_OTA_FRAME_SIZE];
   size_t offset, count;
@@ -296,6 +296,8 @@ int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
 
   if (data == NULL || data->serdev == NULL)
     return -EINVAL;
+  if (data->sensor == NULL || !data->sensor->supports_ota)
+    return -EOPNOTSUPP;
   ret = ssf_mems_ota_validate_image(image, size);
   if (ret != 0)
     goto done;

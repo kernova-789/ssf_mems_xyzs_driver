@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bounded IIO hardware test; disable owned buffers even when capture fails."""
+import argparse
 import errno
 import json
 import os
@@ -10,14 +11,18 @@ import struct
 import sys
 import time
 
-output = Path(sys.argv[1])
-duration = float(sys.argv[2])
-devices = {}
-for path in Path('/sys/bus/iio/devices').glob('iio:device*'):
-    name = (path / 'name').read_text().strip()
-    if name in ('ssf_mems_xyzs', 'ssf_mems_xyzs_raw'):
-        devices[name] = path
-assert len(devices) == 2, devices
+from iio_devices import find_pair
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('output', type=Path)
+parser.add_argument('duration', type=float)
+parser.add_argument('--serdev', help='只采集该 serdev 实例，例如 serial0-0')
+args = parser.parse_args()
+output = args.output
+duration = args.duration
+if duration <= 0:
+    parser.error('duration must be positive')
+devices = find_pair(args.serdev)
 
 def write(path, value):
     """写入本次测试负责的 IIO 配置属性。"""

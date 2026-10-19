@@ -56,8 +56,8 @@ core 在 IIO 注册前初始化采集状态，注册成功后启动 kthread。�
 
 以下轮询规则适用于特征模式以及交替模式的特征窗口。
 
-每轮调用 `ssf_mems_protocol_read_features()`，只采集表中保留的 40001～40029
-特征寄存器，不轮询配置寄存器或触发原始数据传输。分段读取必须全部成功才更新
+每轮调用 probe 绑定的 `data->sensor_ops->read_features()`，只采集当前型号表中的特征；XYZS 为 40001～40029，XYZ 为 40001～40019。
+这些是特征寄存器，不轮询配置寄存器或触发原始数据传输。分段读取必须全部成功才更新
 缓存。成功后取出完整快照，并调用 `ssf_mems_iio_publish_features()`，即使结果
 重复也发布：重复值本身不能证明没有产生新样本。buffer 发布错误不触发串口恢复。
 
@@ -140,7 +140,7 @@ IIO 发布另持 `indio_dev->mlock` 同步 buffer 开关；buffer 回调不能�
 开发板可用 `dmesg -w | grep -E 'acquisition configuration|sensor matched|baud change|40110|sampling|sensor online|sensor connection failed'`
 保留各阶段的结果。源代码检查和模拟测试无法证明板上的配置已生效。
 
-默认工作波特率和默认采样率在 `protocol/model/modbus_table.h` 的型号描述中；
+默认工作波特率和默认采样率在 `sensor/xyz.c` / `sensor/xyzs.c` 的型号描述中；
 启动/切换等待、请求超时和退避初值在 `ssf_mems_acquisition.c` 中；
 调速窗口、阈值周期及失败条件在 `acquisition_policy.h` 和对应 `.c` 中。
 
@@ -175,3 +175,5 @@ IIO 发布另持 `indio_dev->mlock` 同步 buffer 开关；buffer 回调不能�
 
 传输时间和帧间隔统一使用 `serial_transport`；默认采样率及其 Hz 文本从型号表读取。
 IIO 属性的完整用户说明见 [ATTRIBUTES.md](../iio/ATTRIBUTES.md)。
+
+型号层和回调关系见 [sensor/README.md](../sensor/README.md)。原始窗口通过 `sensor_ops->collect_raw()` 调用型号实现。

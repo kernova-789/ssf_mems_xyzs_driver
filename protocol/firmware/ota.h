@@ -5,7 +5,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 #define SSF_MEMS_OTA_BLOCK_SIZE 256U /* 一包写入的固定载荷字节数。 */
 #define SSF_MEMS_OTA_FRAME_SIZE 263U /* 6 字节头 + 256 字节载荷 + 1 字节校验。 */
@@ -53,11 +53,11 @@ struct ssf_mems_ota_state {
 /* 初始化固件升级状态。
  * 返回：无。
  */
-void ssf_mems_ota_init(struct ssf_mems_xyzs_data *data);
+void ssf_mems_ota_init(struct ssf_mems_data *data);
 /* 禁止新升级并唤醒升级等待者。
  * 返回：无。
  */
-void ssf_mems_ota_shutdown(struct ssf_mems_xyzs_data *data);
+void ssf_mems_ota_shutdown(struct ssf_mems_data *data);
 /* 检查固件大小和启动向量是否有效。
  * 返回：0 通过，-EINVAL 数据无效，-EFBIG 过大，-ENOEXEC 启动向量不符。
  */
@@ -77,24 +77,24 @@ int ssf_mems_ota_build_packet(u8 address, u32 sequence, const u8 *payload,
  * 返回：无。
  * 收齐应答后唤醒发送者。
  */
-void ssf_mems_ota_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);
+void ssf_mems_ota_receive_byte(struct ssf_mems_data *data, u8 byte);
 /* 传输固件并确认传感器重启后的通信。
  * 返回：0 升级应答及通信已确认，负数为镜像、状态或传输错误。
  * 调用者持 update_lock 和采集锁；末包不重发，结果不明时标记 uncertain。
  */
-int ssf_mems_ota_transfer(struct ssf_mems_xyzs_data *data,
+int ssf_mems_ota_transfer(struct ssf_mems_data *data,
                           const u8 *image, size_t size);
 /* 更新升级阶段和错误码。
  * 返回：无。
  * 开始加载时清空旧进度。
  */
-void ssf_mems_ota_set_stage(struct ssf_mems_xyzs_data *data,
+void ssf_mems_ota_set_stage(struct ssf_mems_data *data,
                             enum ssf_mems_ota_stage stage, int error);
 /* 复制当前固件升级进度。
  * 返回：无。
  * 只持升级状态锁，升级期间也可读取。
  */
-void ssf_mems_ota_get_status(struct ssf_mems_xyzs_data *data,
+void ssf_mems_ota_get_status(struct ssf_mems_data *data,
                              struct ssf_mems_ota_status *status);
 /* 把升级阶段转换为名称。
  * 返回：静态名称字符串，无效阶段为 "unknown"。

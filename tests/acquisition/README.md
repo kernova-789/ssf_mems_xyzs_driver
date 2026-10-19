@@ -51,3 +51,6 @@ against the target kernel and validate the device's 40102 change timing on hardw
 另用真实 pthread mutex 验证生产 `get_status()` 和 `get_config()`：持有完整采集事务锁时，
 在线状态、周期、样本年龄和主机配置仍可读取，调用受 5 秒测试超时保护。
 替代型号表将默认工作波特率改为 115200，验证初始化确实采用表中目标。
+
+替代型号测试还同时初始化 XYZ 和工作速率不同的 XYZS，确认目标配置按实例读取。
+XYZ 的自适应比较忽略 union 未使用区域，且能识别位移成员变化。

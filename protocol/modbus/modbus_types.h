@@ -2,7 +2,7 @@
 
 #include <linux/bitops.h>
 #include <linux/types.h>
-#include "model/sensor_fields.h"
+#include "sensor_fields.h"
 
 /*
  * Modbus 共用类型：定义功能码、收发格式和各种“描述表项”。
@@ -120,25 +120,11 @@ struct ssf_reg_desc {
   enum ssf_rx_format read_format; // 读取时预期的响应格式
   bool write_single;              // 是否允许用 0x06 单独写入
   enum ssf_mems_sensor_field feature_field; /* NONE 表示不映射特征。 */
+  struct ssf_mems_sensor_field_desc field; /* 本型号缓存成员的 offsetof/宽度/单位。 */
   u16 value_mask;                 // 写入特征缓存前保留的位
   u16 feature_multiplier; /* 特征单位换算的分子；0 按 1 处理。 */
   u16 feature_divisor; /* 特征单位换算的分母；0 按 1 处理。 */
   const char *name;               // 表内唯一、稳定的查询名称，同时用于调试
-};
-
-/* 当前型号的配置含义；上层只使用规范化后的特征单位和配置编号。 */
-struct ssf_mems_sensor_profile {
-  const char *const *sampling_frequencies; /* Hz 文本，按采样率编码索引。 */
-  size_t sampling_frequency_count;
-  const unsigned int *baudrates; /* bit/s，按传感器波特率编码索引。 */
-  size_t baudrate_count;
-  enum ssf_mems_baudrate default_work_baudrate; /* 驱动首次连接的目标编码。 */
-  u16 default_sampling_rate_index;
-  u16 raw_max_sampling_rate_index; /* 型号支持的定长采样率上限。 */
-  u32 raw_accel_scale_nano; /* 原始计数换算为 m/s² 的纳米比例。 */
-  u8 raw_axis_order[3]; /* 手册XYZ对应线上三轴的位置，取值0..2。 */
-  u16 feature_enable_mask;
-  u8 feature_enable_shift;
 };
 
 /* 上层批量操作的逻辑编号，不是 Modbus 功能码。 */

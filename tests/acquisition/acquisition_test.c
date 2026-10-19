@@ -13,7 +13,7 @@ static unsigned int checks;
 
 unsigned long jiffies;
 unsigned int test_wake_count;
-static struct ssf_mems_xyzs_data device;
+static struct ssf_mems_data device;
 static struct serdev_device serial;
 static struct task_struct task;
 static int (*thread_function)(void *);
@@ -38,14 +38,14 @@ enum scenario {
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
   RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
   RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED, POLL_SWITCH,
-  SAMPLING_TARGET_RECONNECT
+  SAMPLING_TARGET_RECONNECT, RAW_UNSUPPORTED, RAW_ONLY_UNSUPPORTED
 };
 static enum scenario scenario;
 static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
 static unsigned long raw_started_at[80]; /* 检查短窗口不会被 1 s 轮询间隔拖长。 */
 
 /* 停止接口无论线程在哪个阶段退出，都必须检查协议层残留的私有流。 */
-int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data) {
   CHECK(data == &device && data->acquisition.stopping);
   CHECK(data->acquisition.thread == NULL);
   data->protocol.mode = SSF_MEMS_LINK_MODBUS;
@@ -53,12 +53,17 @@ int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
 }
 
 /* 原始模式由协议模块测试；这里核对采集状态机的交替顺序和计时。 */
-int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
-                                 unsigned int duration_ms) {
+int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
+                                 unsigned int duration_ms, u32 length) {
+  (void)length;
   CHECK(data == &device && duration_ms == device.acquisition.raw_duration_ms);
   CHECK(data->acquisition.phase == SSF_MEMS_ACQ_RAW);
   CHECK(raw_captures < ARRAY_SIZE(raw_started_at));
   raw_started_at[raw_captures++] = jiffies;
+  if (scenario == RAW_UNSUPPORTED || scenario == RAW_ONLY_UNSUPPORTED) {
+    jiffies += 5;
+    return -EOPNOTSUPP;
+  }
   jiffies += duration_ms;
   if (scenario == RAW_RECOVERY_FAILURE ||
       (scenario == RAW_ONLY_RECOVERY && raw_captures == 1)) {
@@ -85,7 +90,7 @@ int ssf_mems_protocol_write_setting(struct serdev_device *s,
                                    u16 value, unsigned int timeout_ms) {
   CHECK(s == &serial && setting == SSF_MEMS_SETTING_SAMPLING_RATE);
   CHECK(timeout_ms > 200);
-  if (value > SSF_MEMS_SAMPLING_RATE_MAX_INDEX)
+  if (value > (ssf_mems_xyzs.profile.sampling_frequency_count - 1U))
     return -EINVAL;
   setting_calls++;
   if (device.acquisition.phase == SSF_MEMS_ACQ_CONFIGURE) {
@@ -93,7 +98,7 @@ int ssf_mems_protocol_write_setting(struct serdev_device *s,
     CHECK(get_count > 0 && !device.acquisition.online);
     CHECK(value == device.acquisition.target_sampling_rate_index);
     CHECK(device.protocol.host_baudrate ==
-          (unsigned int)ssf_mems_baudrate_to_value(device.acquisition.target_baudrate));
+          (unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, device.acquisition.target_baudrate));
     sampling_config_calls++;
     if (!setting_error || scenario == CONFIG_FAILURE) {
       /* CONFIG_FAILURE 模拟写入生效但确认丢失；重试不能重复写同一值。 */
@@ -134,7 +139,8 @@ ssize_t serdev_device_write(struct serdev_device *dev, const u8 *buf,
   abort(); /* 采集层测试使用协议替身，不应直接发送串口数据。 */
 }
 
-int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate) {
+int ssf_mems_baudrate_to_value(const struct ssf_mems_sensor *model, enum ssf_mems_baudrate baudrate) {
+  (void)model;
   static const int rates[] = {9600, 2400, 4800, 9600, 19200, 38400,
                              57600, 115200, 128000, 230400, 256000, 460800,
                              500000, 512000, 600000, 750000, 921600, 1000000};
@@ -160,7 +166,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *s,
   }
   *baudrate = sensor_baudrate;
   device.protocol.baudrate = sensor_baudrate;
-  device.protocol.host_baudrate = ssf_mems_baudrate_to_value(sensor_baudrate);
+  device.protocol.host_baudrate = ssf_mems_baudrate_to_value(&ssf_mems_xyzs, sensor_baudrate);
   return 0;
 }
 
@@ -171,25 +177,25 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *s,
   set_count++;
   /* 写请求必须在旧速率完成；模拟丢应答时传感器已切换而主机仍在旧速率。 */
   CHECK(device.protocol.host_baudrate ==
-        (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate));
+        (unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, sensor_baudrate));
   sensor_baudrate = baudrate;
   if (set_error)
     return set_error;
   device.protocol.baudrate = baudrate;
-  device.protocol.host_baudrate = ssf_mems_baudrate_to_value(baudrate);
+  device.protocol.host_baudrate = ssf_mems_baudrate_to_value(&ssf_mems_xyzs, baudrate);
   return 0;
 }
 
-void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_protocol_invalidate_features(struct ssf_mems_data *data) {
   data->protocol.valid = false;
 }
 
-int ssf_mems_protocol_read_features(struct serdev_device *s,
+int ssf_mems_sensor_read_features(struct ssf_mems_data *data,
                                    unsigned int timeout_ms) {
-  CHECK(s == &serial);
+  CHECK(data->serdev == &serial);
   CHECK(device.protocol.mode == SSF_MEMS_LINK_MODBUS);
   CHECK(device.protocol.host_baudrate ==
-        (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate));
+        (unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, sensor_baudrate));
   CHECK(timeout_ms > 200);
   if (sensor_baudrate == SSF_MEMS_BAUDRATE_2400)
     CHECK(timeout_ms > 1000);
@@ -207,7 +213,7 @@ int ssf_mems_protocol_read_features(struct serdev_device *s,
   jiffies += 5;
   memset(&device.protocol.features, 0, sizeof(device.protocol.features));
   if (scenario != CONSTANT)
-    device.protocol.features.x.acc_rms_x100 = read_count;
+    device.protocol.features.xyzs.x.acc_rms_x100 = read_count;
   device.protocol.valid = true;
   return 0;
 }
@@ -221,7 +227,7 @@ int ssf_mems_protocol_get_features(struct serdev_device *s,
   return 0;
 }
 
-int ssf_mems_iio_publish_features(struct ssf_mems_xyzs_data *data,
+int ssf_mems_iio_publish_features(struct ssf_mems_data *data,
                                  const struct ssf_mems_sensor_data *features,
                                  s64 timestamp_ns) {
   CHECK(data == &device && timestamp_ns == 0);
@@ -287,9 +293,16 @@ void test_acquisition_wait(unsigned long timeout) {
       CHECK(device.acquisition.target_sampling_rate_index == 4);
       mode_switch_step++;
       fail_reads = true;
-    } else if (scenario == RAW_ONLY || scenario == RAW_ONLY_RECOVERY || scenario == RAW_ONLY_DROPS) {
+    } else if (scenario == RAW_UNSUPPORTED) {
+      CHECK(device.acquisition.online && device.protocol.valid && get_count == 1);
+      if (raw_captures == 3)
+        stop_requested = true;
+    } else if (scenario == RAW_ONLY || scenario == RAW_ONLY_RECOVERY ||
+               scenario == RAW_ONLY_DROPS || scenario == RAW_ONLY_UNSUPPORTED) {
       CHECK(device.acquisition.online && !device.protocol.valid);
       CHECK(publish_count == 0 && read_count == 0);
+      if (scenario == RAW_ONLY_UNSUPPORTED && raw_captures != 0)
+        CHECK(timeout >= 1000);
       if (raw_captures == 3)
         stop_requested = true;
     } else if (scenario == SHORT_WINDOWS) {
@@ -366,6 +379,8 @@ static void reset_device(enum scenario next) {
   memset(&device, 0, sizeof(device));
   memset(&serial, 0, sizeof(serial));
   device.serdev = &serial;
+  device.sensor = &ssf_mems_xyzs;
+  device.sensor_ops = ssf_mems_xyzs.ops;
   device.indio_dev = (void *)&task;
   device.protocol.host_baudrate = 9600;
   device.protocol.baudrate = SSF_MEMS_BAUDRATE_9600;
@@ -386,9 +401,9 @@ static void reset_device(enum scenario next) {
   first_match_baudrate = 0;
   CHECK(device.acquisition.raw_duration_ms == 5000);
   CHECK(device.acquisition.feature_duration_ms == 5000);
-  CHECK(device.acquisition.target_baudrate == ssf_mems_sensor_profile.default_work_baudrate);
+  CHECK(device.acquisition.target_baudrate == ssf_mems_xyzs.profile.default_work_baudrate);
   CHECK(device.acquisition.target_sampling_rate_index ==
-        ssf_mems_sensor_profile.default_sampling_rate_index);
+        ssf_mems_xyzs.profile.default_sampling_rate_index);
   device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
   mode_switch_step = 0;
   raw_captures = 0;
@@ -422,7 +437,7 @@ static void test_thread_scenarios(void) {
    * 验证真实调度调用间隔，而不仅检查周期配置值。 */
   for (unsigned int i = 2; i < read_count; i++)
     CHECK(read_started_at[i] - read_started_at[i - 1] == 1000);
-  CHECK(published.x.acc_rms_x100 == read_count);
+  CHECK(published.xyzs.x.acc_rms_x100 == read_count);
   ssf_mems_acquisition_get_status(&device, &status);
   CHECK(status.have_sample && !status.online && status.sample_age_ms > 0);
   CHECK(ssf_mems_acquisition_set_baudrate(&device, SSF_MEMS_BAUDRATE_57600) == -ENODEV);
@@ -551,7 +566,7 @@ static void window(struct ssf_mems_acquisition_policy *policy,
   ssf_mems_acquisition_policy_sample(policy, sample, read_ms, 0);
   for (i = 0; i < 32; i++) {
     if (i >= repeats)
-      sample->temperature_x100++;
+      sample->xyzs.temperature_x100++;
     ssf_mems_acquisition_policy_sample(policy, sample, read_ms, 0);
   }
 }
@@ -560,7 +575,7 @@ static void adaptive_policy(struct ssf_mems_acquisition_policy *policy,
                               unsigned long now) {
   struct ssf_mems_poll_config config;
 
-  ssf_mems_acquisition_policy_init(policy, now);
+  ssf_mems_acquisition_policy_init(policy, &ssf_mems_xyzs, now);
   config = policy->config;
   config.mode = SSF_MEMS_POLL_ADAPTIVE;
   CHECK(ssf_mems_acquisition_policy_configure(policy, &config, now) == 0);
@@ -572,16 +587,16 @@ static void test_policy(void) {
   struct ssf_mems_poll_config config;
   unsigned int i;
 
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   window(&policy, &sample, 32, 5);
   CHECK(policy.interval_ms == 1000 && policy.comparisons == 0);
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   window(&policy, &sample, 0, 5);
   CHECK(policy.interval_ms == 1000);
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   window(&policy, &sample, 16, 5);
   CHECK(policy.interval_ms == 1000);
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   window(&policy, &sample, 0, 501);
   CHECK(policy.interval_ms == 1000);
 
@@ -598,7 +613,7 @@ static void test_policy(void) {
   policy.interval_ms = 1000;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 30000);
   CHECK(policy.interval_ms == 1000 && policy.next_probe == 60000);
-  sample.temperature_x100++;
+  sample.xyzs.temperature_x100++;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 60000);
   CHECK(policy.interval_ms == 950 && policy.next_probe == 90000);
 
@@ -610,10 +625,10 @@ static void test_policy(void) {
     ((u8 *)&sample)[i] = 1;
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, 0);
     CHECK(policy.comparisons == 1);
-    CHECK(policy.repeats == (i > offsetof(struct ssf_mems_sensor_data, startup_flags)));
+    CHECK(policy.repeats == (i > offsetof(struct ssf_mems_sensor_data, xyzs.startup_flags)));
   }
 
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   for (i = 0; i < 4; i++)
     CHECK(!ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 3000));
   CHECK(ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 3000));
@@ -623,7 +638,7 @@ static void test_policy(void) {
   CHECK(!ssf_mems_acquisition_policy_error(&policy, -ENOMEM, 9000));
   CHECK(policy.link_failures == 0);
 
-  ssf_mems_acquisition_policy_init(&policy, 0);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
   for (i = 0; i < 10; i++)
     CHECK(!ssf_mems_acquisition_policy_error(&policy, -EIO, 2999));
   CHECK(ssf_mems_acquisition_policy_error(&policy, -EIO, 3000));
@@ -632,7 +647,7 @@ static void test_policy(void) {
   CHECK(!ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 3002));
   CHECK(!policy.have_previous && policy.comparisons == 0);
 
-  ssf_mems_acquisition_policy_init(&policy, ULONG_MAX - 1000UL);
+  ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, ULONG_MAX - 1000UL);
   for (i = 0; i < 4; i++)
     CHECK(!ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 1999UL));
   CHECK(ssf_mems_acquisition_policy_error(&policy, -ETIMEDOUT, 1999UL));
@@ -702,7 +717,7 @@ static void test_timed_policy(void) {
   unsigned int previous_interval;
 
   for (unsigned int start = 20000; start <= 60000; start += 40000) {
-    ssf_mems_acquisition_policy_init(&policy, 0);
+    ssf_mems_acquisition_policy_init(&policy, &ssf_mems_xyzs, 0);
     config = policy.config;
     config.fixed_interval_ms = start;
     config.max_interval_ms = 60000;
@@ -738,7 +753,7 @@ static void test_timed_policy(void) {
   for (unsigned int i = 0; i < 8; i++) {
     previous_interval = policy.interval_ms;
     now += previous_interval;
-    sample.temperature_x100++;
+    sample.xyzs.temperature_x100++;
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
     CHECK(policy.interval_ms < previous_interval);
   }
@@ -753,14 +768,14 @@ static void test_timed_policy(void) {
     ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
   }
   now = policy.next_probe;
-  sample.temperature_x100++;
+  sample.xyzs.temperature_x100++;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 5, now);
   CHECK(policy.interval_ms == 1000 && policy.repeats == 10);
 
   /* 数据虽变化，读取占用超过半个周期也不能试探提速。 */
   adaptive_policy(&policy, 0);
   ssf_mems_acquisition_policy_sample(&policy, &sample, 501, 0);
-  sample.temperature_x100++;
+  sample.xyzs.temperature_x100++;
   ssf_mems_acquisition_policy_sample(&policy, &sample, 501, 30000);
   CHECK(policy.interval_ms == 1000);
 }
@@ -882,6 +897,8 @@ static void test_settings(void) {
   /* 最后一个线程场景可能已停止，单独初始化配置访问状态。 */
   memset(&device, 0, sizeof(device));
   device.serdev = &serial;
+  device.sensor = &ssf_mems_xyzs;
+  device.sensor_ops = ssf_mems_xyzs.ops;
   device.protocol.host_baudrate = 115200;
   CHECK(ssf_mems_acquisition_init(&device) == 0);
   sensor_sampling_index = 6;
@@ -997,12 +1014,12 @@ static void test_startup_baudrate_target(void) {
   for (i = 0; i < ARRAY_SIZE(hints); i++) {
     reset_device(MANUAL);
     device.protocol.baudrate = hints[i];
-    device.protocol.host_baudrate = ssf_mems_baudrate_to_value(hints[i]);
+    device.protocol.host_baudrate = ssf_mems_baudrate_to_value(&ssf_mems_xyzs, hints[i]);
     CHECK(ssf_mems_acquisition_init(&device) == 0);
     device.acquisition.mode = SSF_MEMS_ACQ_MODE_FEATURE;
     CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
     run_thread();
-    CHECK(first_match_baudrate == (unsigned int)ssf_mems_baudrate_to_value(hints[i]));
+    CHECK(first_match_baudrate == (unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, hints[i]));
     CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_128000 && set_count == 1);
     CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
   }
@@ -1068,6 +1085,16 @@ int main(void) {
   device.acquisition.mode = SSF_MEMS_ACQ_MODE_RAW;
   run_thread();
   CHECK(raw_captures == 3 && backoff_count == 0 && get_count == 1 && set_count == 1);
+  reset_device(RAW_UNSUPPORTED);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
+  run_thread();
+  CHECK(raw_captures == 3 && publish_count > 3 && backoff_count == 0);
+  CHECK(get_count == 1 && set_count == 1);
+  reset_device(RAW_ONLY_UNSUPPORTED);
+  device.acquisition.mode = SSF_MEMS_ACQ_MODE_RAW;
+  run_thread();
+  CHECK(raw_captures == 3 && publish_count == 0 && backoff_count == 0);
+  CHECK(get_count == 1 && set_count == 1);
   reset_device(SHORT_WINDOWS);
   device.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
   device.acquisition.raw_duration_ms = device.acquisition.feature_duration_ms = 100;

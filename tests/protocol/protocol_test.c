@@ -25,7 +25,8 @@ long test_wait_timeout(unsigned long timeout) {
   return test_wait_result;
 }
 
-static struct ssf_mems_xyzs_data sensor;
+static struct ssf_mems_data sensor;
+static const struct ssf_mems_sensor *test_model = &ssf_mems_xyzs;
 static struct serdev_device serial;
 static unsigned int checks, sends;
 static u8 last_tx[256];
@@ -72,7 +73,7 @@ enum { REPLY_NORMAL, REPLY_EXCEPTION, REPLY_BAD_CRC, REPLY_WRONG_COUNT, REPLY_NO
 #define NO_SEND(expr, error) do { unsigned int before = sends; CHECK((expr) == (error)); CHECK(sends == before); } while (0)
 
 /* 记录生产解析器交给 IIO 的样本，而不复制解码实现。 */
-int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
+int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
                             const struct ssf_mems_raw_sample *sample) {
   CHECK(data == &sensor);
   raw_published++;
@@ -116,12 +117,12 @@ static void finish_crc(u8 *buf, size_t len) {
 }
 
 /* 验证没有未完成的帧头留在解析窗口中。 */
-static void check_receive_empty(struct ssf_mems_xyzs_data *data) {
+static void check_receive_empty(struct ssf_mems_data *data) {
   CHECK(data->modbus_rx.frame_used == 0);
 }
 
 /* 验证未认领帧不改变请求、输出、缓存或唤醒计数，且没有残留半帧。 */
-static void check_discard_preserves_state(struct ssf_mems_xyzs_data *data,
+static void check_discard_preserves_state(struct ssf_mems_data *data,
                                          const u8 *frame, size_t len) {
   u8 request_before[sizeof(data->modbus_req)];
   struct ssf_mems_sensor_data features_before = data->protocol.features;
@@ -149,7 +150,7 @@ static void check_discard_preserves_state(struct ssf_mems_xyzs_data *data,
 ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
                            size_t size, unsigned long timeout) {
   u8 response[256] = {0};
-  struct ssf_mems_xyzs_data *data = s->drvdata;
+  struct ssf_mems_data *data = s->drvdata;
   size_t len, offset;
   u16 address, count, i;
   int mode;
@@ -186,7 +187,7 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
   }
   if (enforce_sensor_baudrate &&
       (time_before(jiffies, sensor_reboot_until) ||
-       s->baudrate != (unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate)))
+       s->baudrate != (unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, sensor_baudrate)))
     return size;
   if (verification_never_replies && reboots && buf[1] == 3 && address == 101)
     return size;
@@ -282,6 +283,8 @@ static void reset_sensor(void) {
   memset(&serial, 0, sizeof(serial));
   serial.drvdata = &sensor;
   sensor.serdev = &serial;
+  sensor.sensor = test_model;
+  sensor.sensor_ops = test_model->ops;
   sensor.slave_id = SSF_MEMS_MODBUS_DEFAULT_SLAVE_ID;
   serial.baudrate = 9600;
   test_allocation_failure = false;
@@ -318,7 +321,7 @@ static void reset_sensor(void) {
 }
 
 static void test_initialization_and_cleanup(void) {
-  struct ssf_mems_xyzs_data local;
+  struct ssf_mems_data local;
   struct ssf_mems_sensor_data zero = {0};
   const u8 partial_frame[] = {1, 3, 2, 0x12};
   u8 fifo_data[SSF_MEMS_RX_FIFO_SIZE] = {0};
@@ -335,6 +338,8 @@ static void test_initialization_and_cleanup(void) {
   /* Initialization must not depend on core having zero-filled each module's state. */
   memset(&local, 0xa5, sizeof(local));
   local.serdev = &serial;
+  local.sensor = &ssf_mems_xyzs;
+  local.sensor_ops = ssf_mems_xyzs.ops;
   CHECK(ssf_mems_protocol_init(&local) == 0);
   CHECK(!local.protocol.valid && local.protocol.lock.unused == 0 &&
         local.protocol.bus_lock.unused == 0);
@@ -342,10 +347,10 @@ static void test_initialization_and_cleanup(void) {
   CHECK(local.protocol.host_baudrate == 9600 &&
         local.protocol.parity == SSF_MEMS_PARITY_NONE);
   CHECK(memcmp(&local.protocol.features, &zero, sizeof(zero)) == 0);
-  local.protocol.features.x.acc_rms_x100 = 0x4321;
+  local.protocol.features.xyzs.x.acc_rms_x100 = 0x4321;
   local.protocol.valid = true;
   CHECK(ssf_mems_modbus_request_init(&local) == 0);
-  CHECK(local.protocol.valid && local.protocol.features.x.acc_rms_x100 == 0x4321);
+  CHECK(local.protocol.valid && local.protocol.features.xyzs.x.acc_rms_x100 == 0x4321);
   CHECK(!local.modbus_req.busy && !local.modbus_req.pending && !local.modbus_req.shutting_down);
   CHECK(!local.modbus_req.values && !local.modbus_req.transfer.frame);
   CHECK(!local.modbus_req.slave_id && local.modbus_req.status == 0 &&
@@ -492,7 +497,7 @@ static void test_nested_candidate_payload(void) {
 
   /* 删表变体不允许读取跨越已删除寄存器；此用例只验证完整响应。 */
   for (i = 0; i < ARRAY_SIZE(values); i++)
-    if (ssf_mems_modbus_find_reg(40001 + i) == NULL)
+    if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40001 + i) == NULL)
       return;
   reset_sensor();
   emulate_settings = true;
@@ -555,7 +560,7 @@ static void test_receive_window_boundaries(void) {
 }
 
 struct expected_field { u16 display_reg; size_t offset, width; u16 mask; };
-#define FIELD(index, member) {40001 + index, offsetof(struct ssf_mems_sensor_data, member), sizeof(((struct ssf_mems_sensor_data *)0)->member), 0xffff}
+#define FIELD(index, member) {40001 + index, offsetof(struct ssf_mems_sensor_data, xyzs.member), sizeof(((struct ssf_mems_sensor_data *)0)->xyzs.member), 0xffff}
 static const struct expected_field feature_fields[] = {
   FIELD(0, x.high_freq_acc_rms_x100), FIELD(1, x.low_freq_velocity_rms_x100),
   FIELD(2, y.high_freq_acc_rms_x100), FIELD(3, y.low_freq_velocity_rms_x100),
@@ -569,7 +574,7 @@ static const struct expected_field feature_fields[] = {
   FIELD(22, sound.rms_db_x100), FIELD(23, sound.peak_db_x100), FIELD(24, sound.peak_to_peak_db_x100),
   FIELD(25, zero_crossing_rate_percent), FIELD(26, spectral_centroid_hz_x10),
   FIELD(27, spectral_flux_x100),
-  {40029, offsetof(struct ssf_mems_sensor_data, startup_flags), sizeof(u8), 7},
+  {40029, offsetof(struct ssf_mems_sensor_data, xyzs.startup_flags), sizeof(u8), 7},
 };
 
 static void test_sparse_features(void) {
@@ -587,7 +592,7 @@ static void test_sparse_features(void) {
 
   for (i = 0; i < ARRAY_SIZE(feature_fields); i++) {
     const struct expected_field *field = &feature_fields[i];
-    const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(field->display_reg);
+    const struct ssf_reg_desc *reg = ssf_mems_sensor_find_reg(&ssf_mems_xyzs, field->display_reg);
     u16 value = 0;
     bool enabled = reg != NULL && (reg->access & SSF_REG_READ);
 
@@ -609,7 +614,7 @@ static void test_sparse_features(void) {
   }
 
   check_busy_handoff = true;
-  CHECK(ssf_mems_protocol_read_features(&serial, 0) == 0);
+  CHECK(sensor.sensor_ops->read_features(&sensor, 0) == 0);
   CHECK(ssf_mems_protocol_get_features(&serial, &actual) == 0);
   CHECK(memcmp(&expected, &actual, sizeof(expected)) == 0);
   CHECK(read_runs == wanted_runs);
@@ -620,13 +625,13 @@ static void test_sparse_features(void) {
   CHECK((wanted_count == 0) || saw_block_description);
   CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
 
-  CHECK(ssf_mems_protocol_decode_features(full_values, 29, &decoded) == 0);
+  CHECK(ssf_mems_sensor_decode_features(&ssf_mems_xyzs, full_values, 29, &decoded) == 0);
   CHECK(memcmp(&expected, &decoded, sizeof(expected)) == 0);
-  CHECK(ssf_mems_protocol_decode_features(full_values, 28, &decoded) == -EINVAL);
+  CHECK(ssf_mems_sensor_decode_features(&ssf_mems_xyzs, full_values, 28, &decoded) == -EINVAL);
 
   if (wanted_runs) {
     fail_on_send = sends + (wanted_runs > 1 ? 2 : 1);
-    CHECK(ssf_mems_protocol_read_features(&serial, 0) == -EIO);
+    CHECK(sensor.sensor_ops->read_features(&sensor, 0) == -EIO);
     CHECK(memcmp(&sensor.protocol.features, &actual, sizeof(actual)) == 0);
     CHECK(!sensor.modbus_req.busy && !sensor.modbus_req.pending);
   }
@@ -637,7 +642,7 @@ static void test_sparse_features(void) {
   CHECK(ssf_mems_protocol_get_features(&serial, &decoded) == -ENODATA);
   fail_on_send = 0;
   read_runs = 0;
-  CHECK(ssf_mems_protocol_read_features(&serial, 0) == 0);
+  CHECK(sensor.sensor_ops->read_features(&sensor, 0) == 0);
   CHECK(ssf_mems_protocol_get_features(&serial, &decoded) == 0);
   CHECK(memcmp(&decoded, &expected, sizeof(expected)) == 0);
 }
@@ -724,15 +729,15 @@ static void test_named_requests(void) {
   size_t i, j;
 
   reset_sensor();
-  for (i = 0; i < SSF_REG_TABLE_SIZE; i++) {
-    const struct ssf_reg_desc *reg = &ssf_reg_table[i];
+  for (i = 0; i < ssf_mems_xyzs.reg_count; i++) {
+    const struct ssf_reg_desc *reg = &ssf_mems_xyzs.regs[i];
     CHECK(reg->name != NULL && reg->name[0] != '\0');
-    CHECK(ssf_mems_modbus_find_reg_by_name(reg->name) == reg);
-    for (j = i + 1; j < SSF_REG_TABLE_SIZE; j++)
-      CHECK(strcmp(reg->name, ssf_reg_table[j].name) != 0);
+    CHECK(ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, reg->name) == reg);
+    for (j = i + 1; j < ssf_mems_xyzs.reg_count; j++)
+      CHECK(strcmp(reg->name, ssf_mems_xyzs.regs[j].name) != 0);
   }
-  CHECK(ssf_mems_modbus_find_reg_by_name(NULL) == NULL);
-  CHECK(ssf_mems_modbus_find_reg_by_name("") == NULL);
+  CHECK(ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, NULL) == NULL);
+  CHECK(ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, "") == NULL);
   CHECK(ssf_mems_modbus_read_reg_by_name(&serial, "firmware_version", &value, 0) == 0);
   CHECK(value == wire_value(120) && last_tx[2] == 0 && last_tx[3] == 120);
   CHECK(ssf_mems_modbus_write_reg_by_name(&serial, "slave_addr", 17, 0) == 0);
@@ -753,20 +758,20 @@ static void test_named_requests(void) {
   NO_SEND(ssf_mems_modbus_write_reg_by_name(NULL, "slave_addr", 1, 0), -EINVAL);
   NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial, "missing", 1, 0), -ENOENT);
   NO_SEND(ssf_mems_modbus_write_reg_by_name(&serial,
-      ssf_mems_modbus_find_reg(40061)->name, 1, 0), -EOPNOTSUPP);
+      ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40061)->name, 1, 0), -EOPNOTSUPP);
   NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial,
-      ssf_mems_modbus_find_reg(40054)->name, &value, 0), -EOPNOTSUPP);
-  if (ssf_mems_modbus_find_reg(40050) == NULL)
+      ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40054)->name, &value, 0), -EOPNOTSUPP);
+  if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40050) == NULL)
     NO_SEND(ssf_mems_modbus_read_reg_by_name(&serial, "auto_report_enable", &value, 0), -ENOENT);
 }
 
 static void test_requests(void) {
   u16 values[126] = {0x1122, 0xabcd, 0x8001};
   struct serdev_device no_driver = {0};
-  const struct ssf_reg_desc *config = ssf_mems_modbus_find_reg(40050);
-  const struct ssf_reg_desc *work = ssf_mems_modbus_find_reg(40064);
+  const struct ssf_reg_desc *config = ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40050);
+  const struct ssf_reg_desc *work = ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40064);
   struct ssf_modbus_transfer planned;
-  const struct ssf_block_cmd_desc *block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_WRITE_WORK_PARAMETERS);
+  const struct ssf_block_cmd_desc *block = ssf_mems_sensor_find_block(&ssf_mems_xyzs, SSF_BLOCK_WRITE_WORK_PARAMETERS);
 
   reset_sensor();
   sensor.slave_id = 0x11;
@@ -792,13 +797,13 @@ static void test_requests(void) {
     sensor.protocol.parity = SSF_MEMS_PARITY_ODD;
     CHECK(ssf_mems_modbus_write_block(&serial, block, values, 126, 0) == 0);
     CHECK(serial.write_timeout == 233 && serial.wait_timeout == 233);
-    NO_SEND(ssf_mems_modbus_plan_request(0x10, 40062, 2, block, &planned), -EINVAL);
+    NO_SEND(ssf_mems_modbus_plan_request(&ssf_mems_xyzs, 0x10, 40062, 2, block, &planned), -EINVAL);
   } else {
     NO_SEND(ssf_mems_protocol_write_work_parameters(&serial, values, 126, 0), -ENOENT);
   }
 
   NO_SEND(ssf_mems_modbus_read(&serial, 40110, 1, values, 126, 0),
-          ssf_mems_modbus_find_reg(40110) == NULL ? -ENOENT : -EACCES);
+          ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40110) == NULL ? -ENOENT : -EACCES);
   NO_SEND(ssf_mems_modbus_read(&serial, 40054, 1, values, 126, 0), -EOPNOTSUPP);
   NO_SEND(ssf_mems_modbus_read(&serial, 40103, 2, values, 126, 0), -ENOENT);
   NO_SEND(ssf_mems_modbus_write_regs(&serial, 40121, 1, values, 126, 0), -EACCES);
@@ -852,6 +857,8 @@ static void reset_startup_configuration(void) {
   memset(&serial, 0, sizeof(serial));
   serial.drvdata = &sensor;
   sensor.serdev = &serial;
+  sensor.sensor = &ssf_mems_xyzs;
+  sensor.sensor_ops = ssf_mems_xyzs.ops;
   sends = 0;
 }
 
@@ -865,7 +872,7 @@ static void test_serial_configuration(void) {
       {"odd", SSF_MEMS_PARITY_ODD, SERDEV_PARITY_ODD},
       {"even", SSF_MEMS_PARITY_EVEN, SERDEV_PARITY_EVEN},
   };
-  struct ssf_mems_xyzs_data no_serial = {0};
+  struct ssf_mems_data no_serial = {0};
   size_t i;
 
   CHECK(ssf_mems_protocol_init(NULL) == -EINVAL);
@@ -1025,13 +1032,13 @@ static void test_baudrate_management(void) {
   reset_sensor();
   enforce_sensor_baudrate = true;
   sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
-  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_DEFAULT) == 9600);
-  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_38400) == 38400);
-  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_MAX) == -EINVAL);
-  CHECK(ssf_mems_baudrate_from_value(9600, &baudrate) == 0 &&
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, SSF_MEMS_BAUDRATE_DEFAULT) == 9600);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, SSF_MEMS_BAUDRATE_38400) == 38400);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, SSF_MEMS_BAUDRATE_MAX) == -EINVAL);
+  CHECK(ssf_mems_baudrate_from_value(&ssf_mems_xyzs, 9600, &baudrate) == 0 &&
         baudrate == SSF_MEMS_BAUDRATE_9600);
-  CHECK(ssf_mems_baudrate_from_value(12345, &baudrate) == -EINVAL);
-  CHECK(ssf_mems_baudrate_from_value(9600, NULL) == -EINVAL);
+  CHECK(ssf_mems_baudrate_from_value(&ssf_mems_xyzs, 12345, &baudrate) == -EINVAL);
+  CHECK(ssf_mems_baudrate_from_value(&ssf_mems_xyzs, 9600, NULL) == -EINVAL);
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &baudrate, 0) == 0);
   CHECK(baudrate == SSF_MEMS_BAUDRATE_9600);
   CHECK(sensor.protocol.baudrate == SSF_MEMS_BAUDRATE_9600);
@@ -1039,7 +1046,7 @@ static void test_baudrate_management(void) {
 
   CHECK(sends == 1);
 
-  if (!ssf_mems_modbus_find_reg(40110)) {
+  if (!ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40110)) {
     NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 0),
             -ENOENT);
     CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_MAX && !reboots);
@@ -1150,7 +1157,7 @@ static void test_baudrate_reboot(void) {
   reset_sensor();
   enforce_sensor_baudrate = true;
   sensor_baudrate = SSF_MEMS_BAUDRATE_9600;
-  if (!ssf_mems_modbus_find_reg(40110)) {
+  if (!ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40110)) {
     NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_115200, 50),
             -ENOENT);
     return;
@@ -1161,7 +1168,7 @@ static void test_baudrate_reboot(void) {
   CHECK(sensor_baudrate == SSF_MEMS_BAUDRATE_9600 && !reboots);
   CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200 && serial.baudrate == 9600);
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
-  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, found) == 9600);
 
   /* 40102 已暂存但它的应答丢失：不得继续保存或提前切换主机。 */
   reset_sensor();
@@ -1173,7 +1180,7 @@ static void test_baudrate_reboot(void) {
   CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200);
   special_reply_send = 0;
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
-  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, found) == 9600);
 
   reset_sensor();
   enforce_sensor_baudrate = true;
@@ -1195,7 +1202,7 @@ static void test_baudrate_reboot(void) {
   CHECK(sends == 2 && !reboots && !sleep_count && serial.baudrate == 9600);
   CHECK(staged_baudrate == SSF_MEMS_BAUDRATE_115200);
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == 0);
-  CHECK(ssf_mems_baudrate_to_value(found) == 9600);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, found) == 9600);
 
   /* 丢失/损坏保存回显：设备可能已重启，但接口必须报错并保留静默期。 */
   for (i = 0; i < ARRAY_SIZE(uncertain_modes); i++) {
@@ -1470,6 +1477,17 @@ static void test_feature_settings(void) {
                                        &value, 0) == 0 && value == 5100);
   CHECK(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
                                        &value, 0) == 0 && value == 2);
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
+                                        5, 0) == 0);
+  CHECK(setting_registers[52] == 5 && setting_registers[51] == 0);
+  CHECK(tx_events[sends - 2].function == 6 && tx_events[sends - 2].address == 52);
+  before = sends;
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
+                                        5, 0) == 0 && sends == before + 1);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
+                                         6, 0), -EINVAL);
+  CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_LENGTH,
+                                        2, 0) == 0);
   CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
                                         6, 0) == 0);
   CHECK(setting_registers[51] == 6 && setting_registers[52] == 2);
@@ -1480,13 +1498,13 @@ static void test_feature_settings(void) {
                                         6, 0) == 0);
   CHECK(sends == before + 1); /* 相同采样率只读一次，避免重复触发固件 Flash 保存。 */
   CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
-                                        SSF_MEMS_SAMPLING_RATE_MAX_INDEX, 0) == 0);
+                                        (ssf_mems_xyzs.profile.sampling_frequency_count - 1U), 0) == 0);
   CHECK(setting_registers[51] == 9 && setting_registers[52] == 2);
   CHECK(tx_events[sends - 2].function == 6 &&
         tx_events[sends - 2].address == 51 && tx_events[sends - 2].value == 9);
   before = sends;
   CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_SAMPLING_RATE,
-                                        SSF_MEMS_SAMPLING_RATE_MAX_INDEX, 0) == 0);
+                                        (ssf_mems_xyzs.profile.sampling_frequency_count - 1U), 0) == 0);
   CHECK(sends == before + 1);
   CHECK(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE,
                                         63, 0) == 0);
@@ -1650,7 +1668,7 @@ static void finite_sensor(void) {
   emulate_settings = enforce_sensor_baudrate = emulate_raw_mode = true;
   sensor_baudrate = sensor.protocol.baudrate = SSF_MEMS_BAUDRATE_128000;
   sensor.protocol.host_baudrate = serial.baudrate = 128000;
-  setting_registers[51] = 6;
+  setting_registers[51] = sensor.sensor->profile.default_sampling_rate_index;
   wait_hook = raw_wait_hook;
   sleep_hook = raw_recovery_sleep_hook;
   wait_returns_early = true;
@@ -1662,12 +1680,12 @@ static void test_raw_recovery(void) {
   unsigned int before;
   u16 value;
 
-  if (ssf_mems_modbus_find_reg(40060) == NULL ||
-      ssf_mems_modbus_find_reg(40061) == NULL)
+  if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40060) == NULL ||
+      ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40061) == NULL)
     return;
   finite_sensor();
   raw_wait_action = 2;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ENODEV);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -ENODEV);
   CHECK(raw_published == 0 && sensor.raw.drain_packets == 16);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
   CHECK(serial.baudrate == 128000 && sensor.modbus_req.shutting_down);
@@ -1676,7 +1694,7 @@ static void test_raw_recovery(void) {
 
   finite_sensor();
   fail_on_send = 5; /* 批次结束后的只读确认发送失败。 */
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EIO);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EIO);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
   NO_SEND(ssf_mems_modbus_write_reg(&serial, 40102, 6, 50), -EAGAIN);
   before = sends;
@@ -1695,32 +1713,32 @@ static void test_raw_session(void) {
   unsigned int action, i;
   finite_sensor();
   sensor.protocol.parity = SSF_MEMS_PARITY_EVEN;
-  NO_SEND(ssf_mems_protocol_collect_raw(&sensor, 100), -EOPNOTSUPP);
-  CHECK(ssf_mems_protocol_collect_raw(NULL, 100) == -EINVAL);
+  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100), -EOPNOTSUPP);
+  CHECK(ssf_mems_xyzs.ops->collect_raw(NULL, 100) == -EINVAL);
   finite_sensor();
-  if (ssf_mems_modbus_find_reg(40060) == NULL) {
-    NO_SEND(ssf_mems_protocol_collect_raw(&sensor, 100), -ENOENT);
+  if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40060) == NULL) {
+    NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100), -ENOENT);
     return;
   }
-  if (ssf_mems_modbus_find_reg(40061) == NULL) {
-    CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ENOENT);
+  if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40061) == NULL) {
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -ENOENT);
     CHECK(sends == 1);
     return;
   }
   setting_registers[51] = 9;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == 0);
   CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
   CHECK(sensor.raw.sampling_rate_index == 9 && !reboots);
   finite_sensor();
-  setting_registers[51] = SSF_MEMS_SAMPLING_RATE_MAX_INDEX + 1;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EPROTO);
+  setting_registers[51] = (ssf_mems_xyzs.profile.sampling_frequency_count - 1U) + 1;
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EPROTO);
   CHECK(sends == 1 && !sensor.raw.active);
 
   for (action = 0; action <= 7; action++) {
     const int expected[] = {0, -ETIMEDOUT, -ENODEV, -ERESTARTSYS, 0, -EILSEQ, -ETIMEDOUT, -ENODEV};
     finite_sensor();
     raw_wait_action = action;
-    CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == expected[action]);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == expected[action]);
     CHECK(serial.baudrate == 128000 && !sensor.raw.active);
     CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
     CHECK(sends == 5 && tx_events[3].address == 59 && tx_events[4].address == 101);
@@ -1738,7 +1756,7 @@ static void test_raw_session(void) {
   setting_registers[61] = 4096;
   setting_registers[62] = 0x5678;
   setting_registers[69] = 0xfffd;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == 0);
   CHECK(setting_registers[60] == 0 && setting_registers[61] == 0);
   CHECK(setting_registers[62] == 0x5678 && setting_registers[69] == 0xfffd);
   CHECK(tx_events[3].function == 16 && tx_events[3].address == 60 && tx_events[3].value == 2);
@@ -1746,18 +1764,18 @@ static void test_raw_session(void) {
 
   finite_sensor();
   raw_publish_error = -ENOSPC;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -ENOSPC);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -ENOSPC);
   CHECK(sensor.raw.buffer_errors == 1024 && sensor.raw.batches == 0);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
 
   finite_sensor();
   fail_on_send = 4; /* 触发发送失败，也只等待批次预算并做只读确认。 */
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EIO);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EIO);
   CHECK(sends == 5 && sensor.raw.packets == 0 && !reboots);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
 
   finite_sensor();
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 1500) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1500) == 0);
   CHECK(sensor.raw.batches >= 2 && raw_published == sensor.raw.batches * 1024);
   CHECK(sensor.raw.discontinuities == 0);
 }
@@ -1789,16 +1807,16 @@ static void test_startup_baudrate_matching(void) {
     CHECK(ssf_mems_protocol_init(&sensor) == 0);
     CHECK(ssf_mems_protocol_configure_serial(&sensor) == 0);
     target = sensor.protocol.baudrate;
-    CHECK((unsigned int)ssf_mems_baudrate_to_value(target) == cases[i].expected_target);
+    CHECK((unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, target) == cases[i].expected_target);
     CHECK(sends == 0); /* 启动属性和主机 UART 配置不会发送 Modbus。 */
     sensor_baudrate = cases[i].sensor_rate;
     enforce_sensor_baudrate = true;
     CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 200) == 0);
     CHECK(tx_events[0].baudrate == cases[i].expected_target);
-    CHECK(ssf_mems_baudrate_to_value(found) == ssf_mems_baudrate_to_value(cases[i].sensor_rate));
+    CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, found) == ssf_mems_baudrate_to_value(&ssf_mems_xyzs, cases[i].sensor_rate));
     before = sends;
-    if ((unsigned int)ssf_mems_baudrate_to_value(found) != cases[i].expected_target) {
-      if (ssf_mems_modbus_find_reg(40110) == NULL) {
+    if ((unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, found) != cases[i].expected_target) {
+      if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40110) == NULL) {
         NO_SEND(ssf_mems_protocol_set_baudrate(&serial, target, 200), -ENOENT);
         continue;
       }
@@ -1808,7 +1826,7 @@ static void test_startup_baudrate_matching(void) {
       CHECK(reboots == 0 && sends == 1);
     }
     CHECK(serial.baudrate == cases[i].expected_target);
-    CHECK((unsigned int)ssf_mems_baudrate_to_value(sensor_baudrate) == cases[i].expected_target);
+    CHECK((unsigned int)ssf_mems_baudrate_to_value(&ssf_mems_xyzs, sensor_baudrate) == cases[i].expected_target);
   }
 }
 
@@ -1816,15 +1834,15 @@ static void test_startup_baudrate_matching(void) {
 static void test_relocated_registers(void) {
   enum ssf_mems_baudrate found;
 
-  CHECK(ssf_mems_modbus_find_reg(40052) == NULL);
-  CHECK(ssf_mems_modbus_find_reg_by_name("sampling_rate")->display_reg == 41052);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40052) == NULL);
+  CHECK(ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, "sampling_rate")->display_reg == 41052);
   test_feature_settings();
 
   finite_sensor();
   setting_registers[60] = 17;
   setting_registers[61] = 4096;
   setting_registers[62] = 0x5678;
-  CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == 0);
   CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
   CHECK(setting_registers[60] == 0 && setting_registers[61] == 0);
   CHECK(setting_registers[62] == 0x5678 && !reboots);
@@ -1863,10 +1881,10 @@ static void test_manual_register_descriptions(void) {
   reset_sensor();
   for (i = 0; i < ARRAY_SIZE(descriptions); i++) {
     const struct ssf_reg_desc *reg =
-        ssf_mems_modbus_find_reg_by_name(descriptions[i].name);
+        ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, descriptions[i].name);
 
     CHECK(reg != NULL);
-    CHECK(reg == ssf_mems_modbus_find_reg(descriptions[i].address));
+    CHECK(reg == ssf_mems_sensor_find_reg(&ssf_mems_xyzs, descriptions[i].address));
     CHECK(reg->protocol_addr == descriptions[i].protocol_addr);
     CHECK(reg->access == descriptions[i].access && reg->type == SSF_REG_U16);
     CHECK(reg->read_format == descriptions[i].read_format);
@@ -1884,15 +1902,15 @@ static void test_feature_scale_metadata(void) {
 
   reset_sensor();
   values[6] = (u16)-123;
-  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == 0);
-  CHECK(features.temperature_x100 == -1230);
+  CHECK(ssf_mems_sensor_decode_features(&ssf_mems_xyzs, values, ARRAY_SIZE(values), &features) == 0);
+  CHECK(features.xyzs.temperature_x100 == -1230);
   values[6] = 246;
-  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == 0);
-  CHECK(features.temperature_x100 == 2460);
+  CHECK(ssf_mems_sensor_decode_features(&ssf_mems_xyzs, values, ARRAY_SIZE(values), &features) == 0);
+  CHECK(features.xyzs.temperature_x100 == 2460);
   CHECK(ssf_mems_protocol_store_features(&sensor, &features) == 0);
   cached = features;
   values[6] = 4000;
-  CHECK(ssf_mems_protocol_decode_features(values, ARRAY_SIZE(values), &features) == -ERANGE);
+  CHECK(ssf_mems_sensor_decode_features(&ssf_mems_xyzs, values, ARRAY_SIZE(values), &features) == -ERANGE);
   CHECK(ssf_mems_protocol_get_features(&serial, &features) == 0);
   CHECK(memcmp(&features, &cached, sizeof(cached)) == 0);
 }
@@ -1915,7 +1933,7 @@ static void test_feature_switch_metadata(void) {
 static void test_unchanged_baudrate(void) {
   unsigned int before;
 
-  if (ssf_mems_modbus_find_reg_by_name("save_config_and_reboot") == NULL)
+  if (ssf_mems_sensor_find_reg_by_name(&ssf_mems_xyzs, "save_config_and_reboot") == NULL)
     return;
   reset_sensor();
   enforce_sensor_baudrate = true;
@@ -1947,16 +1965,135 @@ static void test_short_baud_table(void) {
   enum ssf_mems_baudrate found = SSF_MEMS_BAUDRATE_1000000;
 
   reset_sensor();
-  CHECK(ssf_mems_sensor_profile.baudrate_count == 8);
-  CHECK(ssf_mems_baudrate_to_value(SSF_MEMS_BAUDRATE_128000) == -EINVAL);
+  CHECK(ssf_mems_xyzs.profile.baudrate_count == 8);
+  CHECK(ssf_mems_baudrate_to_value(&ssf_mems_xyzs, SSF_MEMS_BAUDRATE_128000) == -EINVAL);
   NO_SEND(ssf_mems_protocol_set_baudrate(&serial, SSF_MEMS_BAUDRATE_128000, 50), -EINVAL);
   response_mode = REPLY_NONE;
   CHECK(ssf_mems_protocol_get_baudrate(&serial, &found, 50) == -ETIMEDOUT);
   CHECK(found == SSF_MEMS_BAUDRATE_1000000 && sends == 7 && serial.baudrate == 9600);
 }
 
+/* XYZ V2.4 独立夹具按手册寄存器顺序列出，不从生产映射生成。 */
+static void test_xyz_model(void) {
+  static const size_t offsets[] = {
+      offsetof(struct ssf_mems_sensor_data, xyz.x.acc_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.x.acc_peak_to_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.x.acc_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.x.kurtosis_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.x.velocity_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.x.displacement_peak_to_peak_um),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.acc_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.acc_peak_to_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.acc_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.kurtosis_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.velocity_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.y.displacement_peak_to_peak_um),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.acc_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.acc_peak_to_peak_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.acc_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.kurtosis_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.velocity_rms_x100),
+      offsetof(struct ssf_mems_sensor_data, xyz.z.displacement_peak_to_peak_um),
+      offsetof(struct ssf_mems_sensor_data, xyz.temperature_x100),
+  };
+  struct ssf_mems_sensor_data actual, cached;
+  const struct ssf_reg_desc *reg;
+  unsigned int i;
+  u16 value = 0xabcd;
+
+  test_model = &ssf_mems_xyz;
+  reset_sensor();
+  CHECK(ssf_mems_sensor_validate(sensor.sensor, NULL) == 0);
+  CHECK(sensor.sensor_ops == ssf_mems_xyz.ops);
+  CHECK(sensor.sensor_ops->read_features != ssf_mems_xyzs.ops->read_features);
+  CHECK(sensor.sensor_ops->collect_raw != ssf_mems_xyzs.ops->collect_raw);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40001)->feature_field == SSF_MEMS_FIELD_X_ACC_PEAK);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40001)->feature_field == SSF_MEMS_FIELD_X_HIGH_FREQ_ACC_RMS);
+  CHECK(ssf_mems_sensor_field_desc(&ssf_mems_xyz, SSF_MEMS_FIELD_SOUND_RMS) == NULL);
+  CHECK(ssf_mems_sensor_field_desc(&ssf_mems_xyzs, SSF_MEMS_FIELD_X_DISPLACEMENT_PEAK_TO_PEAK) == NULL);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40020) == NULL);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40063) == NULL);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40070) == NULL);
+  CHECK(ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40121) == NULL);
+  emulate_settings = true;
+  for (i = 0; i < 19; i++) {
+    reg = ssf_mems_sensor_find_reg(&ssf_mems_xyz, 40001 + i);
+    CHECK(reg && reg->protocol_addr == i && reg->field.offset == offsets[i]);
+    CHECK(reg->field.width == 2 && reg->feature_field != SSF_MEMS_FIELD_NONE);
+    setting_registers[i] = (i + 1) * 10;
+  }
+  setting_registers[18] = (u16)-123;
+  CHECK(sensor.sensor_ops->read_features(&sensor, 200) == 0);
+  CHECK(read_runs == 1 && read_starts[0] == 0 && read_counts[0] == 19);
+  CHECK(ssf_mems_protocol_get_features(&serial, &actual) == 0);
+  for (i = 0; i < 19; i++) {
+    s16 stored;
+    memcpy(&stored, (u8 *)&actual + offsets[i], sizeof(stored));
+    CHECK(stored == (i == 18 ? -1230 : (int)(i + 1) * 10));
+  }
+  cached = actual;
+  setting_registers[18] = 4000; /* 换算溢出不能发布半份结果。 */
+  CHECK(sensor.sensor_ops->read_features(&sensor, 200) == -ERANGE);
+  CHECK(ssf_mems_protocol_get_features(&serial, &actual) == 0);
+  CHECK(memcmp(&cached, &actual, sizeof(cached)) == 0);
+  fail_on_send = sends + 1;
+  CHECK(sensor.sensor_ops->read_features(&sensor, 200) == -EIO);
+  CHECK(ssf_mems_protocol_get_features(&serial, &actual) == 0);
+  CHECK(memcmp(&cached, &actual, sizeof(cached)) == 0);
+  NO_SEND(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_FIRMWARE_VERSION, &value, 200), -EOPNOTSUPP);
+  NO_SEND(ssf_mems_protocol_read_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, &value, 200), -EOPNOTSUPP);
+  NO_SEND(ssf_mems_protocol_write_setting(&serial, SSF_MEMS_SETTING_FEATURE_ENABLE, 1, 200), -EOPNOTSUPP);
+  CHECK(value == 0xabcd);
+
+  finite_sensor();
+  CHECK(sensor.sensor == &ssf_mems_xyz);
+  setting_registers[62] = 0x55aa; /* 不得写入不存在的声音参数。 */
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == 0);
+  CHECK(raw_published == 1024 && sensor.raw.batches == 1);
+  CHECK(setting_registers[60] == 0 && setting_registers[61] == 1024);
+  CHECK(setting_registers[62] == 0x55aa && sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
+  CHECK(!reboots && sensor.protocol.host_baudrate == 128000);
+  for (i = 0; i < sends; i++) {
+    CHECK(tx_events[i].function == 3 || (tx_events[i].function == 16 && tx_events[i].address == 60 && tx_events[i].value == 2));
+    CHECK(tx_events[i].address != 62 && tx_events[i].address != 69);
+  }
+  finite_sensor();
+  raw_wait_action = 5; /* 包丢失仍必须恢复后才接受普通请求。 */
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EILSEQ);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
+
+  /* XYZ 超出线速预算时不得写长度、触发采集或丢弃可用特征缓存。 */
+  for (i = 0; i < 10; i++) {
+    finite_sensor();
+    setting_registers[51] = i;
+    if (i <= 3) {
+      CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == 0);
+      CHECK(raw_published == 1024 && sensor.raw.batches == 1);
+    } else {
+      sensor.protocol.valid = true;
+      CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EOPNOTSUPP);
+      CHECK(sends == 1 && tx_events[0].function == 3 && tx_events[0].address == 51);
+      CHECK(sensor.protocol.valid && !sensor.raw.active && raw_published == 0);
+      CHECK(!reboots && setting_registers[51] == i);
+    }
+  }
+  finite_sensor();
+  sensor.protocol.host_baudrate = 9600;
+  setting_registers[51] = 0;
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EOPNOTSUPP && sends == 1);
+  {
+    struct ssf_mems_sensor invalid = ssf_mems_xyz;
+    invalid.profile.raw_min_baudrate_count--;
+    CHECK(ssf_mems_sensor_validate(&invalid, NULL) == -EINVAL);
+  }
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
+  if (strcmp(argv[1], "xyz") == 0) {
+    test_xyz_model();
+    goto done;
+  }
   test_manual_register_descriptions();
   test_unchanged_baudrate();
   if (strcmp(argv[1], "short_baud_table") == 0) {
@@ -1978,7 +2115,7 @@ int main(int argc, char **argv) {
   if (strncmp(argv[1], "nonadjacent_length_", strlen("nonadjacent_length_")) == 0) {
     finite_sensor();
     setting_registers[60] = 17;
-    CHECK(ssf_mems_protocol_collect_raw(&sensor, 100) == -EINVAL);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100) == -EINVAL);
     CHECK(sends == 1 && !sensor.raw.active && !reboots);
     CHECK(setting_registers[60] == 17);
     goto done;

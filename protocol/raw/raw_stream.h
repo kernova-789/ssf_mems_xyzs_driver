@@ -4,11 +4,11 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 struct ssf_mems_raw_sample;
 
 typedef int (*ssf_mems_raw_sample_handler_t)(
-    struct ssf_mems_xyzs_data *data, const struct ssf_mems_raw_sample *sample);
+    struct ssf_mems_data *data, const struct ssf_mems_raw_sample *sample);
 
 #define SSF_MEMS_RAW_HEADER 0x15U
 #define SSF_MEMS_RAW_TAIL 0x17U
@@ -20,7 +20,7 @@ typedef int (*ssf_mems_raw_sample_handler_t)(
   (SSF_MEMS_RAW_PAYLOAD_OFFSET + SSF_MEMS_RAW_SAMPLES_PER_PACKET * SSF_MEMS_RAW_SAMPLE_BYTES)
 #define SSF_MEMS_RAW_TAIL_OFFSET (SSF_MEMS_RAW_CRC_OFFSET + 2U)
 #define SSF_MEMS_RAW_PACKET_BYTES (SSF_MEMS_RAW_TAIL_OFFSET + 1U)
-#define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 一批 XYZ 组数，对应长度参数为零时的默认批次。 */
+#define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 一批 XYZ 组数；具体长度编码由型号回调选择。 */
 #define SSF_MEMS_RAW_BATCH_PACKETS \
   (SSF_MEMS_RAW_BATCH_SAMPLES / SSF_MEMS_RAW_SAMPLES_PER_PACKET)
 
@@ -51,10 +51,10 @@ struct ssf_mems_raw_state {
 /* 初始化定长原始数据接收状态。
  * 返回：无。
  */
-void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data);
+void ssf_mems_raw_init(struct ssf_mems_data *data);
 
 /* 用一个字节推进定长原始数据拼包。
  * 返回：无。
  * 调用者持 parse_lock；校验失败后定位下一包头。
  */
-void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte);
+void ssf_mems_raw_receive_byte(struct ssf_mems_data *data, u8 byte);

@@ -7,7 +7,7 @@
 #include "modbus/modbus_types.h"
 
 struct serdev_device;
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 /* 请求接口的共用返回值（具体接口只会返回实际路径上的部分错误）：
  * 0 成功；-EINVAL 参数/数量/地址布局非法；-ENOENT 必要表项缺失；
@@ -45,19 +45,20 @@ struct ssf_mems_modbus_request_state {
 /* 查表校验请求并生成传输描述。
  * 返回：0 成功，负数为参数、缺失表项、权限或格式错误。
  */
-int ssf_mems_modbus_plan_request(u8 function, u16 display_reg, u16 reg_count,
+struct ssf_mems_sensor;
+int ssf_mems_modbus_plan_request(const struct ssf_mems_sensor *sensor, u8 function, u16 display_reg, u16 reg_count,
                                 const struct ssf_block_cmd_desc *block,
                                 struct ssf_modbus_transfer *transfer);
 
 /* 初始化请求状态和等待队列。
  * 返回：0 成功，-EINVAL 设备无效。
  */
-int ssf_mems_modbus_request_init(struct ssf_mems_xyzs_data *data);
+int ssf_mems_modbus_request_init(struct ssf_mems_data *data);
 /* 关闭请求模块并唤醒等待者。
  * 返回：无。
  * 在途请求以 -ENODEV 结束。
  */
-void ssf_mems_modbus_request_remove(struct ssf_mems_xyzs_data *data);
+void ssf_mems_modbus_request_remove(struct ssf_mems_data *data);
 /* 读取一段普通寄存器。
  * 返回：0 成功，负数为校验或通信错误。
  * 私有数据响应不能通过此接口读取。
@@ -171,5 +172,5 @@ int ssf_mems_modbus_write_block_locked(
  * 返回：true 已认领，false 未认领。
  * 认领从机异常帧也返回 true，不表示请求成功。
  */
-bool ssf_mems_modbus_claim_frame(struct ssf_mems_xyzs_data *data,
+bool ssf_mems_modbus_claim_frame(struct ssf_mems_data *data,
                                  const u8 *buf, size_t len);

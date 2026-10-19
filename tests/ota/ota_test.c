@@ -13,7 +13,7 @@ unsigned int test_queue_count, test_cancel_count, test_wake_count;
 unsigned int test_delayed_queue_count, test_delayed_cancel_count;
 unsigned long jiffies;
 
-static struct ssf_mems_xyzs_data sensor;
+static struct ssf_mems_data sensor;
 static struct serdev_device serial;
 static struct firmware firmware;
 static u8 image[SSF_MEMS_OTA_MAX_SIZE + 1];
@@ -69,7 +69,7 @@ void test_msleep(unsigned int ms) {
   jiffies += ms;
 }
 
-int ssf_mems_iio_publish_raw(struct ssf_mems_xyzs_data *data,
+int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
                             const struct ssf_mems_raw_sample *sample) {
   (void)data;
   (void)sample;
@@ -234,6 +234,8 @@ static void reset(size_t size, enum fault selected) {
   memset(&sensor, 0, sizeof(sensor));
   memset(&serial, 0, sizeof(serial));
   sensor.serdev = &serial;
+  sensor.sensor = &ssf_mems_xyzs;
+  sensor.sensor_ops = ssf_mems_xyzs.ops;
   serial.drvdata = &sensor;
   serial.dev.has_current_speed = true;
   serial.dev.current_speed = 128000;
@@ -447,11 +449,21 @@ static void test_waiting_and_shutdown(void) {
   }
 }
 
+static void test_xyz_unsupported_ota(void) {
+  reset(513, NORMAL);
+  sensor.sensor = &ssf_mems_xyz;
+  sensor.sensor_ops = ssf_mems_xyz.ops;
+  CHECK(ssf_mems_ota_transfer(&sensor, image, firmware.size) == -EOPNOTSUPP);
+  CHECK(ssf_mems_acquisition_update_firmware(&sensor, "update.bin") == -EOPNOTSUPP);
+  CHECK(sends == 0 && releases == 0 && sensor.ota.status.stage == SSF_MEMS_OTA_IDLE);
+}
+
 int main(void) {
   test_success();
   test_failures();
   test_validation();
   test_waiting_and_shutdown();
+  test_xyz_unsupported_ota();
   cleanup();
   printf("PASS OTA framing, staged Flash, ACK faults, loader and lifecycle: %u checks\n", checks);
   return 0;

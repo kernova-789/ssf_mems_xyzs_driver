@@ -16,13 +16,15 @@ def main():
                    "-Werror", "-Wno-sign-compare", "-fsanitize=address,undefined",
                    "-DSSF_TEST_REAL_MUTEX", "-g", "-pthread"]
         for path in (TEST / "shim", ROOT / "tests/protocol/shim",
-                     ROOT / "core", ROOT / "protocol", ROOT / "acquisition",
+                     ROOT / "sensor", ROOT / "core", ROOT / "protocol", ROOT / "acquisition",
                      ROOT / "iio"):
             command += ["-I" + str(path)]
         command += [str(ROOT / "protocol" / source) for source in
                     ("model/modbus_table.c", "transport/serial_transport.c", "raw/raw_capture.c",
                      "modbus/modbus.c", "modbus/modbus_request.c", "modbus/modbus_receive.c",
                      "protocol.c", "raw/raw_stream.c", "firmware/ota.c")]
+        command += [str(ROOT / "sensor" / source) for source in
+                    ("sensor.c", "xyzs.c", "xyz.c", "features.c")]
         command += [str(ROOT / "acquisition/ssf_mems_firmware.c"),
                     str(TEST / "ota_test.c"), "-o", str(executable)]
         subprocess.run(command, check=True)

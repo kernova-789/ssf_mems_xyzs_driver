@@ -16,9 +16,11 @@ def main():
                  "-fsanitize=address,undefined", "-g", "-pthread", "-ffunction-sections",
                  "-fdata-sections", "-Wl,--gc-sections"]
         for directory in (TEST_DIR / "shim", ROOT / "tests/protocol/shim",
-                          ROOT / "iio", ROOT / "core", ROOT / "protocol", ROOT / "acquisition"):
+                          ROOT / "sensor", ROOT / "iio", ROOT / "core", ROOT / "protocol", ROOT / "acquisition"):
             flags += ["-I" + str(directory)]
         subprocess.run(flags + [str(TEST_DIR / "iio_test.c"),
+                               str(ROOT / "sensor/sensor.c"), str(ROOT / "sensor/xyzs.c"),
+                               str(ROOT / "sensor/xyz.c"), str(ROOT / "tests/protocol/model_ops_stub.c"),
                                str(ROOT / "protocol/firmware/ota.c"),
                                str(ROOT / "protocol/model/modbus_table.c"),
                                str(ROOT / "protocol/transport/serial_transport.c"),

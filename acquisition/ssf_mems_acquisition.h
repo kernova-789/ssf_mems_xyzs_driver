@@ -9,7 +9,7 @@
 #include "protocol.h"
 
 struct task_struct;
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 /* 采集策略；raw 反复执行完整定长批次，每批结束后确认普通通信。 */
 enum ssf_mems_acquisition_mode {
@@ -88,47 +88,47 @@ struct ssf_mems_acquisition_status {
 /* 初始化采集状态和窗口配置。
  * 返回：0 成功，-EINVAL 设备无效。
  */
-int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data);
+int ssf_mems_acquisition_init(struct ssf_mems_data *data);
 /* 启动后台采集线程。
  * 返回：0 成功，负数为状态或线程创建错误。
  * 在 IIO 注册后调用。
  */
-int ssf_mems_acquisition_start(struct ssf_mems_xyzs_data *data);
+int ssf_mems_acquisition_start(struct ssf_mems_data *data);
 /* 停止采集线程并收尾在途批次。
  * 返回：无。
  * 调用前关闭请求模块，完成后才能释放接收和 IIO 资源。
  */
-void ssf_mems_acquisition_stop(struct ssf_mems_xyzs_data *data);
+void ssf_mems_acquisition_stop(struct ssf_mems_data *data);
 /* 确认当前通信波特率。
  * 返回：0 成功，负数为参数、停止、升级占用或通信错误。
  * 与后台采集共用采集锁。
  */
-int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_get_baudrate(struct ssf_mems_data *data,
                                     enum ssf_mems_baudrate *baudrate);
 /* 修改波特率并更新重连目标。
  * 返回：0 成功，负数为参数、停止、升级占用或通信错误。
  * 与后台采集共用采集锁。
  */
-int ssf_mems_acquisition_set_baudrate(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_baudrate(struct ssf_mems_data *data,
                                     enum ssf_mems_baudrate baudrate);
 /* 复制当前采集状态。
  * 返回：无。
  * 只读主机状态，不发送串口请求。
  */
 void ssf_mems_acquisition_get_status(
-    struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_status *status);
+    struct ssf_mems_data *data, struct ssf_mems_acquisition_status *status);
 /* 读取一个传感器配置项。
  * 返回：0 成功，负数为参数、设备状态或通信错误。
  * 设备上线后才发送请求。
  */
-int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_read_setting(struct ssf_mems_data *data,
                                      enum ssf_mems_sensor_setting setting,
                                      u16 *value);
 /* 写入一个传感器配置项。
  * 返回：0 成功，负数为参数、设备状态或通信错误。
  * 设备上线后才发送请求；确认成功的采样率保留为本次运行的重连目标。
  */
-int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_write_setting(struct ssf_mems_data *data,
                                       enum ssf_mems_sensor_setting setting,
                                       u16 value);
 /* 复制当前采集配置。
@@ -136,28 +136,28 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
  * 只取短状态锁，不等待在途采集或升级。
  */
 int ssf_mems_acquisition_get_config(
-    struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_config *config);
+    struct ssf_mems_data *data, struct ssf_mems_acquisition_config *config);
 /* 设置原始、特征或交替采集模式。
  * 返回：0 成功，负数为参数、停止或校验位错误。
  * 只改变主机调度，可能等待在途采集窗口完成。
  */
-int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_mode(struct ssf_mems_data *data,
                                   enum ssf_mems_acquisition_mode mode);
 /* 设置一个采集窗口的时长。
  * 返回：0 成功，-EINVAL 参数无效，-ENODEV 正在停止。
  */
-int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_duration(struct ssf_mems_data *data,
                                       bool raw_window, unsigned int duration_ms);
 /* 修改一个主机特征轮询配置项。
  * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。
  * 设置周期不写传感器参数，也不截断在途原始批次。
  */
-int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_data *data,
                                           enum ssf_mems_poll_setting setting,
                                           unsigned int value);
 /* 加载 bin 文件并升级传感器固件。
  * 返回：0 升级已确认，负数为文件、设备状态或传输错误。
  * 升级期间独占采集流程，末包结果不明时暂停自动重连。
  */
-int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_update_firmware(struct ssf_mems_data *data,
                                          const char *name);

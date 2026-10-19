@@ -1,3 +1,14 @@
+本文原有操作示例使用 XYZS 名称。驱动现在还支持 XYZ V2.4：
+
+| 型号 | 特征设备 / 原始设备 | 特征与能力差异 |
+| --- | --- | --- |
+| XYZS | `ssf_mems_xyzs` / `ssf_mems_xyzs_raw` | 原有 29 个特征、参数开关、版本和 OTA |
+| XYZ | `ssf_mems_xyz` / `ssf_mems_xyz_raw` | 19 个特征，含三轴位移；无声音、高低频、运行标志、参数开关、版本和 OTA 属性 |
+
+XYZ 位移通道为 `in_distance_x_peak_to_peak_raw`（Y/Z 同理），scale 为 `0.000001` m；
+温度 raw 已从手册的有符号 ℃×10 换算为 ℃×100，scale 同样为 10 m℃。
+型号布局和定长采集兼容假设见 [sensor/README.md](../sensor/README.md)。
+
 # IIO 属性使用说明
 
 本文对应当前 SSF-MEMS-XYZS 温振声驱动。属性名以 `ssf_mems_iio.c` 为准。
@@ -133,7 +144,7 @@ cat "$FEATURE/sensor_poll_interval_ms"
 | `sensor_sampling_rate_index` | 读写 | 传感器采样率编码，当前为 0～9。例如写 `6` 选择 5333.4 Hz。首次连接默认索引 6；成功设置后，重连继续使用用户值，卸载后恢复型号表默认值。 |
 | `sensor_sampling_rate_index_available` | 只读 | 列出可用采样率编码，当前为 `0 1 2 3 4 5 6 7 8 9`。 |
 | `sensor_sampling_frequency` | 只读 | 将当前采样率编码换算成 Hz 文本，例如 `5333.4`。 |
-| `sensor_sampling_length_index` | 只读 | 查看特征计算的采样长度编码：0～5 对应 1024、2048、4096、8192、16384、32768 点。它不代表原始定长批次的长度。 |
+| `sensor_sampling_length_index` | 读写 | 普通采样长度编码：0～5 对应 1024、2048、4096、8192、16384、32768 点；写后读回确认，同值不写。它不代表驱动原始定长批次的长度，后者通过 40061/40062 独立设置为 1024。 |
 | `sensor_parameter_switch` | 只读 | 查看完整参数开关字，以十六进制输出，例如 `0xfc00`。包含特征使能和报警等配置位。 |
 | `sensor_feature_enable` | 读写 | 查看/修改六个高低频特征计算开关，范围 0～63。例如 `echo 63 > "$FEATURE/sensor_feature_enable"` 开启全部六项，`0` 关闭这六项。保留其他配置位。 |
 | `sensor_firmware_version` | 只读 | 读取固件版本编码，原样输出整数，例如 `5100`；不将其解释为语义版本号。 |
@@ -366,7 +377,7 @@ cat "$FEATURE/sensor_firmware_update_status"
 | 无此文件 / `ENOENT` | 升级文件不存在，或当前寄存器表缺少所请求的 `.name` |
 
 上述说明对应当前型号和固件。寄存器地址、编码和单位映射集中在
-[modbus_table.h](../protocol/model/modbus_table.h)；将来更换型号表时，应同步核对设备能力和文档。
+[sensor 型号描述](../sensor/README.md)；将来更换型号表时，应同步核对设备能力和文档。
 
 ## 12. 单位与测量边界
 

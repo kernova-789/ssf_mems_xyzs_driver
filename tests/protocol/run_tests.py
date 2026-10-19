@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TEST_DIR = Path(__file__).resolve().parent
 VARIANTS = {
     "baseline": set(),
+    "xyz": set(),
     "delete_first": {40001},
     "delete_middle": {40002},
     "delete_last": {40029},
@@ -30,6 +32,10 @@ VARIANTS = {
 }
 MODULES = {
     "modbus_table": "model/modbus_table.c",
+    "sensor": "../sensor/sensor.c",
+    "features": "../sensor/features.c",
+    "xyzs": "../sensor/xyzs.c",
+    "xyz": "../sensor/xyz.c",
     "serial_transport": "transport/serial_transport.c",
     "raw_capture": "raw/raw_capture.c",
     "modbus": "modbus/modbus.c",
@@ -40,13 +46,17 @@ MODULES = {
     "ota": "firmware/ota.c",
 }
 HEADERS = (
-    "model/sensor_data.h", "model/sensor_fields.h", "modbus/modbus_types.h",
+    "sensor_data.h", "sensor_fields.h", "sensor.h", "xyz.h", "xyzs.h", "modbus/modbus_types.h",
     "modbus/modbus.h", "model/modbus_table.h", "modbus/modbus_request.h",
     "modbus/modbus_receive.h", "protocol.h", "core.h",
     "ssf_mems_acquisition.h", "acquisition_policy.h", "raw/raw_stream.h",
     "raw/raw_capture.h", "transport/serial_transport.h", "firmware/ota.h",
 )
 ALLOWED_DEPENDENCIES = {
+    "sensor": {"modbus_table"},
+    "features": {"sensor", "modbus_request", "protocol"},
+    "xyzs": {"features", "raw_capture"},
+    "xyz": {"features", "raw_capture"},
     "modbus_table": set(),
     "serial_transport": {"modbus_table"},
     "raw_capture": {"modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
@@ -60,6 +70,8 @@ ALLOWED_DEPENDENCIES = {
 
 def check_module_dependencies(objects):
     nm = os.environ.get("NM", "nm")
+    for allowed in ALLOWED_DEPENDENCIES.values():
+        allowed.add("sensor")
     owners = {}
     for module, obj in objects.items():
         output = subprocess.check_output([nm, "-g", "--defined-only", str(obj)], text=True)
@@ -78,7 +90,7 @@ def check_module_dependencies(objects):
                 raise AssertionError(f"Invalid dependency: {module} -> {symbol} ({owner})")
 
 def configure_table(text, deleted, variant):
-    marker = "const struct ssf_reg_desc ssf_reg_table[] = {"
+    marker = "static const struct ssf_reg_desc ssf_reg_table[] = {"
     start = text.index(marker) + len(marker)
     end = text.index("\n};", start)
     entries = re.findall(r"    \{\n.*?\n    \},", text[start:end], re.S)
@@ -120,13 +132,17 @@ def main():
     compiler = os.environ.get("CC", "cc")
     with tempfile.TemporaryDirectory(prefix="ssf-mems-protocol-tests-") as temp:
         scratch = Path(temp)
-        check_table_validation(compiler, scratch)
-        for name, deleted in VARIANTS.items():
+        selected = sys.argv[1:] or list(VARIANTS)
+        if not sys.argv[1:]:
+            check_table_validation(compiler, scratch)
+        for name in selected:
+            deleted = VARIANTS[name]
             project = scratch / name
             shutil.copytree(ROOT / "protocol", project / "protocol")
             shutil.copytree(ROOT / "core", project / "core")
             shutil.copytree(ROOT / "acquisition", project / "acquisition")
-            table_path = project / "protocol/model/modbus_table.h"
+            shutil.copytree(ROOT / "sensor", project / "sensor")
+            table_path = project / "sensor/xyzs.c"
             # Mechanical test-fixture transformation; production table is never edited.
             table_path.write_text(configure_table(table_path.read_text(), deleted, name))
             executable = project / "protocol_test"
@@ -135,6 +151,7 @@ def main():
                 "-Wno-sign-compare", "-fsanitize=address,undefined", "-g",
                 "-I" + str(TEST_DIR / "shim"), "-I" + str(project / "protocol"),
                 "-I" + str(project / "core"),
+                "-I" + str(project / "sensor"),
                 "-I" + str(project / "acquisition"),
                 "-I" + str(ROOT / "iio"),
             ]
@@ -189,12 +206,23 @@ def check_table_validation(compiler, scratch):
         "bad_field": (".feature_field = SSF_MEMS_FIELD_TEMPERATURE",
                       ".feature_field = SSF_MEMS_FIELD_MAX", "temperature"),
         "bad_field_type": (".type = SSF_REG_S16", ".type = SSF_REG_U32_HIGH", "temperature"),
+        "bad_offset": ("SSF_MEMS_FEATURE_MEMBER(xyzs.x.high_freq_acc_rms_x100, ACCEL)",
+                       ".field = {.offset = 1000, .width = 2}", "x_high_freq_acc_rms"),
+        "bad_width": ("SSF_MEMS_FEATURE_MEMBER(xyzs.x.high_freq_acc_rms_x100, ACCEL)",
+                      ".field = {.offset = 0, .width = 4}", "x_high_freq_acc_rms"),
+        "overlapping_member": ("SSF_MEMS_FEATURE_MEMBER(xyzs.x.low_freq_velocity_rms_x100, VELOCITY)",
+                               "SSF_MEMS_FEATURE_MEMBER(xyzs.x.high_freq_acc_rms_x100, VELOCITY)",
+                               "x_low_freq_velocity_rms"),
+        "bad_feature_scale": ("SSF_MEMS_FEATURE_MEMBER(xyzs.x.high_freq_acc_rms_x100, ACCEL)",
+                              ".field = {.offset = 0, .width = 2, .scale = 1000}",
+                              "x_high_freq_acc_rms"),
         "empty_block": (".reg_count = 29", ".reg_count = 0", "read_all_features"),
     }
     for name, (original, replacement, expected) in fixtures.items():
         project = scratch / ("validation_" + name)
         shutil.copytree(ROOT / "protocol", project / "protocol")
-        table_path = project / "protocol/model/modbus_table.h"
+        shutil.copytree(ROOT / "sensor", project / "sensor")
+        table_path = project / "sensor/xyzs.c"
         if original is not None:
             source = table_path.read_text()
             assert original in source, (name, original)
@@ -203,7 +231,10 @@ def check_table_validation(compiler, scratch):
         command = [compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                    "-Wno-sign-compare", "-fsanitize=address,undefined", "-g",
                    "-I" + str(TEST_DIR / "shim"), "-I" + str(project / "protocol"),
-                   str(project / "protocol/model/modbus_table.c"), str(TEST_DIR / "table_test.c"),
+                   "-I" + str(project / "sensor"),
+                   str(project / "protocol/model/modbus_table.c"),
+                   str(project / "sensor/sensor.c"), str(project / "sensor/xyzs.c"),
+                   str(TEST_DIR / "model_ops_stub.c"), str(TEST_DIR / "table_test.c"),
                    "-o", str(executable)]
         subprocess.run(command, check=True)
         subprocess.run([str(executable), expected], check=True)

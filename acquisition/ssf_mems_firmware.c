@@ -11,7 +11,7 @@
  * 返回：0 升级已确认，负数为文件、设备状态或传输错误。
  * 升级期间独占采集流程，末包结果不明时暂停自动重连。
  */
-int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_update_firmware(struct ssf_mems_data *data,
                                          const char *name) {
   const struct firmware *firmware = NULL;
   struct ssf_mems_acquisition_state *acq;
@@ -21,6 +21,8 @@ int ssf_mems_acquisition_update_firmware(struct ssf_mems_xyzs_data *data,
 
   if (data == NULL || data->serdev == NULL || name == NULL)
     return -EINVAL;
+  if (data->sensor == NULL || !data->sensor->supports_ota)
+    return -EOPNOTSUPP;
   ret = ssf_mems_ota_parse_name(name, strlen(name), checked);
   if (ret != 0)
     return ret;

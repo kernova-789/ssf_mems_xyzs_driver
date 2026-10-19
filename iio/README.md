@@ -1,3 +1,7 @@
+两款型号按设备树 compatible 选择：XYZS 保留以下原有 29 通道 ABI，XYZ 使用自己的 19 个通道。
+XYZ 的 IIO 名称为 `ssf_mems_xyz` / `ssf_mems_xyz_raw`；通道、单位和能力差异见
+[sensor/README.md](../sensor/README.md)。下文以 XYZS 的属性和名称举例。
+
 # IIO mapping
 
 完整中文属性说明、权限、取值范围和操作示例见 [IIO 属性使用说明](ATTRIBUTES.md)。
@@ -155,7 +159,7 @@ acquisition and baud-rate recovery. They return `-ENODATA` while offline:
 - `sensor_sampling_rate_index` (RW): register 40052, index 0 through 9.
 - `sensor_sampling_frequency` (RO): the configured frequency in Hz.
 - `sensor_sampling_rate_index_available` (RO): supported indices.
-- `sensor_sampling_length_index` (RO): register 40053, feature sampling-length index;
+- `sensor_sampling_length_index` (RW): register 40053, ordinary sampling-length index 0..5;
   it does not set the finite raw batch size.
 - `sensor_parameter_switch` (RO): register 40070, complete switch word in hex.
 - `sensor_feature_enable` (RW): bits 15..10 of 40070, shifted down to 0..63.
@@ -199,4 +203,4 @@ buffer，保持特征设备原有布局不变。全部数据字段和时间戳�
 
 成功设置的采样率会在本次驱动运行期间作为重连目标，卸载后恢复型号表默认值。
 主机模式、窗口与轮询配置读取使用短锁，不等待原始窗口或 OTA；写入继续串行化。
-特征字段/单位统一来自 `protocol/model/sensor_fields.h`，两设备共用缓冲区打包和注册辅助函数。
+特征字段/单位统一来自 `sensor/sensor_fields.h`，两设备共用缓冲区打包和注册辅助函数。

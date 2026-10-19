@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "acquisition_policy.h"
-#include "model/sensor_fields.h"
+#include "sensor_fields.h"
 
 #include <linux/errno.h>
 #include <linux/jiffies.h>
@@ -11,11 +11,20 @@
  * 返回：true 相同，false 不同。
  * 从公共字段清单生成比较，不比较结构体填充字节。
  */
-static bool ssf_mems_sample_equal(const struct ssf_mems_sensor_data *a,
+static bool ssf_mems_sample_equal(const struct ssf_mems_sensor *sensor,
+                                  const struct ssf_mems_sensor_data *a,
                                   const struct ssf_mems_sensor_data *b) {
-#define SSF_MEMS_FIELD_EQUAL(_name, _member, _scale) && (a->_member == b->_member)
-  return true SSF_MEMS_SENSOR_FIELDS(SSF_MEMS_FIELD_EQUAL);
-#undef SSF_MEMS_FIELD_EQUAL
+  size_t i;
+
+  for (i = 0; i < sensor->reg_count; i++) {
+    const struct ssf_reg_desc *reg = &sensor->regs[i];
+
+    if (reg->feature_field != SSF_MEMS_FIELD_NONE &&
+        memcmp((const u8 *)a + reg->field.offset,
+               (const u8 *)b + reg->field.offset, reg->field.width) != 0)
+      return false;
+  }
+  return true;
 }
 
 /* 清空本轮轮询统计。
@@ -42,8 +51,10 @@ static void ssf_mems_poll_faster(struct ssf_mems_acquisition_policy *policy) {
  * 返回：无。
  */
 void ssf_mems_acquisition_policy_init(
-    struct ssf_mems_acquisition_policy *policy, unsigned long now) {
+    struct ssf_mems_acquisition_policy *policy,
+    const struct ssf_mems_sensor *sensor, unsigned long now) {
   memset(policy, 0, sizeof(*policy));
+  policy->sensor = sensor;
   policy->config.mode = SSF_MEMS_POLL_FIXED;
   policy->config.fixed_interval_ms = SSF_MEMS_POLL_DEFAULT_INTERVAL_MS;
   policy->config.min_interval_ms = SSF_MEMS_POLL_DEFAULT_MIN_MS;
@@ -123,7 +134,7 @@ void ssf_mems_acquisition_policy_sample(
   policy->max_read_ms = max(policy->max_read_ms, read_ms);
   if (policy->have_previous == true) {
     policy->comparisons++;
-    changed = !ssf_mems_sample_equal(&policy->previous, sample);
+    changed = !ssf_mems_sample_equal(policy->sensor, &policy->previous, sample);
     if (changed == false)
       policy->repeats++;
   }

@@ -3,7 +3,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 
-#include "model/sensor_data.h"
+#include "sensor.h"
 #include "model/modbus_table.h"
 
 /* 与手册 40103 寄存器的编码一致。 */
@@ -15,7 +15,7 @@ enum ssf_mems_parity {
 };
 
 struct serdev_device;
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 /* 特征计算配置；地址和使能位布局由型号表解释。 */
 enum ssf_mems_sensor_setting {
@@ -33,7 +33,7 @@ enum ssf_mems_sensor_setting {
 int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
                                   enum ssf_mems_sensor_setting setting,
                                   u16 *value, unsigned int timeout_ms);
-/* 修改采样率或特征使能配置。
+/* 修改采样率、普通采样长度或特征使能配置。
  * 返回：0 成功或无需修改，负数为参数、通信或读回错误。
  * 同值不重复写入，写后读回并保留原有报警位。
  */
@@ -79,25 +79,19 @@ struct ssf_mems_protocol_state {
  * 返回：0 成功，-EINVAL 设备或启动配置无效。
  * 只初始化状态，不发送串口命令。
  */
-int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data);
+int ssf_mems_protocol_init(struct ssf_mems_data *data);
 
 /* 按启动配置设置主机 UART。
  * 返回：0 成功，负数为参数或控制器错误。
  * 非默认启动速率被拒绝时回退到 9600。
  */
-int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data);
+int ssf_mems_protocol_configure_serial(struct ssf_mems_data *data);
 
-/* 在指定窗口内逐批采集 1024 组 XYZ。
- * 返回：0 完成，负数为配置、通信、数据完整性或 IIO 错误。
- * 调用者持采集锁；全程独占总线，窗口到期仍收完在途批次。
- */
-int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
-                                 unsigned int duration_ms);
 /* 恢复尚未确认结束的原始批次。
  * 返回：0 已恢复或无需恢复，负数为参数或收尾错误。
  * 接收模块须仍可用，只读确认，不写 Flash。
  */
-int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data);
+int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data);
 
 /* 把完整 Modbus 帧交给请求层匹配。
  * 返回：0 已处理或丢弃，-EINVAL 参数为空。
@@ -111,39 +105,18 @@ int ssf_mems_protocol_handle_frame(void *context, const u8 *buf, size_t len);
 int ssf_mems_protocol_get_features(struct serdev_device *serdev,
                                    struct ssf_mems_sensor_data *result);
 
-/* 打印一份完整特征用于调试。
- * 返回：无。
- * 用定点数输出，避免内核浮点运算。
- */
-void ssf_mems_protocol_log_features(
-    const struct ssf_mems_sensor_data *features);
-
 /* 替换最新的特征缓存。
  * 返回：0 成功，-EINVAL 参数为空。
  * 加锁更新，避免读到部分新数据。
  */
 int ssf_mems_protocol_store_features(
-    struct ssf_mems_xyzs_data *data,
+    struct ssf_mems_data *data,
     const struct ssf_mems_sensor_data *features);
 
 /* 把特征缓存标记为无效。
  * 返回：无。
  */
-void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data);
-
-/* 把完整特征块转换为特征结构体。
- * 返回：0 成功，-EINVAL 参数无效，-ENOENT 块描述缺失，-ERANGE 换算越界。
- * 删除的表项对应字段置零。
- */
-int ssf_mems_protocol_decode_features(const u16 *registers, size_t count,
-                                      struct ssf_mems_sensor_data *result);
-
-/* 分段读取全部特征并更新缓存。
- * 返回：0 成功，负数为参数、表项、通信或解码错误。
- * 所有分段成功后才更新缓存。
- */
-int ssf_mems_protocol_read_features(struct serdev_device *serdev,
-                                    unsigned int timeout_ms);
+void ssf_mems_protocol_invalidate_features(struct ssf_mems_data *data);
 
 /* 写入块表规定的十个工作参数。
  * 返回：0 成功，负数为参数、表项或通信错误。
@@ -156,13 +129,13 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
 /* 把波特率编码转换为 bit/s 数值。
  * 返回：正数为波特率，-EINVAL 编码无效。
  */
-int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate);
+int ssf_mems_baudrate_to_value(const struct ssf_mems_sensor *sensor, enum ssf_mems_baudrate baudrate);
 
 /* 把 bit/s 数值转换为波特率编码。
  * 返回：0 成功，-EINVAL 参数或速率无效。
  * 9600 对应显式编码 3。
  */
-int ssf_mems_baudrate_from_value(unsigned int value,
+int ssf_mems_baudrate_from_value(const struct ssf_mems_sensor *sensor, unsigned int value,
                                  enum ssf_mems_baudrate *baudrate);
 
 /* 修改并验证传感器通信波特率。

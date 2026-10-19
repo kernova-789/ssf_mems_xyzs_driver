@@ -13,11 +13,12 @@ import sys
 import threading
 import time
 
+from iio_devices import find_pair
+
 
 def find(name):
     """按名称发现 IIO 设备，不依赖设备编号。"""
-    return next(path for path in Path('/sys/bus/iio/devices').glob('iio:device*')
-                if (path / 'name').read_text().strip() == name)
+    return find_pair(os.environ.get('SSF_MEMS_TEST_SERDEV'))[name]
 
 
 def read(path):
@@ -76,11 +77,26 @@ def api_case(feature):
             else:
                 raise AssertionError((key, value, 'invalid write accepted'))
     assert settings(feature) == before
-    # 采样率/特征开关的同值写只读确认；波特率 setter 即使同值也会保存重启，跳过。
+    # 同值采样率/特征开关写只读确认，不修改原有配置。
     for key in ('sensor_sampling_rate_index', 'sensor_feature_enable'):
         (feature / key).write_text(before[key])
     wait_online(feature)
     assert settings(feature) == before
+
+    # 已匹配的波特率同值写应只读确认；检查当前实例没有新增保存/重启日志。
+    instance = feature.resolve().parent.name
+    baud_started = time.monotonic()
+    kernel_started = time.clock_gettime(time.CLOCK_BOOTTIME)
+    (feature / 'sensor_baudrate').write_text(before['sensor_baudrate'])
+    wait_online(feature)
+    assert read(feature / 'sensor_baudrate') == before['sensor_baudrate']
+    log = subprocess.check_output(['dmesg'], text=True)
+    for line in log.splitlines():
+        stamp = re.search(r'\[\s*([\d.]+)\]', line)
+        if stamp and float(stamp[1]) >= kernel_started and instance + ':' in line:
+            assert 'baud change:' not in line and 'saving/rebooting via' not in line, line
+    same_baud = dict(value=before['sensor_baudrate'], saved_or_rebooted=False,
+                     elapsed_seconds=round(time.monotonic() - baud_started, 3))
 
     def reader(worker):
         """模拟多个应用同时经驱动读取配置，验证请求串行化。"""
@@ -97,7 +113,7 @@ def api_case(feature):
     assert scales and '0.098066500' in scales.values(), scales
     return dict(before=before, after=settings(feature), invalid=cases,
                 concurrent_snapshots=concurrent, scales=scales,
-                same_baud_write_skipped='setter currently saves/reboots even for the same value')
+                same_baud_write=same_baud)
 
 
 def channels(device):
@@ -251,7 +267,7 @@ def lifecycle_case(feature, raw, module):
     unbound = False
     parent = feature.resolve().parent
     driver = (parent / 'driver').resolve()
-    assert parent.name == 'serial0-0' and driver.name == 'ssf_mems_xyzs_driver'
+    assert driver.name == 'ssf_mems_xyzs_driver'
 
     def reader(name, fd, size):
         """解绑应以 ENODEV 结束阻塞读取，而不是永久等待。"""
@@ -433,7 +449,10 @@ def main():
     parser.add_argument('case', choices=('api', 'layouts', 'overflow', 'invalid-buffer',
                                         'lifecycle', 'early-remove', 'feature-overflow'))
     parser.add_argument('--module', type=Path, help='lifecycle 用例重载的正式模块路径')
+    parser.add_argument('--serdev', help='只测试该 serdev 实例，例如 serial0-0')
     args = parser.parse_args()
+    if args.serdev is not None:
+        os.environ['SSF_MEMS_TEST_SERDEV'] = args.serdev
     feature, raw = find('ssf_mems_xyzs'), find('ssf_mems_xyzs_raw')
     assert read(feature / 'buffer/enable') == read(raw / 'buffer/enable') == '0'
     result = dict(case=args.case, passed=False)

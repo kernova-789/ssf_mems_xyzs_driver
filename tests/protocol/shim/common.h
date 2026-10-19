@@ -38,7 +38,10 @@ typedef int spinlock_t;
 typedef struct { int counter; } atomic_t;
 struct work_struct { void (*fn)(struct work_struct *); };
 struct delayed_work { struct work_struct work; unsigned long delay; bool pending; };
+typedef unsigned short umode_t;
+struct kobject { int unused; };
 struct device {
+  struct kobject kobj;
   bool has_slave_id, has_current_speed, has_parity;
   u32 slave_id, current_speed;
   const char *parity;
@@ -50,6 +53,9 @@ struct device {
   u32 raw_duration_ms, feature_duration_ms;
   int duration_read_error;
 };
+static inline struct device *kobj_to_dev(struct kobject *kobj) {
+  return container_of(kobj, struct device, kobj);
+}
 enum serdev_parity {
   SERDEV_PARITY_NONE,
   SERDEV_PARITY_EVEN,
@@ -71,7 +77,7 @@ struct serdev_device {
   unsigned long wait_timeout;
 };
 struct kfifo { u8 *data; size_t capacity, head, tail, count; };
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 extern bool test_allocation_failure;
 extern long test_wait_result;

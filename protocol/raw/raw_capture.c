@@ -17,10 +17,10 @@
  * 返回：0 完整发送，负数为表项、组帧或串口错误。
  * 调用者须持 bus_lock，触发后不等待普通 Modbus 应答。
  */
-static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_protocol_raw_command(struct ssf_mems_data *data) {
   struct ssf_modbus_transfer transfer = {0};
   const struct ssf_reg_desc *reg =
-      ssf_mems_modbus_find_reg_by_name("start_custom_length");
+      ssf_mems_sensor_find_reg_by_name(data->sensor, "start_custom_length");
   u8 frame[8];
   int len;
 
@@ -40,7 +40,7 @@ static int ssf_mems_protocol_raw_command(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 切换前清理残留数据，不改变 UART 速率。
  */
-static void ssf_mems_protocol_raw_receiver(struct ssf_mems_xyzs_data *data,
+static void ssf_mems_protocol_raw_receiver(struct ssf_mems_data *data,
                                           bool active) {
   if (READ_ONCE(data->raw.active) == active)
     return;
@@ -54,7 +54,7 @@ static void ssf_mems_protocol_raw_receiver(struct ssf_mems_xyzs_data *data,
 /* 检查驱动是否正在停止。
  * 返回：true 正在停止，false 可以继续。
  */
-static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_xyzs_data *data) {
+static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_data *data) {
   return READ_ONCE(data->acquisition.stopping) == true ||
          READ_ONCE(data->modbus_req.shutting_down) == true;
 }
@@ -62,7 +62,7 @@ static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_xyzs_data *data) {
 /* 等待串口接收持续安静 300 ms。
  * 返回：true 已静默，false 在 1 秒内未满足条件。
  */
-static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_xyzs_data *data) {
+static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_data *data) {
   unsigned long began = jiffies;
   unsigned long deadline = began + msecs_to_jiffies(1000);
   unsigned long quiet = msecs_to_jiffies(SSF_MEMS_RAW_QUIET_MS);
@@ -83,7 +83,7 @@ static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_xyzs_data *data) {
  * 返回：0 已恢复，负数为静默、表项或读回错误。
  * 等待在途批次自然结束，确认失败时禁止开始新业务。
  */
-int ssf_mems_raw_finish_locked(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
   const struct ssf_reg_desc *reg;
   u16 reported;
@@ -99,7 +99,7 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_xyzs_data *data) {
   }
   if (ssf_mems_protocol_raw_quiet(data) == false)
     return -ETIMEDOUT;
-  reg = ssf_mems_modbus_find_reg_by_name("baudrate");
+  reg = ssf_mems_sensor_find_reg_by_name(data->sensor, "baudrate");
   if (reg == NULL)
     return -ENOENT;
   mutex_lock(&data->modbus_rx.parse_lock);
@@ -109,7 +109,7 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_xyzs_data *data) {
   ssf_mems_protocol_raw_receiver(data, false);
   ret = ssf_mems_modbus_read_reg_recovery_locked(data->serdev, reg->display_reg,
                                                 &reported, 500);
-  if (ret == 0 && ssf_mems_baudrate_to_value(reported) < 0)
+  if (ret == 0 && ssf_mems_baudrate_to_value(data->sensor, reported) < 0)
     ret = -EPROTO;
   if (ret == 0) {
     WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_MODBUS);
@@ -126,7 +126,7 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_xyzs_data *data) {
  * 返回：0 已恢复或无需恢复，负数为参数或收尾错误。
  * 接收模块须仍可用，只读确认，不写 Flash。
  */
-int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data) {
   int ret = 0;
 
   if (data == NULL || data->serdev == NULL)
@@ -138,16 +138,17 @@ int ssf_mems_protocol_recover_raw(struct ssf_mems_xyzs_data *data) {
   return ret;
 }
 
-/* 设置定长采集为默认的 1024 组 XYZ。
+/* 按型号提供的长度编码配置 1024 组 XYZ。
  * 返回：0 成功，负数为表项、布局、通信或读回错误。
- * 只把长度高低字置零，并检查地址相邻。
+ * 只写长度高低字，并检查地址相邻。
  */
-static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_protocol_raw_length(struct ssf_mems_data *data,
+                                          u32 length) {
   const struct ssf_reg_desc *high_reg =
-      ssf_mems_modbus_find_reg_by_name("custom_length_high");
+      ssf_mems_sensor_find_reg_by_name(data->sensor, "custom_length_high");
   const struct ssf_reg_desc *low_reg =
-      ssf_mems_modbus_find_reg_by_name("custom_length_low");
-  const u16 zero[2] = {0, 0};
+      ssf_mems_sensor_find_reg_by_name(data->sensor, "custom_length_low");
+  const u16 desired[2] = {length >> 16, length & 0xffff};
   u16 high, low;
   int ret;
 
@@ -163,10 +164,10 @@ static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
     return ret;
   ret = ssf_mems_modbus_read_reg_locked(data->serdev, low_reg->display_reg,
                                        &low, 500);
-  if (ret != 0 || (high == 0 && low == 0))
+  if (ret != 0 || (high == desired[0] && low == desired[1]))
     return ret;
   ret = ssf_mems_modbus_write_regs_locked(data->serdev, high_reg->display_reg, 2,
-                                          zero, ARRAY_SIZE(zero), 500);
+                                          desired, ARRAY_SIZE(desired), 500);
   if (ret != 0)
     return ret;
   ret = ssf_mems_modbus_read_reg_locked(data->serdev, high_reg->display_reg,
@@ -175,7 +176,7 @@ static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
     return ret;
   ret = ssf_mems_modbus_read_reg_locked(data->serdev, low_reg->display_reg,
                                        &low, 500);
-  if (ret == 0 && (high != 0 || low != 0))
+  if (ret == 0 && (high != desired[0] || low != desired[1]))
     ret = -EIO;
   return ret;
 }
@@ -184,7 +185,7 @@ static int ssf_mems_protocol_raw_length(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 调用者持 bus_lock，在解析锁内整体更新。
  */
-static void ssf_mems_raw_reset_window(struct ssf_mems_xyzs_data *data,
+static void ssf_mems_raw_reset_window(struct ssf_mems_data *data,
                                       u16 sampling_index) {
   struct ssf_mems_raw_state *raw = &data->raw;
 
@@ -207,7 +208,7 @@ static void ssf_mems_raw_reset_window(struct ssf_mems_xyzs_data *data,
  * 返回：无。
  * 调用者持 bus_lock；每批序号从零开始。
  */
-static void ssf_mems_raw_begin_batch(struct ssf_mems_xyzs_data *data) {
+static void ssf_mems_raw_begin_batch(struct ssf_mems_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
 
   ssf_mems_protocol_raw_receiver(data, true);
@@ -223,8 +224,8 @@ static void ssf_mems_raw_begin_batch(struct ssf_mems_xyzs_data *data) {
  * 返回：0 完成，负数为配置、通信、数据完整性或 IIO 错误。
  * 调用者持采集锁；全程独占总线，窗口到期仍收完在途批次。
  */
-int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
-                                 unsigned int duration_ms) {
+int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
+                                 unsigned int duration_ms, u32 length) {
   struct ssf_mems_raw_state *raw;
   unsigned long window_until, started;
   unsigned int batch_ms;
@@ -243,7 +244,7 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
     if (ret != 0)
       goto out;
   }
-  if (ssf_mems_modbus_find_reg_by_name("start_custom_length") == NULL) {
+  if (ssf_mems_sensor_find_reg_by_name(data->sensor, "start_custom_length") == NULL) {
     ret = -ENOENT;
     goto out;
   }
@@ -251,16 +252,29 @@ int ssf_mems_protocol_collect_raw(struct ssf_mems_xyzs_data *data,
       data->serdev, "sampling_rate", &sampling_index, 500);
   if (ret != 0)
     goto out;
-  if (sampling_index > SSF_MEMS_SAMPLING_RATE_MAX_INDEX) {
+  if (sampling_index > (data->sensor->profile.sampling_frequency_count - 1U)) {
     ret = -EPROTO;
     goto out;
   }
   /* 定长采样率范围由型号表限定，当前手册包含索引 9。 */
-  if (sampling_index > SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX) {
+  if (sampling_index > data->sensor->profile.raw_max_sampling_rate_index) {
     ret = -EOPNOTSUPP;
     goto out;
   }
-  ret = ssf_mems_protocol_raw_length(data);
+  /* 部分型号边采边传；超过 UART 吞吐量会在设备端产生坏包。
+   * 校验在长度写入、触发及缓存失效之前，不能靠忽略 CRC/序号来放行。
+   */
+  if (data->sensor->profile.raw_min_baudrates != NULL &&
+      data->protocol.host_baudrate <
+          data->sensor->profile.raw_min_baudrates[sampling_index]) {
+    dev_warn_ratelimited(&data->serdev->dev,
+        "finite raw sampling index %u requires baud >= %u (current %u)\n",
+        sampling_index, data->sensor->profile.raw_min_baudrates[sampling_index],
+        data->protocol.host_baudrate);
+    ret = -EOPNOTSUPP;
+    goto out;
+  }
+  ret = ssf_mems_protocol_raw_length(data, length);
   if (ret != 0)
     goto out;
   if (ssf_mems_protocol_raw_stopping(data) == true) {

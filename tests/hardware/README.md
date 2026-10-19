@@ -1,5 +1,55 @@
 # 开发板回归测试
 
+## 波特率与连续回报实验
+
+`board_baud_sweep.py` 通过正式 IIO 接口逐档设置两路波特率，同时记录各60秒，
+再执行一高一低的90秒对照，最后尝试恢复128000和原主机模式。
+每次脚本调速写入只执行一次；正式驱动自身的重连、扫描和调速行为会完整留在日志中。
+配置失败时保留实际读回值，不能把请求的波特率当作实际已启用的波特率。
+
+```sh
+sudo python3 board_baud_sweep.py /tmp/new-baud-sweep --seconds 60
+python3 analyze_baud_sweep.py /path/to/copied/sweep --output /tmp/baud-analysis.json
+```
+
+`--rates 230400 1000000` 可限制测试档位，`--no-mixed` 可略过高低速对照。
+测试会实际保存传感器波特率并重启，不能作为无限循环压力脚本运行。
+`board_autonomous_observe.py` 则关闭IIO buffer消费路径，仅观察后台线程、缓存与UART计数，
+不发送传感器配置读取请求，用于区分驱动自主采集和应用记录工作。
+
+连续回报由 [独立实验模块](recovery_lab/README.md) 测试，正式驱动仍只支持定长原始采集。
+连续实验不经过正式驱动或IIO，不能混入正式驱动通过项目。
+
+## 同型号双 RS485 实例
+
+本次实机结果见 [双 RS485 测试报告](TEST_REPORT_2026-10-19_DUAL_RS485.md)：
+双路同时采集与隔离检查通过，保留一次尚未定位的配置读取超时及 CRC/长度告警。
+
+两路温振声传感器的 IIO `name` 相同，必须通过串口父设备区分，不能仅按名称取第一个设备。
+当前板端 RS485-1 对应 UART4 / `serial0-0`，RS485-2 对应 UART7 / `serial1-0`；
+实际 IIO 编号可能交错分配，测试按 sysfs 父设备配对特征和原始设备。
+`iio_devices.py` 在有多个实例且未指定选择条件时会拒绝执行，防止混入另一路数据。
+
+将脚本连同 `iio_devices.py` 放入开发板同一目录，在两个 buffer 均空闲时运行：
+
+```sh
+sudo python3 board_capture.py /tmp/rs485-1 300 --serdev serial0-0
+sudo python3 board_driver_functional.py /tmp/rs485-2 api --serdev serial1-0
+```
+
+两个记录目录须预先创建。也可同时记录并分别检查两路数据：
+
+```sh
+sudo python3 board_dual_capture.py /tmp/dual-capture --seconds 300 --module /path/to/ssf_mems.ko
+sudo python3 board_dual_isolation.py /tmp/dual-isolation --seconds 20
+```
+
+`--module` 只在模块尚未加载时使用；不带它则记录已加载的驱动。
+双路记录分别调用现有摘要和二进制检查器，任一路失败时整体返回非零。
+隔离用例将两路临时设为不同轮询周期，并先使用 feature/raw 模式组合，再交换模式，
+检查每路只有选定的数据流输出、原始模式不暴露旧特征缓存；退出时恢复原有主机配置。
+它不会修改传感器波特率、采样率或固件。
+
 现行正式驱动已接入 1024 点定长采集，原始与特征共用 128000；集成结果见
 [正式驱动验证报告](TEST_REPORT_2026-10-12_PRODUCTION_FINITE.md)。
 驱动独立通信、断电恢复和 IIO 边界验证见
@@ -23,8 +73,8 @@ sudo python3 board_driver_functional.py /tmp/本次输出目录 early-remove --m
 ```
 
 - `api` 检查配置读回、非法写、采样率/特征开关同值写、四线程读取和单位比例。
-  不实际切换采样率，也不执行波特率同值写。当前驱动同值波特率先读回确认，
-  一致时跳过保存和重启；该优化已做离线回归，原实机报告不覆盖它。
+  不实际切换采样率；另外执行已匹配波特率的同值写，核对读回值并检查当前实例
+  没有新增改速、保存和重启日志。原实机报告不覆盖新增加的同值波特率检查。
 - `invalid-buffer` 检查空掩码/仅时间戳被 EINVAL 拒绝、运行中改掩码被 EBUSY 拒绝。
 - `layouts` 检查单通道、混合宽度、无时间戳和 8 位标志的实际扫描对齐。
 - `overflow` 故意使用仅两条记录的小原始 buffer，不读取直到溢出，再确认特征恢复。
@@ -113,3 +163,17 @@ sudo python3 board_finite_unload.py /tmp/本次测试目录
 异常时保留现场和日志，不自动保存 Flash，不自动替用户断电。
 
 硬件异常的根因需要结合供电、接线和串口抓包，不能由上述脚本单独确定。
+
+## XYZ V2.4 定长实机回归
+
+`board_xyz_regression.py OUTPUT SECONDS` 同时记录两路 XYZ 的特征与原始 IIO，
+按扫描类型计算 ARM64 对齐，检查 1024 组批次、包号、包内序号及时间戳。
+`board_xyz_guard.py OUTPUT` 检查一路设为吞吐量不足的 128000/5333.4 Hz 时，
+该路不输出原始数据，另一路 128000/1333.35 Hz 仍能采集，两路均能获取特征。
+这两项测试均使用正式驱动，脚本只配置和读取 IIO。
+
+`recovery_lab/mems_xyz_wire.c` 是单独绑定 serdev 的有限抓包模块，
+用于保存解析前的线上原始字节。它与正式驱动不能同时加载，
+会修改采样率及定长长度；必须在采集完成后卸载，并恢复传感器配置。
+`restore=1` 用于恢复采样率索引 9 和普通采样长度索引 2；
+`baud` 必须与当前传感器一致，它不负责切换传感器波特率。

@@ -6,7 +6,7 @@
 unsigned long jiffies = 12345;
 
 int main(void) {
-  struct ssf_mems_xyzs_data sensor = {0};
+  struct ssf_mems_data sensor = {0};
   struct ssf_mems_acquisition_status status;
   struct ssf_mems_acquisition_config config;
   struct ssf_mems_acquisition_state *acq = &sensor.acquisition;

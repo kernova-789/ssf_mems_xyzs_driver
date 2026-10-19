@@ -19,7 +19,7 @@ static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev);
  * 返回：超时 tick 数。
  * 按最长帧传输时间加余量计算。
  */
-static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_xyzs_data *data) {
+static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_data *data) {
   return msecs_to_jiffies(ssf_mems_serial_wire_ms(data,
                          SSF_MEMS_MODBUS_MAX_FRAME_LEN) + SSF_MEMS_RX_EXPIRY_MARGIN_MS);
 }
@@ -31,8 +31,8 @@ static unsigned long ssf_mems_rx_expiry_ticks(struct ssf_mems_xyzs_data *data) {
 static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
   struct ssf_mems_modbus_receive_state *rx =
       container_of(work, struct ssf_mems_modbus_receive_state, expiry_work.work);
-  struct ssf_mems_xyzs_data *data =
-      container_of(rx, struct ssf_mems_xyzs_data, modbus_rx);
+  struct ssf_mems_data *data =
+      container_of(rx, struct ssf_mems_data, modbus_rx);
   unsigned long flags;
   unsigned long expiry = ssf_mems_rx_expiry_ticks(data);
   unsigned long now = jiffies;
@@ -62,8 +62,8 @@ static void ssf_mems_rx_expiry_workfn(struct work_struct *work) {
 static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
   struct ssf_mems_modbus_receive_state *rx =
       container_of(work, struct ssf_mems_modbus_receive_state, work);
-  struct ssf_mems_xyzs_data *data =
-      container_of(rx, struct ssf_mems_xyzs_data, modbus_rx);
+  struct ssf_mems_data *data =
+      container_of(rx, struct ssf_mems_data, modbus_rx);
 
   ssf_mems_modbus_receive_drain(data->serdev);
 }
@@ -71,7 +71,7 @@ static void ssf_mems_modbus_rx_workfn(struct work_struct *work) {
 /* 初始化接收队列并注册完整帧回调。
  * 返回：0 成功，-EINVAL 参数无效，其他负数为分配错误。
  */
-int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
+int ssf_mems_modbus_receive_init(struct ssf_mems_data *data,
                                ssf_mems_frame_handler_t handler, void *context) {
   struct ssf_mems_modbus_receive_state *rx;
   int ret;
@@ -103,7 +103,7 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
  * 返回：无。
  * 清理期间收到的字节会丢弃，调用时不能持请求锁。
  */
-void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_modbus_receive_flush(struct ssf_mems_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
 
@@ -138,7 +138,7 @@ void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 先停止接收工作项，再释放资源。
  */
-void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_modbus_receive_remove(struct ssf_mems_data *data) {
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
 
@@ -163,7 +163,7 @@ void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data) {
  * 返回：接收时间的 jiffies 值。
  * 包含清理期间丢弃的字节。
  */
-unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data) {
+unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_data *data) {
   unsigned long flags;
   unsigned long last_rx;
 
@@ -177,7 +177,7 @@ unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *d
  * 返回：无。
  */
 void ssf_mems_modbus_queue_parse(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
 
@@ -216,7 +216,7 @@ static int ssf_mems_rx_candidate_len(const u8 *buf, size_t available) {
  * 返回：无。
  * 帧数据仅在回调期间有效。
  */
-static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
+static void ssf_mems_rx_complete(struct ssf_mems_data *data,
                                 const u8 *buf, size_t len) {
   int ret = ssf_mems_modbus_check_crc(buf, len);
 
@@ -233,7 +233,7 @@ static void ssf_mems_rx_complete(struct ssf_mems_xyzs_data *data,
  * 返回：无。
  * 窗口最多一帧长；各帧头独立计时，伪帧头不会挤掉合法帧。
  */
-static void ssf_mems_rx_process_modbus(struct ssf_mems_xyzs_data *data, u8 byte) {
+static void ssf_mems_rx_process_modbus(struct ssf_mems_data *data, u8 byte) {
   struct ssf_mems_modbus_receive_state *rx = &data->modbus_rx;
   size_t offset, keep;
   unsigned long expiry = ssf_mems_rx_expiry_ticks(data);
@@ -274,7 +274,7 @@ static void ssf_mems_rx_process_modbus(struct ssf_mems_xyzs_data *data, u8 byte)
 /* 按总线模式把一个字节交给对应解析器。
  * 返回：无。
  */
-static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
+static void ssf_mems_rx_process_byte(struct ssf_mems_data *data, u8 byte) {
   if (READ_ONCE(data->protocol.mode) == SSF_MEMS_LINK_OTA)
     ssf_mems_ota_receive_byte(data, byte);
   else if (READ_ONCE(data->raw.active) == true)
@@ -289,7 +289,7 @@ static void ssf_mems_rx_process_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
  */
 ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
                          const unsigned char *buf, size_t count) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_modbus_receive_state *rx;
   unsigned long flags;
   unsigned int ret;
@@ -327,7 +327,7 @@ ssize_t ssf_mems_rx_push(struct serdev_device *serdev,
  * 只由接收工作项调用。
  */
 static int ssf_mems_modbus_receive_drain(struct serdev_device *serdev) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_modbus_receive_state *rx;
   u8 byte;
 

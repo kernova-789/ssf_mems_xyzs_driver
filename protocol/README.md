@@ -5,7 +5,8 @@
 | 位置 | 内容 |
 | --- | --- |
 | `protocol.c/.h` | 传感器业务接口：特征缓存、配置读写、帧分发、波特率匹配和修改 |
-| `model/` | 完整寄存器表、型号参数、规范化数据结构和公共字段描述 |
+| `model/` | 共用的标准 RTU 帧描述 |
+| `../sensor/` | 型号数据布局、寄存器偏移映射、型号参数、采集回调 |
 | `modbus/` | RTU 组帧/解帧、请求等待与响应匹配、接收 FIFO 和解析窗口 |
 | `transport/` | 串口发送、短写处理、线上耗时和帧间隔估算 |
 | `raw/` | 定长批次触发、私有原始包解析、排空和通信恢复 |
@@ -13,8 +14,8 @@
 
 常用入口：
 
-- [型号配置说明](model/README.md)：轴顺序、量程比例、寄存器和单位映射。
-- [modbus_table.h](model/modbus_table.h)：完整手册寄存器和型号参数。
+- [型号配置说明](../sensor/README.md)：轴顺序、量程比例、寄存器和单位映射。
+- [sensor/](../sensor/README.md)：两款传感器各自的寄存器和采集实现。
 - [定长采集说明](raw/RAW_CAPTURE.md)：批次格式、限制和 buffer 用法。
 - [固件升级说明](firmware/OTA.md)：镜像要求、线上流程和用户命令。
 - [IIO 属性说明](../iio/ATTRIBUTES.md)：全部用户态属性。
@@ -25,10 +26,10 @@ Kbuild 仍只把这些模块链接为一个 `ssf_mems.ko`。
 
 ## 型号表与寄存器访问
 
-`model/modbus_table.h` 保留完整手册寄存器，包括未使用的连续采集寄存器。
-表中同时定义帧格式、块命令和 `ssf_mems_sensor_profile`；
-`model/modbus_table.c` 定义 `SSF_MEMS_DEFINE_MODBUS_TABLE` 后包含它，生成唯一一份表。
-其他文件通过头文件中的 `extern` 声明共享数据。
+`model/modbus_table.c` 仅定义标准 RTU 帧格式。
+传感器寄存器、块命令和配置分别在 `sensor/xyz.c`、`sensor/xyzs.c` 定义。
+请求层通过当前设备的 `data->sensor` 查表，支持不同型号实例同时工作。
+采集层通过 probe 绑定的 `sensor_ops` 调用各型号回调，特征读取与偏移解码机制在 `sensor/features.c`。
 
 业务层单寄存器操作先按稳定 `.name` 查表，再使用表中的地址、权限和格式。
 名称区分大小写，必须唯一；空名称返回 `-EINVAL`，缺失名称返回 `-ENOENT`。
@@ -54,10 +55,10 @@ ret = ssf_mems_modbus_read_reg_by_name(serdev, "firmware_version", &value, 1000)
 不发送请求。固定十参数写入仍要求对应完整块；定长长度高低字要求显示地址和
 线上地址都相邻，否则拒绝写入。
 
-`ssf_reg_desc.feature_field` 指向公共字段编号，比例字段
-`feature_multiplier / feature_divisor` 将固件值归一化为 `model/sensor_data.h` 的单位。
+`ssf_reg_desc.feature_field` 指向公共特征语义，内嵌 `field` 保存 offsetof、宽度和单位。比例字段
+`feature_multiplier / feature_divisor` 将固件值归一化为 `sensor/sensor_data.h` 的单位。
 未填的比例各按 1 处理，先解释有无符号再做整数换算；越界返回 `-ERANGE`，
-不覆盖缓存。字段布局、单位和未来型号限制见 [型号配置说明](model/README.md)。
+不覆盖缓存。字段布局、单位和未来型号限制见 [型号配置说明](../sensor/README.md)。
 
 初始化在访问型号数组前校验编码范围、默认值、使能掩码、轴排列、原始比例，
 以及寄存器名称/地址/字段唯一性、权限和块描述。无效表返回 `-EINVAL` 并记录出错名称。
@@ -89,7 +90,7 @@ RTU 读取应答没有地址或事务编号，因此迟到时间超出隔离窗�
 
 ## 初始化与生命周期
 
-core 设置 `data->serdev` 后先初始化协议，再初始化请求、接收和采集。
+core 先按 compatible 设置 `data->sensor` 和 `data->sensor_ops`，再设置串口并初始化协议，再初始化请求、接收和采集。
 协议初始化设置从站地址 1、默认 9600、无校验，并解析设备树属性：
 
 - `sange-cbm,slave-id`：1～247；可读但越界会失败。

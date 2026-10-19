@@ -45,7 +45,7 @@ static void ssf_mems_acquisition_wait(struct ssf_mems_acquisition_state *acq,
  * 返回：无。
  * 调用者须持采集锁。
  */
-static void ssf_mems_acquisition_offline(struct ssf_mems_xyzs_data *data) {
+static void ssf_mems_acquisition_offline(struct ssf_mems_data *data) {
   mutex_lock(&data->acquisition.status_lock);
   data->acquisition.online = false;
   mutex_unlock(&data->acquisition.status_lock);
@@ -57,7 +57,7 @@ static void ssf_mems_acquisition_offline(struct ssf_mems_xyzs_data *data) {
  * 按实际串口速率预留响应传输时间。
  */
 static unsigned int ssf_mems_acquisition_read_timeout(
-    struct ssf_mems_xyzs_data *data) {
+    struct ssf_mems_data *data) {
   return SSF_MEMS_ACQ_TIMEOUT_MS +
          ssf_mems_serial_wire_ms(data, 5U + SSF_MEMS_MODBUS_READ_MAX_REGS * 2U);
 }
@@ -66,14 +66,14 @@ static unsigned int ssf_mems_acquisition_read_timeout(
  * 返回：0 读取成功，负数为停止或读取错误。
  * IIO 推送失败只记录日志。
  */
-static int ssf_mems_acquisition_sample(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_acquisition_sample(struct ssf_mems_data *data) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
   struct ssf_mems_sensor_data features;
   unsigned long started = jiffies;
   unsigned long now;
   int ret;
 
-  ret = ssf_mems_protocol_read_features(data->serdev,
+  ret = data->sensor_ops->read_features(data,
                                        ssf_mems_acquisition_read_timeout(data));
   if (ret != 0)
     return ret;
@@ -102,7 +102,7 @@ static int ssf_mems_acquisition_sample(struct ssf_mems_xyzs_data *data) {
 /* 匹配通信速率并配置采样参数。
  * 返回：0 连接成功，负数为停止或通信错误。
  */
-static int ssf_mems_acquisition_connect(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_acquisition_connect(struct ssf_mems_data *data) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
   enum ssf_mems_baudrate found;
   int ret;
@@ -115,11 +115,11 @@ static int ssf_mems_acquisition_connect(struct ssf_mems_xyzs_data *data) {
 
   dev_info(&data->serdev->dev,
            "sensor matched: baud %d, target %d, sampling target index %u\n",
-           ssf_mems_baudrate_to_value(found),
-           ssf_mems_baudrate_to_value(acq->target_baudrate),
+           ssf_mems_baudrate_to_value(data->sensor, found),
+           ssf_mems_baudrate_to_value(data->sensor, acq->target_baudrate),
            acq->target_sampling_rate_index);
-  if (ssf_mems_baudrate_to_value(found) !=
-      ssf_mems_baudrate_to_value(acq->target_baudrate)) {
+  if (ssf_mems_baudrate_to_value(data->sensor, found) !=
+      ssf_mems_baudrate_to_value(data->sensor, acq->target_baudrate)) {
     acq->phase = SSF_MEMS_ACQ_SWITCH;
     ret = ssf_mems_protocol_set_baudrate(data->serdev, acq->target_baudrate,
                                         SSF_MEMS_ACQ_TIMEOUT_MS);
@@ -173,7 +173,7 @@ static int ssf_mems_acquisition_connect(struct ssf_mems_xyzs_data *data) {
   /* 采样率配置已读回，实际测量生效时间由设备决定。 */
   dev_info(&data->serdev->dev,
            "sensor online, baud rate %d, sampling rate index %u, poll period %u ms\n",
-           ssf_mems_baudrate_to_value(acq->target_baudrate),
+           ssf_mems_baudrate_to_value(data->sensor, acq->target_baudrate),
            acq->target_sampling_rate_index,
            acq->policy.interval_ms);
   return 0;
@@ -183,7 +183,7 @@ static int ssf_mems_acquisition_connect(struct ssf_mems_xyzs_data *data) {
  * 返回：0 成功，负数为采集或恢复错误。
  * 调用者持采集锁；原始窗口结束后才恢复特征读取。
  */
-static int ssf_mems_acquisition_collect(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_acquisition_collect(struct ssf_mems_data *data) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
   int ret;
 
@@ -194,26 +194,21 @@ static int ssf_mems_acquisition_collect(struct ssf_mems_xyzs_data *data) {
     mutex_lock(&acq->status_lock);
     acq->have_sample = false;
     mutex_unlock(&acq->status_lock);
-    ret = ssf_mems_protocol_collect_raw(data, acq->raw_duration_ms);
-    if (ret == -EOPNOTSUPP) {
-      dev_warn_ratelimited(&data->serdev->dev,
-               "finite raw mode requires no parity and sampling index 0..%u\n",
-               SSF_MEMS_RAW_SAMPLING_RATE_MAX_INDEX);
-      /* 不把用户选择的纯原始模式偷偷变成特征模式。 */
-      ssf_mems_acquisition_offline(data);
-      acq->phase = SSF_MEMS_ACQ_BACKOFF;
-    }
+    ret = data->sensor_ops->collect_raw(data, acq->raw_duration_ms);
     if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
       /* 定长上传未确认结束时不能轮询特征；connect 先完成只读恢复。 */
       ssf_mems_acquisition_offline(data);
       acq->phase = SSF_MEMS_ACQ_BACKOFF;
-    } else if (acq->phase != SSF_MEMS_ACQ_BACKOFF) {
+    } else {
       acq->phase = SSF_MEMS_ACQ_POLL;
     }
     acq->feature_until = jiffies + msecs_to_jiffies(acq->feature_duration_ms);
     if (ret == 0 || ret == -ENOSPC || ret == -EILSEQ)
       ssf_mems_acquisition_policy_contact(&acq->policy, jiffies);
-    if (ret == 0 && acq->mode != SSF_MEMS_ACQ_MODE_RAW &&
+    /* 参数不支持时，交替模式继续特征窗口；纯原始模式保持原选择。 */
+    if (acq->phase == SSF_MEMS_ACQ_POLL &&
+        (ret == 0 || ret == -EOPNOTSUPP) &&
+        acq->mode != SSF_MEMS_ACQ_MODE_RAW &&
         ssf_mems_acquisition_stopping(acq) == false)
       ret = ssf_mems_acquisition_sample(data);
   } else {
@@ -226,9 +221,11 @@ static int ssf_mems_acquisition_collect(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 调用者持采集锁；缓冲区错误不直接判定链路离线。
  */
-static void ssf_mems_acquisition_error(struct ssf_mems_xyzs_data *data, int ret) {
+static void ssf_mems_acquisition_error(struct ssf_mems_data *data, int ret) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
 
+  if (ret == -EOPNOTSUPP)
+    return;
   if (acq->have_sample == true &&
       time_after_eq(jiffies, acq->last_sample +
                                 msecs_to_jiffies(SSF_MEMS_LINK_FAILURE_MS)) == true)
@@ -248,7 +245,7 @@ static void ssf_mems_acquisition_error(struct ssf_mems_xyzs_data *data, int ret)
  * 返回：等待毫秒数，保留帧间隔并兼顾交替窗口截止时间。
  */
 static unsigned int ssf_mems_acquisition_next_delay(
-    struct ssf_mems_xyzs_data *data, unsigned long started) {
+    struct ssf_mems_data *data, unsigned long started) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
   unsigned int delay_ms;
 
@@ -277,7 +274,7 @@ static unsigned int ssf_mems_acquisition_next_delay(
  * 通信失败后等待一段时间再重试。
  */
 static int ssf_mems_acquisition_thread(void *context) {
-  struct ssf_mems_xyzs_data *data = context;
+  struct ssf_mems_data *data = context;
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
   unsigned int delay_ms;
   unsigned long started;
@@ -329,6 +326,9 @@ static int ssf_mems_acquisition_thread(void *context) {
       if (ret != 0)
         ssf_mems_acquisition_error(data, ret);
       delay_ms = ssf_mems_acquisition_next_delay(data, started);
+      /* 纯原始模式遇到不支持的组合时限速重试，不进行高速忙轮询。 */
+      if (ret == -EOPNOTSUPP)
+        delay_ms = max(delay_ms, SSF_MEMS_ACQ_RETRY_INITIAL_MS);
     }
     mutex_unlock(&acq->lock);
     ssf_mems_acquisition_wait(acq, delay_ms, true);
@@ -362,10 +362,12 @@ static unsigned int ssf_mems_acquisition_window(struct device *dev,
 /* 初始化采集状态和窗口配置。
  * 返回：0 成功，-EINVAL 设备无效。
  */
-int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_acquisition_init(struct ssf_mems_data *data) {
   struct ssf_mems_acquisition_state *acq;
 
-  if (data == NULL || data->serdev == NULL)
+  if (data == NULL || data->serdev == NULL || data->sensor == NULL ||
+      data->sensor_ops == NULL || data->sensor_ops->read_features == NULL ||
+      data->sensor_ops->collect_raw == NULL)
     return -EINVAL;
   acq = &data->acquisition;
   mutex_init(&acq->lock);
@@ -380,9 +382,9 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
   acq->last_sample = 0;
   acq->phase = SSF_MEMS_ACQ_STARTUP;
   /* 设备树仅提供初次匹配提示；原始和特征通信共用型号表中的工作目标。 */
-  acq->target_baudrate = ssf_mems_sensor_profile.default_work_baudrate;
+  acq->target_baudrate = data->sensor->profile.default_work_baudrate;
   acq->target_sampling_rate_index =
-      ssf_mems_sensor_profile.default_sampling_rate_index;
+      data->sensor->profile.default_sampling_rate_index;
   acq->retry_ms = SSF_MEMS_ACQ_RETRY_INITIAL_MS;
   acq->raw_duration_ms = ssf_mems_acquisition_window(
       &data->serdev->dev, "sange-cbm,raw-duration-ms", true);
@@ -401,10 +403,10 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
   acq->config_changed = false;
   acq->poll_changed = false;
   acq->feature_until = 0;
-  ssf_mems_acquisition_policy_init(&acq->policy, jiffies);
+  ssf_mems_acquisition_policy_init(&acq->policy, data->sensor, jiffies);
   dev_info(&data->serdev->dev,
            "acquisition configuration: target baud %d, sampling index %u\n",
-           ssf_mems_baudrate_to_value(acq->target_baudrate),
+           ssf_mems_baudrate_to_value(data->sensor, acq->target_baudrate),
            acq->target_sampling_rate_index);
   return 0;
 }
@@ -414,7 +416,7 @@ int ssf_mems_acquisition_init(struct ssf_mems_xyzs_data *data) {
  * 只取短状态锁，不等待在途采集或升级。
  */
 int ssf_mems_acquisition_get_config(
-    struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_config *config) {
+    struct ssf_mems_data *data, struct ssf_mems_acquisition_config *config) {
   struct ssf_mems_acquisition_state *acq;
   int ret = 0;
 
@@ -438,7 +440,7 @@ int ssf_mems_acquisition_get_config(
  * 返回：0 成功，负数为参数、停止或校验位错误。
  * 只改变主机调度，可能等待在途采集窗口完成。
  */
-int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_mode(struct ssf_mems_data *data,
                                   enum ssf_mems_acquisition_mode mode) {
   struct ssf_mems_acquisition_state *acq;
   int ret = 0;
@@ -470,7 +472,7 @@ int ssf_mems_acquisition_set_mode(struct ssf_mems_xyzs_data *data,
 /* 设置一个采集窗口的时长。
  * 返回：0 成功，-EINVAL 参数无效，-ENODEV 正在停止。
  */
-int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_duration(struct ssf_mems_data *data,
                                       bool raw_window, unsigned int duration_ms) {
   struct ssf_mems_acquisition_state *acq;
   unsigned int *window;
@@ -499,7 +501,7 @@ int ssf_mems_acquisition_set_duration(struct ssf_mems_xyzs_data *data,
  * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。
  * 设置周期不写传感器参数，也不截断在途原始批次。
  */
-int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_data *data,
                                           enum ssf_mems_poll_setting setting,
                                           unsigned int value) {
   struct ssf_mems_acquisition_state *acq;
@@ -561,7 +563,7 @@ out:
  * 返回：0 成功，负数为状态或线程创建错误。
  * 在 IIO 注册后调用。
  */
-int ssf_mems_acquisition_start(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_acquisition_start(struct ssf_mems_data *data) {
   struct task_struct *thread;
 
   if (data == NULL || data->indio_dev == NULL)
@@ -582,7 +584,7 @@ int ssf_mems_acquisition_start(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 调用前关闭请求模块，完成后才能释放接收和 IIO 资源。
  */
-void ssf_mems_acquisition_stop(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_acquisition_stop(struct ssf_mems_data *data) {
   struct ssf_mems_acquisition_state *acq;
   int ret;
 
@@ -606,7 +608,7 @@ void ssf_mems_acquisition_stop(struct ssf_mems_xyzs_data *data) {
  * 返回：0 成功，负数为参数、停止、升级占用或通信错误。
  * 与后台采集共用采集锁。
  */
-int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_get_baudrate(struct ssf_mems_data *data,
                                     enum ssf_mems_baudrate *baudrate) {
   struct ssf_mems_acquisition_state *acq;
   int ret;
@@ -625,8 +627,8 @@ int ssf_mems_acquisition_get_baudrate(struct ssf_mems_xyzs_data *data,
   }
   ret = ssf_mems_protocol_get_baudrate(data->serdev, baudrate,
                                       SSF_MEMS_ACQ_TIMEOUT_MS);
-  if (ret != 0 || ssf_mems_baudrate_to_value(*baudrate) !=
-                 ssf_mems_baudrate_to_value(acq->target_baudrate)) {
+  if (ret != 0 || ssf_mems_baudrate_to_value(data->sensor, *baudrate) !=
+                 ssf_mems_baudrate_to_value(data->sensor, acq->target_baudrate)) {
     ssf_mems_acquisition_offline(data);
     WRITE_ONCE(acq->reconnect, true);
     wake_up_interruptible(&acq->waitq);
@@ -640,7 +642,7 @@ out:
  * 返回：0 成功，负数为参数、停止、升级占用或通信错误。
  * 与后台采集共用采集锁。
  */
-int ssf_mems_acquisition_set_baudrate(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_set_baudrate(struct ssf_mems_data *data,
                                     enum ssf_mems_baudrate baudrate) {
   struct ssf_mems_acquisition_state *acq;
   int ret;
@@ -674,7 +676,7 @@ out:
  * 返回：0 成功，负数为参数、设备状态或通信错误。
  * 设备上线后才发送请求。
  */
-int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_read_setting(struct ssf_mems_data *data,
                                      enum ssf_mems_sensor_setting setting,
                                      u16 *value) {
   struct ssf_mems_acquisition_state *acq;
@@ -701,7 +703,7 @@ int ssf_mems_acquisition_read_setting(struct ssf_mems_xyzs_data *data,
  * 返回：0 成功，负数为参数、设备状态或通信错误。
  * 设备上线后才发送请求；确认成功的采样率保留为本次运行的重连目标。
  */
-int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
+int ssf_mems_acquisition_write_setting(struct ssf_mems_data *data,
                                       enum ssf_mems_sensor_setting setting,
                                       u16 value) {
   struct ssf_mems_acquisition_state *acq;
@@ -742,7 +744,7 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_xyzs_data *data,
  * 只读主机状态，不发送串口请求。
  */
 void ssf_mems_acquisition_get_status(
-    struct ssf_mems_xyzs_data *data, struct ssf_mems_acquisition_status *status) {
+    struct ssf_mems_data *data, struct ssf_mems_acquisition_status *status) {
   struct ssf_mems_acquisition_state *acq = &data->acquisition;
 
   mutex_lock(&acq->status_lock);

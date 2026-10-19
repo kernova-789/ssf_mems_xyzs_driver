@@ -1,10 +1,10 @@
 # SSF MEMS Modbus / IIO driver
 
 This directory contains a Linux serdev driver for the SSF MEMS Modbus RTU
-sensor. It validates and decodes Modbus responses, exposes the sensor feature
+sensors SSF-MEMS-XYZS and SSF-MEMS-XYZ (V2.4). It validates and decodes Modbus responses, exposes the sensor feature
 registers through IIO, and supports sensor baud-rate discovery and updates.
 
-Application-bin OTA is available through `sensor_firmware_update` and
+On XYZS, application-bin OTA is available through `sensor_firmware_update` and
 `sensor_firmware_update_status` on the feature IIO device. See
 [OTA requirements and board commands](protocol/firmware/OTA.md): the image must be linked
 at `0x08020000`, at most 256 KiB, and the RS485 bus must contain only the target
@@ -15,10 +15,12 @@ offline coverage and a target-kernel build, not a hardware flashing result.
 ## Layout
 
 - `core/` — serdev probe/remove and shared device state.
-- `protocol/` — sensor operations and the following protocol components:
-  `model/` for model tables/data, `modbus/` for RTU framing and requests,
+- `sensor/` — model-specific layouts, register-to-member offset maps, profiles and
+  acquisition callbacks; see [sensor architecture and model selection](sensor/README.md).
+- `protocol/` — shared business and protocol components:
+  `model/` for common RTU frame descriptions, `modbus/` for RTU framing and requests,
   `transport/` for serial I/O, `raw/` for finite capture, and `firmware/` for OTA.
-  See [protocol layout](protocol/README.md) and [model configuration](protocol/model/README.md).
+  See [protocol layout](protocol/README.md) and [sensor configuration](sensor/README.md).
 - `iio/` — IIO channel definitions, direct reads, registration, and IIO sysfs
   controls.
 - `acquisition/` — automatic startup, polling, adaptive timing, IIO sample
@@ -67,18 +69,25 @@ make -C /path/to/linux/build M="$PWD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu
 ## IIO interface
 
 After the serdev device binds, the driver registers an IIO device named
-`ssf_mems_xyzs`. A channel's `*_raw` file reads the latest complete feature
+`ssf_mems_xyzs` or `ssf_mems_xyz`, selected by the device-tree compatible.
+XYZS retains its 29-feature ABI; XYZ exposes its own 19 features, including
+three-axis displacement peak-to-peak (µm, IIO scale 0.000001 m). XYZ temperature
+is normalized from signed °C ×10 to °C ×100. Unsupported sound, frequency-band,
+feature-enable, firmware-version and OTA interfaces are absent on XYZ.
+See [model differences and raw-format verification limits](sensor/README.md).
+A channel's `*_raw` file reads the latest complete feature
 snapshot. The corresponding `*_scale` file converts the register's fixed-point
 value to the channel unit.
 
-The normalized feature cache stores acceleration in g ×100, velocity in mm/s ×100,
+For XYZS, the normalized feature cache stores acceleration in g ×100, velocity in mm/s ×100,
 temperature in °C ×100, sound in firmware-computed dB ×100, zero-crossing rate
 in whole percent, spectral centroid in Hz ×10, and spectral flux ×100.
 IIO scale converts acceleration to m/s², velocity to m/s, and temperature to
 millidegrees Celsius. Negative temperature behavior on the target device
 still requires confirmation; see [units and measurement limits](iio/ATTRIBUTES.md#12-单位与测量边界).
 
-The IIO device also provides:
+Both models provide the common acquisition and communication controls below;
+feature-enable, parameter-switch and firmware-version controls are XYZS-only:
 
 - `sensor_baudrate`: read to confirm the active communication rate using 40102,
   or write a numeric baud rate to stage 40102, save/reboot via 40110=1, wait
@@ -103,12 +112,13 @@ The IIO device also provides:
   sensor calculation rate, independent of the host polling period. Index 9
   selects the maximum 26667 Hz, while index 6 selects 5333.4 Hz. Firmware saves
   changes to Flash and restores them on startup. The first driver connection
-  selects the model-table default (currently index 6). Later reconnections use
+  selects the model-table default (XYZS: index 6; XYZ: index 3). Later reconnections use
   the last successfully selected index; reloading the driver resets that target.
 - `sensor_feature_enable` (RW): six frequency-band enables (63 enables all),
   preserving alarm settings; `sensor_parameter_switch` reads the full word.
-- `sensor_sampling_length_index` and `sensor_firmware_version` (RO): sensor
-  configuration diagnostics. See [iio/README.md](iio/README.md) and
+- `sensor_sampling_length_index` (RW): ordinary sampling length index 0..5;
+  separate from the 1024-point finite raw batches. `sensor_firmware_version`
+  (RO) provides a version diagnostic on supported models. See [iio/README.md](iio/README.md) and
   [the board test](tools/README.md#特征值长时间重复的排查).
 
 Successful host reads may repeatedly return the same feature values.
@@ -176,6 +186,10 @@ baud-rate hint. The operational target comes from the model table:
 };
 ```
 
+For XYZ V2.4, use `compatible = "sange-cbm,ssf-mems-xyz"`; all transport
+properties keep the same meaning. The compatible selects a model per instance
+and binds its `read_features` / `collect_raw` callbacks in probe.
+
 `sange-cbm,slave-id` accepts 1 through 247, and `sange-cbm,parity` accepts
 `"none"`, `"odd"`, or `"even"`. Missing or unreadable properties use the manual defaults:
 address 1, 9600 baud, and no parity, with an info log for each fallback.
@@ -218,7 +232,7 @@ After this adjustment, `CONFIG_SSF_SENSOR` controls the in-tree build.
 支持 1024 点定长原始 XYZ 批次与特征轮询交替运行，窗口默认各 5 秒，
 窗口到期收完在途批次；两种通信共用工作波特率，默认 128000。
 批次之间有采样时间间隙，不是全时连续波形。原始数据在独立 IIO
-设备 `ssf_mems_xyzs_raw` 中提供，原有特征设备 ABI 不变；暂不计算 FFT。
+设备 `ssf_mems_xyzs_raw` / `ssf_mems_xyz_raw` 中提供，原有特征设备 ABI 不变；暂不计算 FFT。
 设备树时段配置、私有协议限制和 buffer 读取方法见
 [定长原始采集说明](protocol/raw/RAW_CAPTURE.md)。
 

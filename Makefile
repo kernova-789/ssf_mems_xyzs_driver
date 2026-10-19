@@ -2,6 +2,7 @@
 
 obj-m += ssf_mems.o
 ssf_mems-y += core/core.o
+ssf_mems-y += sensor/sensor.o sensor/features.o sensor/xyz.o sensor/xyzs.o
 ssf_mems-y += protocol/modbus/modbus.o
 ssf_mems-y += protocol/model/modbus_table.o
 ssf_mems-y += protocol/transport/serial_transport.o
@@ -16,6 +17,7 @@ ssf_mems-y += acquisition/ssf_mems_acquisition.o
 ssf_mems-y += acquisition/acquisition_policy.o
 ssf_mems-y += acquisition/ssf_mems_firmware.o
 
+ccflags-y += -I$(src)/sensor
 ccflags-y += -I$(src)/core
 ccflags-y += -I$(src)/iio
 ccflags-y += -I$(src)/protocol

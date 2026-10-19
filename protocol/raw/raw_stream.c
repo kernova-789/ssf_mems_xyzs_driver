@@ -12,7 +12,7 @@
 /* 初始化定长原始数据接收状态。
  * 返回：无。
  */
-void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_raw_init(struct ssf_mems_data *data) {
   memset(&data->raw, 0, sizeof(data->raw));
   init_waitqueue_head(&data->raw.waitq);
 }
@@ -21,7 +21,7 @@ void ssf_mems_raw_init(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 序号和推送错误记入统计，末包标记批次结束。
  */
-static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
+static void ssf_mems_raw_publish_packet(struct ssf_mems_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
   u32 sequence = get_unaligned_be32(raw->packet + SSF_MEMS_RAW_SEQUENCE_OFFSET);
   unsigned int i;
@@ -52,7 +52,7 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
     /* 每组六字节按 X/Y/Z 的大端有符号 16 位值解码。 */
     for (axis = 0; axis < 3U; axis++)
       sample.xyz[axis] = (s16)get_unaligned_be16(raw->packet + offset +
-          ssf_mems_sensor_profile.raw_axis_order[axis] * sizeof(s16));
+          data->sensor->profile.raw_axis_order[axis] * sizeof(s16));
     sample.packet_sequence = sequence;
     sample.sample_index = i;
     ret = raw->sample_handler ? raw->sample_handler(data, &sample) : -ENODEV;
@@ -72,7 +72,7 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_xyzs_data *data) {
  * 返回：无。
  * 调用者持 parse_lock；校验失败后定位下一包头。
  */
-void ssf_mems_raw_receive_byte(struct ssf_mems_xyzs_data *data, u8 byte) {
+void ssf_mems_raw_receive_byte(struct ssf_mems_data *data, u8 byte) {
   struct ssf_mems_raw_state *raw = &data->raw;
   const u8 *next;
 

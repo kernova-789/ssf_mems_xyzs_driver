@@ -16,7 +16,7 @@
 /* 读取设备树中的启动通信参数。
  * 返回：0 成功或使用默认值，-EINVAL 从站地址或校验位无效。
  */
-static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data);
+static int ssf_mems_protocol_parse_properties(struct ssf_mems_data *data);
 
 /* 高层配置项对应表项的稳定名称；具体地址由寄存器表决定。 */
 static const char * const ssf_mems_setting_registers[SSF_MEMS_SETTING_MAX] = {
@@ -33,7 +33,7 @@ static const char * const ssf_mems_setting_registers[SSF_MEMS_SETTING_MAX] = {
 int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
                                   enum ssf_mems_sensor_setting setting,
                                   u16 *value, unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   u16 reg_value;
   int ret;
 
@@ -43,43 +43,54 @@ int ssf_mems_protocol_read_setting(struct serdev_device *serdev,
   data = serdev_device_get_drvdata(serdev);
   if (data == NULL)
     return -ENODEV;
+  if (ssf_mems_sensor_find_reg_by_name(
+          data->sensor, ssf_mems_setting_registers[setting]) == NULL)
+    return -EOPNOTSUPP;
   mutex_lock(&data->protocol.bus_lock);
   ret = ssf_mems_modbus_read_reg_by_name_locked(
       serdev, ssf_mems_setting_registers[setting], &reg_value, timeout_ms);
   mutex_unlock(&data->protocol.bus_lock);
   if (ret == 0) {
     if (setting == SSF_MEMS_SETTING_FEATURE_ENABLE)
-      reg_value = (reg_value & ssf_mems_sensor_profile.feature_enable_mask) >>
-                  ssf_mems_sensor_profile.feature_enable_shift;
+      reg_value = (reg_value & data->sensor->profile.feature_enable_mask) >>
+                  data->sensor->profile.feature_enable_shift;
     *value = reg_value;
   }
   return ret;
 }
 
-/* 修改采样率或特征使能配置。
+/* 修改采样率、普通采样长度或特征使能配置。
  * 返回：0 成功或无需修改，负数为参数、通信或读回错误。
  * 同值不重复写入，写后读回并保留原有报警位。
  */
 int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
                                    enum ssf_mems_sensor_setting setting,
                                    u16 value, unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   const struct ssf_reg_desc *reg;
   u16 reg_value, desired, verified;
   int ret;
 
   if (serdev == NULL ||
       (setting != SSF_MEMS_SETTING_SAMPLING_RATE &&
-       setting != SSF_MEMS_SETTING_FEATURE_ENABLE) ||
-      (setting == SSF_MEMS_SETTING_SAMPLING_RATE &&
-       value > SSF_MEMS_SAMPLING_RATE_MAX_INDEX) ||
-      (setting == SSF_MEMS_SETTING_FEATURE_ENABLE && value > (ssf_mems_sensor_profile.feature_enable_mask >>
-                 ssf_mems_sensor_profile.feature_enable_shift)))
+       setting != SSF_MEMS_SETTING_SAMPLING_LENGTH &&
+       setting != SSF_MEMS_SETTING_FEATURE_ENABLE))
     return -EINVAL;
   data = serdev_device_get_drvdata(serdev);
-  if (data == NULL)
+  if (data == NULL || data->sensor == NULL)
     return -ENODEV;
-  reg = ssf_mems_modbus_find_reg_by_name(ssf_mems_setting_registers[setting]);
+  if (setting == SSF_MEMS_SETTING_FEATURE_ENABLE &&
+      data->sensor->profile.feature_enable_mask == 0)
+    return -EOPNOTSUPP;
+  if ((setting == SSF_MEMS_SETTING_SAMPLING_RATE &&
+       value >= data->sensor->profile.sampling_frequency_count) ||
+      (setting == SSF_MEMS_SETTING_SAMPLING_LENGTH &&
+       value >= data->sensor->profile.sampling_length_count) ||
+      (setting == SSF_MEMS_SETTING_FEATURE_ENABLE &&
+       value > (data->sensor->profile.feature_enable_mask >>
+                data->sensor->profile.feature_enable_shift)))
+    return -EINVAL;
+  reg = ssf_mems_sensor_find_reg_by_name(data->sensor, ssf_mems_setting_registers[setting]);
   if (reg == NULL)
     return -ENOENT;
   mutex_lock(&data->protocol.bus_lock);
@@ -90,8 +101,8 @@ int ssf_mems_protocol_write_setting(struct serdev_device *serdev,
   /* 按表中掩码替换特征使能，保留其他位；同值不写。 */
   desired = value;
   if (setting == SSF_MEMS_SETTING_FEATURE_ENABLE)
-    desired = (reg_value & ~ssf_mems_sensor_profile.feature_enable_mask) |
-              (value << ssf_mems_sensor_profile.feature_enable_shift);
+    desired = (reg_value & ~data->sensor->profile.feature_enable_mask) |
+              (value << data->sensor->profile.feature_enable_shift);
   if (desired == reg_value)
     goto out;
   ret = ssf_mems_modbus_write_reg_locked(serdev, reg->display_reg, desired,
@@ -111,14 +122,14 @@ out:
  * 返回：0 成功，-EINVAL 设备或启动配置无效。
  * 只初始化状态，不发送串口命令。
  */
-int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_protocol_init(struct ssf_mems_data *data) {
   struct ssf_mems_protocol_state *state;
   const char *bad_name;
   int ret;
 
   if (data == NULL || data->serdev == NULL)
     return -EINVAL;
-  ret = ssf_mems_modbus_validate_tables(&bad_name);
+  ret = ssf_mems_sensor_validate(data->sensor, &bad_name);
   if (ret != 0) {
     dev_err(&data->serdev->dev, "invalid sensor table: %s\n", bad_name);
     return ret;
@@ -128,7 +139,7 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
   state->baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
   /* UART 配置前是启动提示值，configure_serial 后才是控制器实际值。 */
   state->host_baudrate =
-      ssf_mems_sensor_profile.baudrates[SSF_MEMS_BAUDRATE_DEFAULT];
+      data->sensor->profile.baudrates[SSF_MEMS_BAUDRATE_DEFAULT];
   state->parity = SSF_MEMS_PARITY_NONE;
   state->mode = SSF_MEMS_LINK_MODBUS;
   state->raw_start_until = jiffies;
@@ -144,7 +155,7 @@ int ssf_mems_protocol_init(struct ssf_mems_xyzs_data *data) {
 /* 读取设备树中的启动通信参数。
  * 返回：0 成功或使用默认值，-EINVAL 从站地址或校验位无效。
  */
-static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
+static int ssf_mems_protocol_parse_properties(struct ssf_mems_data *data) {
   struct device *dev = &data->serdev->dev;
   const char *parity;
   enum ssf_mems_baudrate baudrate;
@@ -168,14 +179,14 @@ static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
     dev_info(dev, "could not read current-speed (%d), using default baud rate 9600\n",
              ret);
   } else {
-    ret = ssf_mems_baudrate_from_value(value, &baudrate);
+    ret = ssf_mems_baudrate_from_value(data->sensor, value, &baudrate);
     if (ret != 0) {
       dev_info(dev, "unsupported current-speed %u, using default baud rate 9600\n",
                value);
     } else {
       /* 默认值统一在 init 中设置；仅合法属性才能覆盖。 */
       data->protocol.baudrate = baudrate;
-      data->protocol.host_baudrate = ssf_mems_baudrate_to_value(baudrate);
+      data->protocol.host_baudrate = ssf_mems_baudrate_to_value(data->sensor, baudrate);
     }
   }
 
@@ -204,7 +215,7 @@ static int ssf_mems_protocol_parse_properties(struct ssf_mems_xyzs_data *data) {
  * 帧数据只在本次调用期间有效。
  */
 int ssf_mems_protocol_handle_frame(void *context, const u8 *buf, size_t len) {
-  struct ssf_mems_xyzs_data *data = context;
+  struct ssf_mems_data *data = context;
 
   if (data == NULL || buf == NULL)
     return -EINVAL;
@@ -212,130 +223,12 @@ int ssf_mems_protocol_handle_frame(void *context, const u8 *buf, size_t len) {
   return 0;
 }
 
-/* 把一段寄存器值填入特征结构体。
- * 返回：0 成功，-EINVAL 参数或字段范围无效，-ERANGE 换算越界。
- * 跳过未入表的特征。
- */
-static int
-ssf_mems_protocol_decode_feature_range(u16 start_reg, const u16 *registers,
-                                       size_t count,
-                                       struct ssf_mems_sensor_data *result) {
-  size_t i;
-
-  if (registers == NULL || result == NULL || count > 0x10000U - start_reg)
-    return -EINVAL;
-
-  for (i = 0; i < count; i++) {
-    const struct ssf_reg_desc *reg = ssf_mems_modbus_find_reg(start_reg + i);
-    const struct ssf_mems_sensor_field_desc *field;
-    u16 stored;
-    s64 value;
-    u8 *dest;
-
-    if (reg == NULL || reg->feature_field == SSF_MEMS_FIELD_NONE || (reg->access & SSF_REG_READ) == 0)
-      continue;
-    field = ssf_mems_sensor_field_desc(reg->feature_field);
-    if (field == NULL || field->offset > sizeof(*result) ||
-        field->width > sizeof(*result) - field->offset)
-      return -EINVAL;
-
-    value = registers[i] & reg->value_mask;
-    if (reg->type == SSF_REG_S16)
-      value = (s16)value;
-    /* 按型号表比例统一到 sensor_data.h 的单位。 */
-    value = (s64)value * (reg->feature_multiplier ? reg->feature_multiplier : 1U) /
-            (reg->feature_divisor ? reg->feature_divisor : 1U);
-    dest = (u8 *)result + field->offset;
-    if (field->width == sizeof(u16)) {
-      if (reg->type == SSF_REG_S16 ? value < -32768 || value > 32767 :
-                                    value < 0 || value > 65535)
-        return -ERANGE;
-      stored = (u16)value;
-      memcpy(dest, &stored, sizeof(stored));
-    } else if (field->width == sizeof(u8)) {
-      if (value < 0 || value > 255)
-        return -ERANGE;
-      *dest = value;
-    } else {
-      return -EINVAL;
-    }
-  }
-  return 0;
-}
-
-/* 把完整特征块转换为特征结构体。
- * 返回：0 成功，-EINVAL 参数无效，-ENOENT 块描述缺失，-ERANGE 换算越界。
- * 删除的表项对应字段置零。
- */
-int ssf_mems_protocol_decode_features(const u16 *registers, size_t count,
-                                      struct ssf_mems_sensor_data *result) {
-  const struct ssf_block_cmd_desc *block;
-
-  if (registers == NULL || result == NULL)
-    return -EINVAL;
-  block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_READ_ALL_FEATURES);
-  if (block == NULL)
-    return -ENOENT;
-  if (count != block->reg_count || block->decode_kind != SSF_DECODE_FEATURES)
-    return -EINVAL;
-
-  memset(result, 0, sizeof(*result));
-  return ssf_mems_protocol_decode_feature_range(block->start_display_reg,
-                                                registers, count, result);
-}
-
-/* 打印一个轴的振动特征。
- * 返回：无。
- */
-static void ssf_mems_protocol_log_axis(
-    const char *name, const struct ssf_mems_axis_features *axis) {
-  pr_debug("ssf_mems: %s acc_rms=%u.%02u g peak=%u.%02u g "
-          "peak_to_peak=%u.%02u g high_freq_acc_rms=%u.%02u g "
-          "velocity_rms=%u.%02u mm/s low_freq_velocity_rms=%u.%02u mm/s\n",
-          name,
-          axis->acc_rms_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->acc_rms_x100 % SSF_MEMS_CENTI_SCALE,
-          axis->acc_peak_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->acc_peak_x100 % SSF_MEMS_CENTI_SCALE,
-          axis->acc_peak_to_peak_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->acc_peak_to_peak_x100 % SSF_MEMS_CENTI_SCALE,
-          axis->high_freq_acc_rms_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->high_freq_acc_rms_x100 % SSF_MEMS_CENTI_SCALE,
-          axis->velocity_rms_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->velocity_rms_x100 % SSF_MEMS_CENTI_SCALE,
-          axis->low_freq_velocity_rms_x100 / SSF_MEMS_CENTI_SCALE,
-          axis->low_freq_velocity_rms_x100 % SSF_MEMS_CENTI_SCALE);
-}
-
-/* 打印一份完整特征用于调试。
- * 返回：无。
- * 用定点数输出，避免内核浮点运算。
- */
-void ssf_mems_protocol_log_features(
-    const struct ssf_mems_sensor_data *features) {
-  if (features == NULL)
-    return;
-
-  ssf_mems_protocol_log_axis("X", &features->x);
-  ssf_mems_protocol_log_axis("Y", &features->y);
-  ssf_mems_protocol_log_axis("Z", &features->z);
-  pr_debug("ssf_mems: sound_rms=%u.%02u dB sound_peak=%u.%02u dB "
-          "sound_peak_to_peak=%u.%02u dB startup_flags=0x%02x\n",
-          features->sound.rms_db_x100 / SSF_MEMS_CENTI_SCALE,
-          features->sound.rms_db_x100 % SSF_MEMS_CENTI_SCALE,
-          features->sound.peak_db_x100 / SSF_MEMS_CENTI_SCALE,
-          features->sound.peak_db_x100 % SSF_MEMS_CENTI_SCALE,
-          features->sound.peak_to_peak_db_x100 / SSF_MEMS_CENTI_SCALE,
-          features->sound.peak_to_peak_db_x100 % SSF_MEMS_CENTI_SCALE,
-          (unsigned int)features->startup_flags);
-}
-
 /* 替换最新的特征缓存。
  * 返回：0 成功，-EINVAL 参数为空。
  * 加锁更新，避免读到部分新数据。
  */
 int
-ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
+ssf_mems_protocol_store_features(struct ssf_mems_data *data,
                                  const struct ssf_mems_sensor_data *features) {
   struct ssf_mems_protocol_state *state;
 
@@ -353,7 +246,7 @@ ssf_mems_protocol_store_features(struct ssf_mems_xyzs_data *data,
 /* 把特征缓存标记为无效。
  * 返回：无。
  */
-void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data) {
+void ssf_mems_protocol_invalidate_features(struct ssf_mems_data *data) {
   if (data == NULL)
     return;
   mutex_lock(&data->protocol.lock);
@@ -361,95 +254,12 @@ void ssf_mems_protocol_invalidate_features(struct ssf_mems_xyzs_data *data) {
   mutex_unlock(&data->protocol.lock);
 }
 
-/* 分段读取全部特征并更新缓存。
- * 返回：0 成功，负数为参数、表项、通信或解码错误。
- * 所有分段成功后才更新缓存。
- */
-int ssf_mems_protocol_read_features(struct serdev_device *serdev,
-                                    unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
-  struct ssf_mems_protocol_state *state;
-  struct ssf_mems_sensor_data features = {0};
-  const struct ssf_block_cmd_desc *block;
-  u16 registers[SSF_MEMS_MODBUS_READ_MAX_REGS];
-  u32 cursor;
-  u32 end;
-  int ret;
-
-  if (serdev == NULL)
-    return -EINVAL;
-  data = serdev_device_get_drvdata(serdev);
-  if (data == NULL)
-    return -ENODEV;
-  state = &data->protocol;
-  mutex_lock(&state->bus_lock);
-
-  block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_READ_ALL_FEATURES);
-  if (block == NULL) {
-    ret = -ENOENT;
-    goto out_unlock;
-  }
-  if (block->sparse_read == false || block->decode_kind != SSF_DECODE_FEATURES ||
-      block->rx_format != SSF_RX_HOLDING_REGS ||
-      block->function != SSF_MEMS_MODBUS_FUNC_READ) {
-    ret = -EOPNOTSUPP;
-    goto out_unlock;
-  }
-
-  cursor = block->start_display_reg;
-  end = cursor + block->reg_count;
-  if (block->reg_count == 0 || end > 0x10000U) {
-    ret = -EINVAL;
-    goto out_unlock;
-  }
-
-  while (cursor < end) {
-    const struct ssf_reg_desc *first =
-        ssf_mems_modbus_next_feature(cursor, end);
-    u16 count = 1;
-
-    if (first == NULL)
-      break;
-    while (count < ARRAY_SIZE(registers) &&
-           (u32)first->display_reg + count < end) {
-      const struct ssf_reg_desc *reg =
-          ssf_mems_modbus_find_reg(first->display_reg + count);
-
-      if (reg == NULL || reg->feature_field == SSF_MEMS_FIELD_NONE || (reg->access & SSF_REG_READ) == 0 ||
-          reg->read_format != block->rx_format ||
-          reg->protocol_addr != (u32)first->protocol_addr + count)
-        break;
-      count++;
-    }
-
-    ret = ssf_mems_modbus_read_block_range_locked(
-        serdev, block, first->display_reg, count, registers,
-        ARRAY_SIZE(registers), timeout_ms);
-    if (ret != 0)
-      goto out_unlock;
-    ret = ssf_mems_protocol_decode_feature_range(first->display_reg, registers,
-                                                 count, &features);
-    if (ret != 0)
-      goto out_unlock;
-    cursor = (u32)first->display_reg + count;
-  }
-
-  /* 所有分段均读取/解码成功才发布，避免新旧混合的主机快照。 */
-  ret = ssf_mems_protocol_store_features(data, &features);
-  if (ret == 0)
-    ssf_mems_protocol_log_features(&features);
-
-out_unlock:
-  mutex_unlock(&state->bus_lock);
-  return ret;
-}
-
 /* 复制最新的有效特征缓存。
  * 返回：0 成功，-ENODATA 无有效缓存，其他负数为参数或设备错误。
  */
 int ssf_mems_protocol_get_features(struct serdev_device *serdev,
                                    struct ssf_mems_sensor_data *result) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_protocol_state *state;
 
   if (serdev == NULL || result == NULL)
@@ -476,7 +286,7 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
                                             const u16 *values,
                                             size_t values_count,
                                             unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   const struct ssf_block_cmd_desc *block;
   int ret;
 
@@ -485,7 +295,7 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
   data = serdev_device_get_drvdata(serdev);
   if (data == NULL)
     return -ENODEV;
-  block = ssf_mems_modbus_find_block_cmd(SSF_BLOCK_WRITE_WORK_PARAMETERS);
+  block = ssf_mems_sensor_find_block(data->sensor, SSF_BLOCK_WRITE_WORK_PARAMETERS);
   if (block == NULL)
     return -ENOENT;
 
@@ -499,27 +309,27 @@ int ssf_mems_protocol_write_work_parameters(struct serdev_device *serdev,
 /* 把波特率编码转换为 bit/s 数值。
  * 返回：正数为波特率，-EINVAL 编码无效。
  */
-int ssf_mems_baudrate_to_value(enum ssf_mems_baudrate baudrate) {
-  if ((unsigned int)baudrate >= SSF_MEMS_BAUDRATE_MAX ||
-      (unsigned int)baudrate >= ssf_mems_sensor_profile.baudrate_count)
+int ssf_mems_baudrate_to_value(const struct ssf_mems_sensor *sensor, enum ssf_mems_baudrate baudrate) {
+  if (sensor == NULL || (unsigned int)baudrate >= SSF_MEMS_BAUDRATE_MAX ||
+      (unsigned int)baudrate >= sensor->profile.baudrate_count)
     return -EINVAL;
 
-  return ssf_mems_sensor_profile.baudrates[baudrate];
+  return sensor->profile.baudrates[baudrate];
 }
 
 /* 把 bit/s 数值转换为波特率编码。
  * 返回：0 成功，-EINVAL 参数或速率无效。
  * 9600 对应显式编码 3。
  */
-int ssf_mems_baudrate_from_value(unsigned int value,
+int ssf_mems_baudrate_from_value(const struct ssf_mems_sensor *sensor, unsigned int value,
                                  enum ssf_mems_baudrate *baudrate) {
   unsigned int i;
 
-  if (baudrate == NULL)
+  if (sensor == NULL || baudrate == NULL)
     return -EINVAL;
   for (i = SSF_MEMS_BAUDRATE_2400; i < SSF_MEMS_BAUDRATE_MAX &&
-       i < ssf_mems_sensor_profile.baudrate_count; i++) {
-    if (ssf_mems_sensor_profile.baudrates[i] == value) {
+       i < sensor->profile.baudrate_count; i++) {
+    if (sensor->profile.baudrates[i] == value) {
       *baudrate = i;
       return 0;
     }
@@ -532,12 +342,12 @@ int ssf_mems_baudrate_from_value(unsigned int value,
  * 把控制器实际速率记录到 host_baudrate。
  */
 static int
-ssf_mems_protocol_set_host_baudrate(struct ssf_mems_xyzs_data *data,
+ssf_mems_protocol_set_host_baudrate(struct ssf_mems_data *data,
                                     enum ssf_mems_baudrate baudrate) {
   unsigned int actual;
   int requested;
 
-  requested = ssf_mems_baudrate_to_value(baudrate);
+  requested = ssf_mems_baudrate_to_value(data->sensor, baudrate);
   if (requested < 0)
     return requested;
 
@@ -555,7 +365,7 @@ ssf_mems_protocol_set_host_baudrate(struct ssf_mems_xyzs_data *data,
 /* 设置主机 UART 校验位。
  * 返回：0 成功，负数为枚举或控制器错误。
  */
-static int ssf_mems_protocol_set_host_parity(struct ssf_mems_xyzs_data *data,
+static int ssf_mems_protocol_set_host_parity(struct ssf_mems_data *data,
                                            enum ssf_mems_parity parity) {
   enum serdev_parity host_parity;
 
@@ -580,7 +390,7 @@ static int ssf_mems_protocol_set_host_parity(struct ssf_mems_xyzs_data *data,
  * 返回：0 成功，负数为参数或控制器错误。
  * 非默认启动速率被拒绝时回退到 9600。
  */
-int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data) {
+int ssf_mems_protocol_configure_serial(struct ssf_mems_data *data) {
   int ret;
 
   if (data == NULL || data->serdev == NULL ||
@@ -593,7 +403,7 @@ int ssf_mems_protocol_configure_serial(struct ssf_mems_xyzs_data *data) {
       data->protocol.baudrate != SSF_MEMS_BAUDRATE_9600) {
     dev_info(&data->serdev->dev,
              "controller rejected startup baud rate %d, using default baud rate 9600\n",
-             ssf_mems_baudrate_to_value(data->protocol.baudrate));
+             ssf_mems_baudrate_to_value(data->sensor, data->protocol.baudrate));
     data->protocol.baudrate = SSF_MEMS_BAUDRATE_DEFAULT;
     ret = ssf_mems_protocol_set_host_baudrate(data, data->protocol.baudrate);
   }
@@ -614,6 +424,7 @@ out_unlock:
 static int ssf_mems_protocol_read_baudrate_once(
     struct serdev_device *serdev, enum ssf_mems_baudrate *baudrate,
     unsigned int timeout_ms) {
+  struct ssf_mems_data *data = serdev_device_get_drvdata(serdev);
   u16 value;
   int ret;
 
@@ -621,7 +432,7 @@ static int ssf_mems_protocol_read_baudrate_once(
                                                timeout_ms);
   if (ret != 0)
     return ret;
-  if (ssf_mems_baudrate_to_value(value) < 0)
+  if (ssf_mems_baudrate_to_value(data->sensor, value) < 0)
     return -EPROTO;
 
   *baudrate = value;
@@ -633,15 +444,15 @@ static int ssf_mems_protocol_read_baudrate_once(
  * 按 bit/s 比较，避免重复扫描两个 9600 编码。
  */
 static bool ssf_mems_protocol_baudrate_tried(
-    enum ssf_mems_baudrate candidate, enum ssf_mems_baudrate initial) {
+    struct ssf_mems_data *data, enum ssf_mems_baudrate candidate, enum ssf_mems_baudrate initial) {
   unsigned int i;
-  int value = ssf_mems_sensor_profile.baudrates[candidate];
+  int value = data->sensor->profile.baudrates[candidate];
 
-  if (value == ssf_mems_sensor_profile.baudrates[initial])
+  if (value == data->sensor->profile.baudrates[initial])
     return true;
   for (i = 0; i < (unsigned int)candidate; i++) {
-    if (ssf_mems_sensor_profile.baudrates[i] == value &&
-        ssf_mems_sensor_profile.baudrates[i] != ssf_mems_sensor_profile.baudrates[initial])
+    if (data->sensor->profile.baudrates[i] == value &&
+        data->sensor->profile.baudrates[i] != data->sensor->profile.baudrates[initial])
       return true;
   }
   return false;
@@ -652,7 +463,7 @@ static bool ssf_mems_protocol_baudrate_tried(
  * 调用者持 bus_lock；仅超时重试读取，不重复保存。
  */
 static int ssf_mems_protocol_verify_baudrate_after_reboot(
-    struct ssf_mems_xyzs_data *data, enum ssf_mems_baudrate requested,
+    struct ssf_mems_data *data, enum ssf_mems_baudrate requested,
     enum ssf_mems_baudrate *verified, unsigned int timeout_ms) {
   enum ssf_mems_baudrate found;
   unsigned int attempt;
@@ -663,8 +474,8 @@ static int ssf_mems_protocol_verify_baudrate_after_reboot(
       return -ENODEV;
     ret = ssf_mems_protocol_read_baudrate_once(data->serdev, &found, timeout_ms);
     if (ret == 0) {
-      if (ssf_mems_sensor_profile.baudrates[found] !=
-          ssf_mems_sensor_profile.baudrates[requested])
+      if (data->sensor->profile.baudrates[found] !=
+          data->sensor->profile.baudrates[requested])
         return -EPROTO;
       *verified = found;
       return 0;
@@ -686,9 +497,9 @@ static int ssf_mems_protocol_verify_baudrate_after_reboot(
  * 速率相同时保留 reported，不同时采用 candidate。
  */
 static enum ssf_mems_baudrate ssf_mems_protocol_accept_baudrate(
-    enum ssf_mems_baudrate candidate, enum ssf_mems_baudrate reported) {
-  return ssf_mems_sensor_profile.baudrates[reported] ==
-                 ssf_mems_sensor_profile.baudrates[candidate] ? reported : candidate;
+    struct ssf_mems_data *data, enum ssf_mems_baudrate candidate, enum ssf_mems_baudrate reported) {
+  return data->sensor->profile.baudrates[reported] ==
+                 data->sensor->profile.baudrates[candidate] ? reported : candidate;
 }
 
 /* 修改并验证传感器通信波特率。
@@ -698,42 +509,44 @@ static enum ssf_mems_baudrate ssf_mems_protocol_accept_baudrate(
 int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
                                    enum ssf_mems_baudrate baudrate,
                                    unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_modbus_transfer planned;
   const struct ssf_reg_desc *baud_reg;
   const struct ssf_reg_desc *save_reg;
   enum ssf_mems_baudrate found;
   int ret;
 
-  if (serdev == NULL || ssf_mems_baudrate_to_value(baudrate) < 0)
+  if (serdev == NULL)
     return -EINVAL;
   data = serdev_device_get_drvdata(serdev);
   if (data == NULL)
     return -ENODEV;
 
-  baud_reg = ssf_mems_modbus_find_reg_by_name("baudrate");
-  save_reg = ssf_mems_modbus_find_reg_by_name("save_config_and_reboot");
+  if (ssf_mems_baudrate_to_value(data->sensor, baudrate) < 0)
+    return -EINVAL;
+  baud_reg = ssf_mems_sensor_find_reg_by_name(data->sensor, "baudrate");
+  save_reg = ssf_mems_sensor_find_reg_by_name(data->sensor, "save_config_and_reboot");
   if (baud_reg == NULL || save_reg == NULL)
     return -ENOENT;
   /* 保存命令不可用时，不先修改传感器的暂存值。 */
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
+  ret = ssf_mems_modbus_plan_request(data->sensor, SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
                                      baud_reg->display_reg, 1, NULL, &planned);
   if (ret != 0)
     return ret;
-  ret = ssf_mems_modbus_plan_request(SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
+  ret = ssf_mems_modbus_plan_request(data->sensor, SSF_MEMS_MODBUS_FUNC_WRITE_SINGLE,
                                      save_reg->display_reg, 1, NULL, &planned);
   if (ret != 0)
     return ret;
 
   mutex_lock(&data->protocol.bus_lock);
   /* 同值也读回确认，防止把主机缓存或未保存的暂存值当作传感器配置。 */
-  if (data->protocol.host_baudrate == ssf_mems_baudrate_to_value(baudrate) &&
-      ssf_mems_baudrate_to_value(data->protocol.baudrate) ==
-          ssf_mems_baudrate_to_value(baudrate)) {
+  if (data->protocol.host_baudrate == ssf_mems_baudrate_to_value(data->sensor, baudrate) &&
+      ssf_mems_baudrate_to_value(data->sensor, data->protocol.baudrate) ==
+          ssf_mems_baudrate_to_value(data->sensor, baudrate)) {
     ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
     if (ret != 0)
       goto out_unlock;
-    if (ssf_mems_baudrate_to_value(found) == ssf_mems_baudrate_to_value(baudrate)) {
+    if (ssf_mems_baudrate_to_value(data->sensor, found) == ssf_mems_baudrate_to_value(data->sensor, baudrate)) {
       data->protocol.baudrate = found;
       goto out_unlock;
     }
@@ -741,7 +554,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
   dev_info(&serdev->dev,
            "baud change: host %u, requested %d; staging %u=%u\n",
            data->protocol.host_baudrate,
-           ssf_mems_baudrate_to_value(baudrate), baud_reg->display_reg,
+           ssf_mems_baudrate_to_value(data->sensor, baudrate), baud_reg->display_reg,
            (unsigned int)baudrate);
   ret = ssf_mems_modbus_write_reg_locked(serdev, baud_reg->display_reg, baudrate,
                                          timeout_ms);
@@ -749,7 +562,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
     dev_err_ratelimited(&serdev->dev,
                         "baud change failed at %u staging: %d (host %u, requested %d)\n",
                         baud_reg->display_reg, ret, data->protocol.host_baudrate,
-                        ssf_mems_baudrate_to_value(baudrate));
+                        ssf_mems_baudrate_to_value(data->sensor, baudrate));
     goto out_unlock;
   }
 
@@ -766,7 +579,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
     dev_err_ratelimited(&serdev->dev,
                         "failed to confirm config save/reboot at %u: %d (host %u, requested %d)\n",
                         save_reg->display_reg, ret, data->protocol.host_baudrate,
-                        ssf_mems_baudrate_to_value(baudrate));
+                        ssf_mems_baudrate_to_value(data->sensor, baudrate));
     goto out_unlock;
   }
 
@@ -781,7 +594,7 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
   if (ret != 0) {
     dev_err_ratelimited(&serdev->dev,
                         "baud change failed to configure host UART: %d (requested %d)\n",
-                        ret, ssf_mems_baudrate_to_value(baudrate));
+                        ret, ssf_mems_baudrate_to_value(data->sensor, baudrate));
     goto out_unlock;
   }
 
@@ -796,11 +609,11 @@ int ssf_mems_protocol_set_baudrate(struct serdev_device *serdev,
     dev_err_ratelimited(&serdev->dev,
                         "failed to verify baud rate after reboot: %d (host %u, requested %d)\n",
                         ret, data->protocol.host_baudrate,
-                        ssf_mems_baudrate_to_value(baudrate));
+                        ssf_mems_baudrate_to_value(data->sensor, baudrate));
   else {
     data->protocol.baudrate = found;
     dev_info(&serdev->dev, "baud change verified: sensor %d, host %u\n",
-             ssf_mems_baudrate_to_value(found), data->protocol.host_baudrate);
+             ssf_mems_baudrate_to_value(data->sensor, found), data->protocol.host_baudrate);
   }
 
 out_unlock:
@@ -815,7 +628,7 @@ out_unlock:
 int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
                                    enum ssf_mems_baudrate *baudrate,
                                    unsigned int timeout_ms) {
-  struct ssf_mems_xyzs_data *data;
+  struct ssf_mems_data *data;
   struct ssf_mems_protocol_state *state;
   enum ssf_mems_baudrate initial;
   enum ssf_mems_baudrate found;
@@ -837,7 +650,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
       goto out_unlock;
   }
   initial = state->baudrate;
-  if (ssf_mems_baudrate_to_value(initial) < 0) {
+  if (ssf_mems_baudrate_to_value(data->sensor, initial) < 0) {
     ret = -EINVAL;
     goto out_unlock;
   }
@@ -845,7 +658,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
   ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
   if (ret == 0) {
     /* 成功应答证明当前主机速率可通信，40102 可能仍是尚未保存的值。 */
-    found = ssf_mems_protocol_accept_baudrate(initial, found);
+    found = ssf_mems_protocol_accept_baudrate(data, initial, found);
     state->baudrate = found;
     *baudrate = found;
     goto out_unlock;
@@ -854,10 +667,10 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
     goto out_unlock;
 
   for (i = 0; i < SSF_MEMS_BAUDRATE_MAX &&
-       i < ssf_mems_sensor_profile.baudrate_count; i++) {
+       i < data->sensor->profile.baudrate_count; i++) {
     enum ssf_mems_baudrate candidate = i;
 
-    if (ssf_mems_protocol_baudrate_tried(candidate, initial) == true)
+    if (ssf_mems_protocol_baudrate_tried(data, candidate, initial) == true)
       continue;
 
     ssf_mems_modbus_receive_flush(data);
@@ -867,7 +680,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
 
     ret = ssf_mems_protocol_read_baudrate_once(serdev, &found, timeout_ms);
     if (ret == 0) {
-      found = ssf_mems_protocol_accept_baudrate(candidate, found);
+      found = ssf_mems_protocol_accept_baudrate(data, candidate, found);
       state->baudrate = found;
       *baudrate = found;
       ssf_mems_modbus_receive_flush(data);

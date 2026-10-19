@@ -2,7 +2,7 @@
 #pragma once
 
 #include <linux/types.h>
-#include "model/sensor_data.h"
+#include "sensor.h"
 
 #define SSF_MEMS_POLL_DEFAULT_INTERVAL_MS 1000U /* 默认固定轮询周期。 */
 #define SSF_MEMS_POLL_DEFAULT_MIN_MS 500U /* 默认自适应周期下限。 */
@@ -30,6 +30,7 @@ struct ssf_mems_poll_config {
 
 /* 只记录轮询策略；采集锁保护统计，配置和生效周期另由短状态锁保护读写。 */
 struct ssf_mems_acquisition_policy {
+  const struct ssf_mems_sensor *sensor;
   struct ssf_mems_poll_config config;
   struct ssf_mems_sensor_data previous; /* 上一份完整特征，用于比较重复值。 */
   bool have_previous; /* previous 是否有效。 */
@@ -46,7 +47,8 @@ struct ssf_mems_acquisition_policy {
  * 返回：无。
  */
 void ssf_mems_acquisition_policy_init(
-    struct ssf_mems_acquisition_policy *policy, unsigned long now);
+    struct ssf_mems_acquisition_policy *policy,
+    const struct ssf_mems_sensor *sensor, unsigned long now);
 /* 清空历史统计并保留用户配置和当前周期。
  * 返回：无。
  */

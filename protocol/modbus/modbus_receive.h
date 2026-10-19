@@ -9,7 +9,7 @@
 
 #include "modbus/modbus_types.h"
 
-struct ssf_mems_xyzs_data;
+struct ssf_mems_data;
 
 /* 处理接收器交出的完整帧。
  * 返回：0 成功，负数为处理错误。
@@ -40,26 +40,26 @@ struct ssf_mems_modbus_receive_state {
 /* 初始化接收队列并注册完整帧回调。
  * 返回：0 成功，-EINVAL 参数无效，其他负数为分配错误。
  */
-int ssf_mems_modbus_receive_init(struct ssf_mems_xyzs_data *data,
+int ssf_mems_modbus_receive_init(struct ssf_mems_data *data,
                                ssf_mems_frame_handler_t handler, void *context);
 
 /* 关闭接收、释放队列并清空解析窗口。
  * 返回：无。
  * 先停止接收工作项，再释放资源。
  */
-void ssf_mems_modbus_receive_remove(struct ssf_mems_xyzs_data *data);
+void ssf_mems_modbus_receive_remove(struct ssf_mems_data *data);
 
 /* 清空接收队列和未完成的解析窗口。
  * 返回：无。
  * 清理期间收到的字节会丢弃，调用时不能持请求锁。
  */
-void ssf_mems_modbus_receive_flush(struct ssf_mems_xyzs_data *data);
+void ssf_mems_modbus_receive_flush(struct ssf_mems_data *data);
 
 /* 读取最近收到串口字节的时间。
  * 返回：接收时间的 jiffies 值。
  * 包含清理期间丢弃的字节。
  */
-unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_xyzs_data *data);
+unsigned long ssf_mems_modbus_receive_last_activity(struct ssf_mems_data *data);
 
 /* 安排接收队列的解析任务。
  * 返回：无。
