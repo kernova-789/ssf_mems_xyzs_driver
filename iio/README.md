@@ -1,55 +1,53 @@
-两款型号按设备树 compatible 选择：XYZS 保留以下原有 29 通道 ABI，XYZ 使用自己的 19 个通道。
+# IIO 映射与使用说明
+
+简体中文 | [English](README.en.md)
+
+两款型号按设备树 `compatible` 选择：XYZS 保留以下原有 29 通道 ABI，XYZ 使用自己的 19 个通道。
 XYZ 的 IIO 名称为 `ssf_mems_xyz` / `ssf_mems_xyz_raw`；通道、单位和能力差异见
 [sensor/README.md](../sensor/README.md)。下文以 XYZS 的属性和名称举例。
 
-# IIO mapping
-
 完整中文属性说明、权限、取值范围和操作示例见 [IIO 属性使用说明](ATTRIBUTES.md)。
+按 XYZ / XYZS 型号汇总的 `IIO_DEVICE_ATTR`、`IIO_CONST_ATTR` 完整清单及用户态读取方法见
+[设备属性宏清单](DEVICE_ATTRIBUTES.md)。
 
-`ssf_mems_iio.c` owns the complete IIO-facing implementation. Core code only
-calls `ssf_mems_iio_register()` after the serdev transport is ready.
+## 通道映射与缓存
 
-The 40001–40029 feature block is exposed in direct and software-buffer modes.
-Acceleration values use `IIO_ACCEL`, velocity uses `IIO_VELOCITY`, and
-signed temperature uses `IIO_TEMP`. Sound features are device-defined dB indicators exposed as named `IIO_COUNT`
-channels; they do not expose calibrated pressure in Pa. Device-specific dimensionless/spectral fields use named
-`IIO_INDEX` or `IIO_COUNT` channels.
-`*_raw` reads only copy the latest published feature snapshot and return
-`-ENODATA` before the first snapshot is available, during reconnect, or after
-read failures have made it stale; they never initiate Modbus I/O.
+`ssf_mems_iio.c` 实现全部 IIO 接口。核心层在 serdev 传输就绪后调用
+`ssf_mems_iio_register()` 完成注册。
 
-The protocol layer atomically updates the feature snapshot after a complete
-read. `ssf_mems_iio_publish_features()` only pushes that sample to the IIO kfifo
-when the buffer is enabled. The automatic producer lives in `acquisition/` and
-starts after IIO registration. Protocol reads continue updating the cache when
-the buffer is disabled.
+XYZS 的 40001～40029 特征寄存器块同时支持直接读取和软件缓冲区模式。
+加速度使用 `IIO_ACCEL`，速度使用 `IIO_VELOCITY`，有符号温度使用 `IIO_TEMP`。
+声音特征是设备定义的 dB 指标，通过带名称的 `IIO_COUNT` 通道提供，不表示经过校准的
+Pa 声压。设备特有的无量纲指标和频谱字段使用带名称的 `IIO_INDEX` 或 `IIO_COUNT` 通道。
+读取 `*_raw` 只复制最近发布的特征快照，不发起 Modbus 请求。首次快照生成前、重连期间，
+或读取失败导致缓存失效后，返回 `-ENODATA`。
 
-The producer holds `indio_dev->mlock` throughout the enabled-state check, scan
-packing, and buffer push. IIO buffer reconfiguration holds the same mutex, so
-disabling a buffer or freeing its active scan mask cannot race with publication.
-Acquisition is stopped before unregistering the IIO device. Buffer callbacks
-must not acquire the acquisition mutex while holding `mlock`.
+协议层在完整读取成功后原子更新特征快照。`ssf_mems_iio_publish_features()` 仅在
+缓冲区启用时将样本推入 IIO kfifo。后台采集位于 `acquisition/`，在 IIO 注册后启动。
+即使缓冲区关闭，协议读取仍会更新缓存。
 
-Scale callbacks convert the normalized cache to IIO units: acceleration uses
-0.0980665 m/s² per count, velocity uses 0.00001 m/s per count, temperature uses
-10 millidegrees Celsius per count, and sound dB values use 0.01 per count. Register 40026
-already contains whole percent, register 40027 contains Hz multiplied by 10,
-and register 40028 is the firmware's unitless spectral-difference sum multiplied
-by 100.
+从检查缓冲区启用状态、打包扫描记录到推送数据，发布流程始终持有 `indio_dev->mlock`。
+IIO 缓冲区重配置也使用同一互斥锁，因此关闭缓冲区、释放活动扫描掩码不会与发布操作并发冲突。
+注销 IIO 设备前先停止采集；缓冲区回调不得在持有 `mlock` 时再获取采集互斥锁。
 
-`sensor_baudrate` and `sensor_baudrate_available` are device attributes. Reading
-`sensor_baudrate` may perform the complete enum scan described in
-`ssf_mems_protocol_get_baudrate()`; writing it accepts one of the numeric values
-listed by `sensor_baudrate_available`. Both operations are serialized with the
-acquisition state machine. A successful write also changes its recovery target;
-the background thread then verifies communication before polling again.
+比例回调将统一格式的缓存值转换为 IIO 单位：加速度每计数为 0.0980665 m/s²，
+速度每计数为 0.00001 m/s，温度每计数为 10 毫摄氏度，声音指标每计数为 0.01 dB。
+寄存器 40026 已按整数百分数存储，40027 按 Hz×10 存储，40028 为固件定义的
+无量纲频谱差异累加值乘以 100。
 
-Read-only `sensor_online`, `sensor_poll_interval_ms`, and `sensor_sample_age_ms`
-report link status, the current target polling period, and the age of the latest
-complete sample. These three reads use a short status mutex, independent of
-the acquisition transaction mutex; they do not wait for a raw window or OTA. Before the first successful sample, the age returns `-ENODATA`.
-A reachable device returning Modbus exceptions can be online while its feature
-cache is stale, so link status and sample age have separate meanings.
+## 波特率与链路状态
+
+`sensor_baudrate` 和 `sensor_baudrate_available` 是设备属性。
+读取 `sensor_baudrate` 时，可能执行 `ssf_mems_protocol_get_baudrate()` 中的完整波特率扫描；
+写入时接受 `sensor_baudrate_available` 列表中的实际数值。
+读写都与采集状态机串行执行。成功写入后也会修改重连目标，后台线程重新验证通信后再恢复轮询。
+
+只读属性 `sensor_online`、`sensor_poll_interval_ms` 和 `sensor_sample_age_ms`
+分别提供链路状态、当前目标轮询周期及最近完整样本的年龄。
+这三项读取使用独立于采集事务锁的短状态锁，不等待原始窗口或固件升级。
+首次成功获取样本前，样本年龄返回 `-ENODATA`。
+可通信但返回 Modbus 异常的设备可能仍为在线状态，同时特征缓存已经失效，
+因此链路状态和样本年龄需要分别判断。
 
 ## 运行中修改采集策略
 
@@ -140,7 +138,7 @@ cat "$IIO/sensor_poll_interval_ms"
 这些操作不发送传感器配置命令。当前周期是调度目标，读取耗时超过周期时不会并行
 发送或补发积压轮次。
 
-## bin 固件升级
+## 二进制固件升级
 
 特征设备新增 root 只写的 `sensor_firmware_update` 和只读的
 `sensor_firmware_update_status`。前者接受放在开发板 `/lib/firmware/` 下的 `.bin`
@@ -151,50 +149,47 @@ cat "$IIO/sensor_poll_interval_ms"
 **必须先阅读 [镜像地址、总线限制和操作说明](../protocol/firmware/OTA.md)**。
 必须使用匹配当前硬件和 Bootloader 的镜像；仓库中的 bin 属于其他传感器，当前没有适用镜像。
 
-## Sensor feature register configuration
+## 传感器特征寄存器配置
 
-The following attributes query the sensor over Modbus, serialized with
-acquisition and baud-rate recovery. They return `-ENODATA` while offline:
+以下是 XYZS 的特征配置属性。其中 `sensor_sampling_rate_index_available` 从型号表
+生成列表，其余属性通过 Modbus 查询传感器，与采集和波特率恢复串行执行；设备离线时
+返回 `-ENODATA`。XYZ 不创建参数开关、特征使能和固件版本属性。
 
-- `sensor_sampling_rate_index` (RW): register 40052, index 0 through 9.
-- `sensor_sampling_frequency` (RO): the configured frequency in Hz.
-- `sensor_sampling_rate_index_available` (RO): supported indices.
-- `sensor_sampling_length_index` (RW): register 40053, ordinary sampling-length index 0..5;
-  it does not set the finite raw batch size.
-- `sensor_parameter_switch` (RO): register 40070, complete switch word in hex.
-- `sensor_feature_enable` (RW): bits 15..10 of 40070, shifted down to 0..63.
-  Bit 5/4/3 enables X/Y/Z high-frequency acceleration RMS; bit 2/1/0 enables
-  X/Y/Z low-frequency velocity RMS. `63` enables all six. Writes preserve
-  the lower ten bits, including alarm settings.
-- `sensor_firmware_version` (RO): register 40121 (the provided firmware is 5100).
+- `sensor_sampling_rate_index`（读写）：寄存器 40052，编码范围为 0～9。
+- `sensor_sampling_frequency`（只读）：当前配置的采样率，单位 Hz。
+- `sensor_sampling_rate_index_available`（只读）：支持的采样率编码列表。
+- `sensor_sampling_length_index`（读写）：寄存器 40053，普通采样长度编码 0～5；
+  不用于设置定长原始采集的批次长度。
+- `sensor_parameter_switch`（只读）：寄存器 40070，以十六进制输出完整参数开关字。
+- `sensor_feature_enable`（读写）：提取 40070 的 bit15～bit10，右移后输出 0～63。
+  bit5/4/3 分别控制 X/Y/Z 高频加速度有效值计算，bit2/1/0 分别控制 X/Y/Z 低频速度有效值计算。
+  `63` 开启全部六项；写入时保留低十位，包括报警配置。
+- `sensor_firmware_version`（只读）：寄存器 40121，固件版本整数编码，例如 `5100`。
 
-Sampling rate indices correspond to `533.34 888.9 1066.68 1333.35 2666.7 2963
-5333.4 8889 13333.5 26667` Hz. Writes use 0x06, skip unchanged register values,
-and read back the result. The first connection selects the model-table target
-baud rate (currently 128000) and sampling-rate index (currently 6, 5333.4 Hz).
-`current-speed` only supplies an initial matching hint. Matching values skip
-writes; configuration errors use the connection retry path. Successful manual
-baud and sampling-rate changes become reconnection targets until driver unload.
-Avoid rapidly toggling persistent device settings. The driver does not send an
-extra save command for sampling rate or feature enables; power-up behavior
-should be confirmed for the target device.
-Readback confirms the register value; a new calculation may take several seconds.
-After configuration, polling clears its comparison history but retains the
-configured/learned period. The old cache is invalidated until the next successful register read. That next read
-can still contain the sensor's previous calculation.
+采样率编码依次对应 `533.34 888.9 1066.68 1333.35 2666.7 2963 5333.4 8889 13333.5 26667` Hz。
+这些可写寄存器配置使用功能码 `0x06`，同值跳过写入，写后读回验证。
+首次连接选择型号表中的目标波特率和采样率：当前两款均为 128000 bit/s，
+XYZS 选择索引 6（5333.4 Hz），XYZ 选择索引 3（1333.35 Hz）。
+`current-speed` 只提供初始匹配提示；配置一致时不重复写入，配置失败进入连接重试流程。
+手动成功修改的波特率和采样率在本次驱动运行期间作为重连目标，卸载后不保留。
 
-The existing `in_count6_startup_flags_raw` name is retained for compatibility,
-and represents XYZ run-detection flags. Zero does not mean that measurement is
-disabled. Bits 0/1/2 correspond to X/Y/Z.
+避免频繁切换持久化设备配置。驱动不会为采样率或特征使能额外发送保存命令，
+上电行为需在目标设备上确认。读回只能确认寄存器值，新的计算结果可能要等待数秒。
+配置后轮询会清空比较历史，但保留已配置或已学习的周期；旧缓存失效，直到下一次寄存器
+读取成功，而这次读取仍可能包含传感器的上一轮计算结果。
 
-See [tools/README.md](../tools/README.md#特征值长时间重复的排查) for a board test.
+为保持兼容，保留 `in_count6_startup_flags_raw` 名称，表示 XYZ 运行判定标志。
+bit0/1/2 分别对应 X/Y/Z，值为 0 不表示测量被禁用。
+实机排查方法见 [特征值长时间重复的排查](../tools/README.md#特征值长时间重复的排查)。
 
-Run `python3 tests/iio/run_tests.py` for a pthread stress test of the production
-publisher with AddressSanitizer/UndefinedBehaviorSanitizer. It checks packing
-for selected masks, signed temperature, startup flags, padding and timestamps
-while repeatedly disabling buffers and freeing/replacing masks. It uses an IIO
-shim, so actual kernel buffer operations still require hardware verification.
-# 原始数据设备
+## 离线验证
+
+运行 `python3 tests/iio/run_tests.py`，使用 pthread 对实际发布代码进行压力测试，
+并启用 AddressSanitizer / UndefinedBehaviorSanitizer。测试在反复关闭缓冲区、释放及替换
+扫描掩码的同时，检查指定掩码下的记录打包、有符号温度、运行标志、对齐填充和时间戳。
+测试使用 IIO 模拟层，真实内核缓冲区操作仍需实机验证。
+
+## 原始数据设备
 
 新增 `ssf_mems_xyzs_raw`，提供 XYZ、包号、包内序号及主机接收时间戳的独立
 buffer，保持特征设备原有布局不变。全部数据字段和时间戳启用时为 24 字节；
