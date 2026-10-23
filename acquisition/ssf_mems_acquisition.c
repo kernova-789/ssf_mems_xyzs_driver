@@ -194,7 +194,8 @@ static int ssf_mems_acquisition_collect(struct ssf_mems_data *data) {
     mutex_lock(&acq->status_lock);
     acq->have_sample = false;
     mutex_unlock(&acq->status_lock);
-    ret = data->sensor_ops->collect_raw(data, acq->raw_duration_ms);
+    ret = data->sensor_ops->collect_raw(data, acq->raw_duration_ms,
+                                       acq->raw_batch_samples);
     if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
       /* 定长上传未确认结束时不能轮询特征；connect 先完成只读恢复。 */
       ssf_mems_acquisition_offline(data);
@@ -321,6 +322,9 @@ static int ssf_mems_acquisition_thread(void *context) {
         if (acq->mode == SSF_MEMS_ACQ_MODE_ALTERNATING)
           delay_ms = min(delay_ms, acq->feature_duration_ms);
       }
+    } else if (acq->mode == SSF_MEMS_ACQ_MODE_RAW && acq->raw_manual) {
+      /* 用户显式窗口期间采集锁由触发请求持有；空闲时不发送采集命令。 */
+      delay_ms = SSF_MEMS_ACQ_RETRY_INITIAL_MS;
     } else {
       ret = ssf_mems_acquisition_collect(data);
       if (ret != 0)
@@ -386,6 +390,8 @@ int ssf_mems_acquisition_init(struct ssf_mems_data *data) {
   acq->target_sampling_rate_index =
       data->sensor->profile.default_sampling_rate_index;
   acq->retry_ms = SSF_MEMS_ACQ_RETRY_INITIAL_MS;
+  acq->raw_batch_samples = SSF_MEMS_RAW_BATCH_SAMPLES;
+  acq->raw_manual = false;
   acq->raw_duration_ms = ssf_mems_acquisition_window(
       &data->serdev->dev, "sange-cbm,raw-duration-ms", true);
   acq->feature_duration_ms = ssf_mems_acquisition_window(
@@ -429,6 +435,8 @@ int ssf_mems_acquisition_get_config(
   } else {
     config->mode = acq->mode;
     config->raw_duration_ms = acq->raw_duration_ms;
+    config->raw_batch_samples = acq->raw_batch_samples;
+    config->raw_manual = acq->raw_manual;
     config->feature_duration_ms = acq->feature_duration_ms;
     config->poll = acq->policy.config;
   }
@@ -497,10 +505,91 @@ int ssf_mems_acquisition_set_duration(struct ssf_mems_data *data,
   return ret;
 }
 
-/* 修改一个主机特征轮询配置项。
- * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。
- * 设置周期不写传感器参数，也不截断在途原始批次。
+/* 设置下一原始窗口的真实批次长度。
+ * 返回：0 成功，-EINVAL 长度不支持，-ENODEV 正在停止。
+ * 只保存主机配置，采集锁保证在途窗口不被改写。
  */
+int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *data, u32 samples) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret = 0;
+
+  if (data == NULL || !ssf_mems_sensor_raw_samples_valid(data->sensor, samples))
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  if (READ_ONCE(acq->stopping)) {
+    ret = -ENODEV;
+  } else {
+    mutex_lock(&acq->status_lock);
+    acq->raw_batch_samples = samples;
+    mutex_unlock(&acq->status_lock);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
+/* 选择 raw 自动循环或显式窗口控制；在当前窗口结束后生效。 */
+int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *data, bool manual) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret = 0;
+
+  if (data == NULL)
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  if (READ_ONCE(acq->stopping)) {
+    ret = -ENODEV;
+  } else {
+    mutex_lock(&acq->status_lock);
+    acq->raw_manual = manual;
+    mutex_unlock(&acq->status_lock);
+    WRITE_ONCE(acq->config_changed, true);
+    wake_up_interruptible(&acq->waitq);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
+/* 同步采集一个原始窗口；不执行长度轮换，不额外改变采集模式。 */
+int ssf_mems_acquisition_capture_window(struct ssf_mems_data *data) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret;
+
+  if (data == NULL)
+    return -EINVAL;
+  acq = &data->acquisition;
+  mutex_lock(&acq->lock);
+  if (READ_ONCE(acq->stopping)) {
+    ret = -ENODEV;
+  } else if (acq->firmware_blocked) {
+    ret = -EBUSY;
+  } else if (!acq->raw_manual || acq->mode != SSF_MEMS_ACQ_MODE_RAW) {
+    ret = -EINVAL;
+  } else if (!acq->online || acq->phase != SSF_MEMS_ACQ_POLL) {
+    ret = -ENODATA;
+  } else {
+    acq->phase = SSF_MEMS_ACQ_RAW;
+    mutex_lock(&acq->status_lock);
+    acq->have_sample = false;
+    mutex_unlock(&acq->status_lock);
+    ret = data->sensor_ops->collect_raw(data, acq->raw_duration_ms,
+                                       acq->raw_batch_samples);
+    if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
+      ssf_mems_acquisition_offline(data);
+      acq->phase = SSF_MEMS_ACQ_BACKOFF;
+    } else {
+      acq->phase = SSF_MEMS_ACQ_POLL;
+    }
+    if (ret == 0)
+      ssf_mems_acquisition_policy_contact(&acq->policy, jiffies);
+    else
+      ssf_mems_acquisition_error(data, ret);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
+/* 修改主机特征轮询配置；不截断在途原始批次，不写传感器配置。 */
 int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_data *data,
                                           enum ssf_mems_poll_setting setting,
                                           unsigned int value) {

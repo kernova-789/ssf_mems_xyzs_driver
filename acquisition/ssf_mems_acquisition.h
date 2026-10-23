@@ -35,6 +35,8 @@ struct ssf_mems_acquisition_config {
   enum ssf_mems_acquisition_mode mode; /* 当前选择的采集策略。 */
   unsigned int raw_duration_ms;       /* 原始采集窗口；交替时决定原始阶段时长，单位 ms。 */
   unsigned int feature_duration_ms;   /* 交替模式的特征窗口，单位 ms。 */
+  u32 raw_batch_samples;             /* 请求的真实批次长度，默认 1024。 */
+  bool raw_manual;                   /* raw 模式只由用户显式触发完整窗口。 */
   struct ssf_mems_poll_config poll;    /* 特征轮询模式及周期范围。 */
 };
 
@@ -73,6 +75,8 @@ struct ssf_mems_acquisition_state {
   bool config_changed; /* 唤醒调度并从新的窗口起点应用配置，不重新配置传感器。 */
   bool poll_changed; /* 唤醒轮询等待，不重新开始特征窗口。 */
   unsigned int raw_duration_ms; /* 每轮定长批采集窗口；收完在途批次。 */
+  u32 raw_batch_samples; /* 主机请求的批次长度，采集锁保护。 */
+  bool raw_manual; /* 为 true 时后台 raw 模式等待用户触发，不自动产生批次。 */
   unsigned int feature_duration_ms; /* 每轮特征轮询时长，不含原始模式退出时间。 */
   unsigned long feature_until; /* 本轮特征采集结束的 jiffies 时刻。 */
 };
@@ -148,6 +152,11 @@ int ssf_mems_acquisition_set_mode(struct ssf_mems_data *data,
  */
 int ssf_mems_acquisition_set_duration(struct ssf_mems_data *data,
                                       bool raw_window, unsigned int duration_ms);
+/* 设置定长批次长度/手动控制；不修改正在接收的窗口。 */
+int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *data, u32 samples);
+int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *data, bool manual);
+/* 同步执行一个完整原始窗口；仅支持 raw + manual，返回前确认收尾。 */
+int ssf_mems_acquisition_capture_window(struct ssf_mems_data *data);
 /* 修改一个主机特征轮询配置项。
  * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。
  * 设置周期不写传感器参数，也不截断在途原始批次。

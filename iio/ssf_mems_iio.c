@@ -715,7 +715,85 @@ static IIO_DEVICE_ATTR(sensor_firmware_update, 0200, NULL,
 static IIO_DEVICE_ATTR(sensor_firmware_update_status, 0444,
                        ssf_mems_iio_firmware_show, NULL, 0);
 
+/* 主机定长控制配置；address=0 为长度，1 为显式窗口模式。 */
+static ssize_t ssf_mems_iio_raw_control_show(struct device *dev,
+                                           struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_acquisition_config config;
+  int ret = ssf_mems_acquisition_get_config(state->data, &config);
+
+  if (ret != 0)
+    return ret;
+  return sysfs_emit(buf, "%u\n", to_iio_dev_attr(attr)->address == 0 ?
+                    config.raw_batch_samples : (unsigned int)config.raw_manual);
+}
+
+static ssize_t ssf_mems_iio_raw_control_store(struct device *dev,
+                                            struct device_attribute *attr,
+                                            const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned int value;
+  int ret = kstrtouint(buf, 10, &value);
+
+  if (ret != 0)
+    return ret;
+  if (to_iio_dev_attr(attr)->address == 0) {
+    ret = ssf_mems_acquisition_set_raw_samples(state->data, value);
+  } else {
+    if (value > 1)
+      return -EINVAL;
+    ret = ssf_mems_acquisition_set_raw_manual(state->data, value != 0);
+  }
+  return ret != 0 ? ret : (ssize_t)len;
+}
+
+static ssize_t ssf_mems_iio_raw_available(struct device *dev,
+                                        struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  u32 samples;
+  int len = 0;
+
+  (void)attr;
+  for (samples = 1024; samples <= state->data->sensor->profile.raw_batch_max_samples;
+       samples *= 2U)
+    len += sysfs_emit_at(buf, len, "%s%u", len ? " " : "", samples);
+  return len + sysfs_emit_at(buf, len, "\n");
+}
+
+/* 同步执行窗口；用户态须在另一线程/进程持续消费原始 buffer。 */
+static ssize_t ssf_mems_iio_raw_capture_store(struct device *dev,
+                                            struct device_attribute *attr,
+                                            const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  unsigned int value;
+  int ret = kstrtouint(buf, 10, &value);
+
+  (void)attr;
+  if (ret != 0)
+    return ret;
+  if (value != 1)
+    return -EINVAL;
+  ret = ssf_mems_acquisition_capture_window(state->data);
+  /* 窗口可能已触发，不能让信号处理自动重启这次写入。 */
+  if (ret == -ERESTARTSYS)
+    ret = -EINTR;
+  return ret != 0 ? ret : (ssize_t)len;
+}
+
+static IIO_DEVICE_ATTR(sensor_raw_batch_samples, 0644,
+                       ssf_mems_iio_raw_control_show, ssf_mems_iio_raw_control_store, 0);
+static IIO_DEVICE_ATTR(sensor_raw_manual, 0644,
+                       ssf_mems_iio_raw_control_show, ssf_mems_iio_raw_control_store, 1);
+static IIO_DEVICE_ATTR(sensor_raw_batch_samples_available, 0444,
+                       ssf_mems_iio_raw_available, NULL, 0);
+static IIO_DEVICE_ATTR(sensor_raw_capture, 0200,
+                       NULL, ssf_mems_iio_raw_capture_store, 0);
+
 static struct attribute *ssf_mems_iio_attributes[] = {
+    &iio_dev_attr_sensor_raw_batch_samples.dev_attr.attr,
+    &iio_dev_attr_sensor_raw_batch_samples_available.dev_attr.attr,
+    &iio_dev_attr_sensor_raw_manual.dev_attr.attr,
+    &iio_dev_attr_sensor_raw_capture.dev_attr.attr,
     &iio_dev_attr_sensor_firmware_update.dev_attr.attr,
     &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr,
     &iio_dev_attr_sensor_acquisition_mode.dev_attr.attr,
@@ -1044,7 +1122,7 @@ static ssize_t ssf_mems_raw_status_show(struct device *dev,
   case SSF_MEMS_IIO_RAW_PUBLISHING: value = READ_ONCE(raw->publishing); break;
   case SSF_MEMS_IIO_RAW_BATCHES: value = READ_ONCE(raw->batches); break;
   case SSF_MEMS_IIO_RAW_BATCH_PACKETS: value = READ_ONCE(raw->batch_packets); break;
-  case SSF_MEMS_IIO_RAW_BATCH_SAMPLES: value = SSF_MEMS_RAW_BATCH_SAMPLES; break;
+  case SSF_MEMS_IIO_RAW_BATCH_SAMPLES: value = READ_ONCE(raw->batch_samples); break;
   case SSF_MEMS_IIO_RAW_IGNORED_BYTES: value = READ_ONCE(raw->ignored_bytes); break;
   default: return -EINVAL;
   }
@@ -1076,7 +1154,7 @@ static IIO_DEVICE_ATTR(raw_link_mode, 0444, ssf_mems_raw_status_show, NULL,
                        SSF_MEMS_IIO_RAW_LINK_MODE);
 static IIO_DEVICE_ATTR(raw_publishing, 0444, ssf_mems_raw_status_show, NULL,
                        SSF_MEMS_IIO_RAW_PUBLISHING);
-/* 定长批次状态只读；包号在每批 1024 组 XYZ 后从零重新开始。 */
+/* 定长批次状态只读；包号在每批实际长度的 XYZ 后从零重新开始。 */
 static IIO_DEVICE_ATTR(raw_batches, 0444, ssf_mems_raw_status_show, NULL,
                        SSF_MEMS_IIO_RAW_BATCHES);
 static IIO_DEVICE_ATTR(raw_batch_packets, 0444, ssf_mems_raw_status_show, NULL,

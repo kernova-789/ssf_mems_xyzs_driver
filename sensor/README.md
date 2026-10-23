@@ -23,7 +23,7 @@
 
 ```c
 ret = data->sensor_ops->read_features(data, timeout_ms);
-ret = data->sensor_ops->collect_raw(data, duration_ms);
+ret = data->sensor_ops->collect_raw(data, duration_ms, samples);
 ```
 
 两个型号各自提供回调，相同机制共用。`protocol/` 负责串口、Modbus 请求、
@@ -120,3 +120,7 @@ python3 tests/ota/run_tests.py
 协议测试包含 XYZ 独立映射、单次连续读取、换算、缓存保留、1024 点采集和丢包恢复；
 也保留 XYZS 的删表、移址、比例和通信故障变体。IIO 覆盖两型号通道/打包及并发发布。
 模拟测试使用合成数据；XYZ 实机记录见 `tests/hardware/TEST_REPORT_2026-10-19_XYZ_RAW_FIX.md`。
+
+可变定长：XYZS 的 `raw_batch_max_samples=32768` 开放 1024～32768 的二次幂长度；XYZ 保持 1024 上限。
+长度由用户态命令设置，型号回调负责固件编码（XYZS 的 1024 仍使用零编码）；
+解析器按当前窗口真实长度判定包数与末包。默认及历史测试数值仍为 1024，新增长度尚待实机验证。

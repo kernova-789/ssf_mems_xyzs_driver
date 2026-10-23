@@ -1,3 +1,8 @@
+> 本文命令及数值示例使用默认 1024 点。新版支持用户设置 XYZS 的真实批次长度：
+> `sensor_raw_batch_samples`（读写）和 `sensor_raw_batch_samples_available`（只读）。
+> 驱动不自动轮换长度；显式窗口控制和用户态轮换见 [训练采集说明](../../tests/training/README.md)。
+> 新增长度尚待逐档实机验证。
+
 两款型号共用以下收流和恢复机制，各自的入口通过 probe 绑定：
 XYZS 使用已有零长度默认批次；XYZ V2.4 显式设置 U32 长度 1024。
 XYZ 的设备名称为 `ssf_mems_xyz_raw`，操作示例需相应替换名称。
@@ -126,7 +131,7 @@ buffer 未启用时驱动仍按时交替采集，但不保存未消费的历史�
 - `raw_publishing`：是否处于向 IIO 发布的采集阶段；buffer 未启用时不存储样本。
 - `raw_batches`：本轮原始窗口中成功完成的批次数。
 - `raw_batch_packets`：当前批次的 CRC 正确包数，包含卸载时排空的包。
-- `raw_batch_samples`：固定为 1024，单位为同步 XYZ 组。
+- `raw_batch_samples`：当前/最近窗口的实际长度，默认 1024，单位为同步 XYZ 组。
 - `raw_ignored_bytes`：无法归入原始包的字节数，非零会使本轮报错。
 
 这些诊断属性按成员读取，不是一份原子快照，观察边界时可能跨越状态切换。

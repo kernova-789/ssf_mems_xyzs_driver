@@ -10,6 +10,6 @@ struct ssf_mems_data;
  */
 int ssf_mems_raw_finish_locked(struct ssf_mems_data *data);
 
-/* 共用定长事务；length 是型号固件的 1024 点长度编码（0 或 1024）。 */
+/* 共用定长事务；length 为型号固件的 U32 编码，0 兼容 1024 点。 */
 int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
                                 unsigned int duration_ms, u32 length);

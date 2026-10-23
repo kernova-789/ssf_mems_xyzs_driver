@@ -75,7 +75,7 @@ device and do not change the scan record layout:
 | `sensor_raw_duration_ms` (read/write) | Raw window, decimal 100..60000 ms |
 | `sensor_feature_duration_ms` (read/write) | Feature window, decimal 100..60000 ms |
 
-`raw` repeatedly collects complete finite batches of 1024 samples without
+`raw` repeatedly collects complete finite batches (1024 samples by default) without
 polling features. It still reads required configuration and confirms communication
 after each batch, so the waveform is not continuous. `feature` continuously polls
 features without triggering raw batches. `alternating` starts with a feature
@@ -260,3 +260,11 @@ host mode, window, and polling settings use a short lock and do not wait for a
 raw window or firmware update; writes remain serialized. Feature fields and
 units come from `sensor/sensor_fields.h`. Both devices share buffer packing and
 registration helpers.
+
+## Userspace-controlled batch length
+
+`sensor_raw_batch_samples` reads/writes the requested batch length;
+`sensor_raw_batch_samples_available` lists the allowed lengths. The driver does not
+cycle lengths automatically. See [training capture](../tests/training/README.md)
+and [attribute definitions](DEVICE_ATTRIBUTES.md) (Chinese) for the userspace schedule
+and synchronous manual-window interface. New lengths still require hardware validation.

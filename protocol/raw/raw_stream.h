@@ -20,12 +20,13 @@ typedef int (*ssf_mems_raw_sample_handler_t)(
   (SSF_MEMS_RAW_PAYLOAD_OFFSET + SSF_MEMS_RAW_SAMPLES_PER_PACKET * SSF_MEMS_RAW_SAMPLE_BYTES)
 #define SSF_MEMS_RAW_TAIL_OFFSET (SSF_MEMS_RAW_CRC_OFFSET + 2U)
 #define SSF_MEMS_RAW_PACKET_BYTES (SSF_MEMS_RAW_TAIL_OFFSET + 1U)
-#define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 一批 XYZ 组数；具体长度编码由型号回调选择。 */
+#define SSF_MEMS_RAW_BATCH_SAMPLES 1024U /* 默认批次长度，运行时使用 raw.batch_samples。 */
 #define SSF_MEMS_RAW_BATCH_PACKETS \
   (SSF_MEMS_RAW_BATCH_SAMPLES / SSF_MEMS_RAW_SAMPLES_PER_PACKET)
 
 /* 定长包解析状态；字节缓冲和批次边界由接收模块的 parse_lock 保护。 */
 struct ssf_mems_raw_state {
+  u32 batch_samples; /* 当前窗口的真实长度；接收启用前设定，收尾完成前不改变。 */
   u32 batch_packets; /* 当前批次 CRC 正确的包数，包含卸载时排空的包。 */
   bool batch_done; /* 是否收到本批末包；错误统计另行决定该批是否完整有效。 */
   u32 batches; /* 当前原始采集窗口中成功完成的批次数。 */

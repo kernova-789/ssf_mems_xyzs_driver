@@ -6,7 +6,8 @@
 struct ssf_mems_data;
 struct ssf_mems_sensor_ops {
   int (*read_features)(struct ssf_mems_data *data, unsigned int timeout_ms);
-  int (*collect_raw)(struct ssf_mems_data *data, unsigned int duration_ms);
+  int (*collect_raw)(struct ssf_mems_data *data, unsigned int duration_ms,
+                     u32 samples);
 };
 
 /* 当前型号的配置含义；上层只使用规范化后的特征单位和配置编号。 */
@@ -19,6 +20,7 @@ struct ssf_mems_sensor_profile {
   enum ssf_mems_baudrate default_work_baudrate; /* 驱动首次连接的目标编码。 */
   u16 default_sampling_rate_index;
   u16 raw_max_sampling_rate_index; /* 型号支持的定长采样率上限。 */
+  u32 raw_batch_max_samples; /* 驱动开放的批次长度上限，按 1024 的二次幂选择。 */
   const unsigned int *raw_min_baudrates; /* 可选：各采样率所需最低线速；NULL 不增加线速约束。 */
   size_t raw_min_baudrate_count;
   u32 raw_accel_scale_nano; /* 原始计数换算为 m/s² 的纳米比例。 */
@@ -42,6 +44,9 @@ struct ssf_mems_sensor {
 };
 extern const struct ssf_mems_sensor ssf_mems_xyzs;
 extern const struct ssf_mems_sensor ssf_mems_xyz;
+
+bool ssf_mems_sensor_raw_samples_valid(const struct ssf_mems_sensor *sensor,
+                                      u32 samples);
 
 const struct ssf_reg_desc *ssf_mems_sensor_find_reg(
     const struct ssf_mems_sensor *sensor, u16 display_reg);

@@ -398,8 +398,8 @@ static int xyz_read_features(struct ssf_mems_data *data,
   return ssf_mems_sensor_read_features(data, timeout_ms);
 }
 static int xyz_collect_raw(struct ssf_mems_data *data,
-                              unsigned int duration_ms) {
-  return ssf_mems_raw_collect_finite(data, duration_ms, 1024);
+                              unsigned int duration_ms, u32 samples) {
+  return ssf_mems_raw_collect_finite(data, duration_ms, samples);
 }
 static const struct ssf_mems_sensor_ops xyz_ops = {
   .read_features = xyz_read_features,
@@ -426,6 +426,7 @@ const struct ssf_mems_sensor ssf_mems_xyz = {
     .default_work_baudrate = SSF_MEMS_BAUDRATE_128000,
     .default_sampling_rate_index = 3, /* 1333.35 Hz。 */
     .raw_max_sampling_rate_index = 9, /* 手册允许索引 0..9。 */
+    .raw_batch_max_samples = 1024, /* XYZ 暂保持已验证的长度。 */
     .raw_min_baudrates = xyz_raw_min_baudrates,
     .raw_min_baudrate_count = ARRAY_SIZE(xyz_raw_min_baudrates),
     .raw_accel_scale_nano = 4788403, /* ±16 g，转换为 m/s²。 */

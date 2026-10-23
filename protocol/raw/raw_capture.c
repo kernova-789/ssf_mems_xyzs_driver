@@ -138,7 +138,7 @@ int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data) {
   return ret;
 }
 
-/* 按型号提供的长度编码配置 1024 组 XYZ。
+/* 按型号提供的长度编码配置一批 XYZ。
  * 返回：0 成功，负数为表项、布局、通信或读回错误。
  * 只写长度高低字，并检查地址相邻。
  */
@@ -220,7 +220,7 @@ static void ssf_mems_raw_begin_batch(struct ssf_mems_data *data) {
   mutex_unlock(&data->modbus_rx.parse_lock);
 }
 
-/* 在指定窗口内逐批采集 1024 组 XYZ。
+/* 在指定窗口内逐批采集指定长度的 XYZ。
  * 返回：0 完成，负数为配置、通信、数据完整性或 IIO 错误。
  * 调用者持采集锁；全程独占总线，窗口到期仍收完在途批次。
  */
@@ -228,7 +228,10 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
                                  unsigned int duration_ms, u32 length) {
   struct ssf_mems_raw_state *raw;
   unsigned long window_until, started;
-  unsigned int batch_ms;
+  unsigned int batch_ms, first_ms, hz = 0;
+  u32 samples = length == 0 ? SSF_MEMS_RAW_BATCH_SAMPLES : length;
+  u32 expected_packets;
+  const char *frequency;
   u16 sampling_index;
   int ret, finish_ret;
   long waited;
@@ -237,6 +240,9 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
     return -EINVAL;
   if (data->protocol.parity != SSF_MEMS_PARITY_NONE)
     return -EOPNOTSUPP;
+  if (!ssf_mems_sensor_raw_samples_valid(data->sensor, samples))
+    return -EINVAL;
+  expected_packets = samples / SSF_MEMS_RAW_SAMPLES_PER_PACKET;
   raw = &data->raw;
   mutex_lock(&data->protocol.bus_lock);
   if (data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
@@ -274,6 +280,20 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
     ret = -EOPNOTSUPP;
     goto out;
   }
+  /* 取 Hz 的整数部分，向保守方向估计设备采样耗时，无浮点运算。 */
+  frequency = data->sensor->profile.sampling_frequencies[sampling_index];
+  while (*frequency >= '0' && *frequency <= '9') {
+    if (hz > 1000000U) {
+      ret = -EINVAL;
+      goto out;
+    }
+    hz = hz * 10U + *frequency++ - '0';
+  }
+  if (hz == 0) {
+    ret = -EINVAL;
+    goto out;
+  }
+  first_ms = SSF_MEMS_RAW_START_TIMEOUT_MS + DIV_ROUND_UP(samples * 1000U, hz);
   ret = ssf_mems_protocol_raw_length(data, length);
   if (ret != 0)
     goto out;
@@ -282,10 +302,11 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
     goto out;
   }
   ssf_mems_protocol_invalidate_features(data);
+  WRITE_ONCE(raw->batch_samples, samples);
   ssf_mems_raw_reset_window(data, sampling_index);
-  batch_ms = SSF_MEMS_RAW_START_TIMEOUT_MS + 2000U +
+  batch_ms = first_ms + 2000U +
       ssf_mems_serial_wire_ms(data,
-                              SSF_MEMS_RAW_BATCH_PACKETS * SSF_MEMS_RAW_PACKET_BYTES);
+                              expected_packets * SSF_MEMS_RAW_PACKET_BYTES);
   window_until = jiffies + msecs_to_jiffies(duration_ms);
   do {
     ssf_mems_raw_begin_batch(data);
@@ -304,7 +325,7 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
       waited = wait_event_interruptible_timeout(
           raw->waitq, READ_ONCE(raw->batch_packets) != 0 ||
                           ssf_mems_protocol_raw_stopping(data) == true,
-          msecs_to_jiffies(SSF_MEMS_RAW_START_TIMEOUT_MS));
+          msecs_to_jiffies(first_ms));
       WRITE_ONCE(raw->start_wait_ms, jiffies_to_msecs(jiffies - started));
       if (waited <= 0)
         ret = waited < 0 ? (int)waited : -ETIMEDOUT;
@@ -325,7 +346,7 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
     finish_ret = ssf_mems_raw_finish_locked(data);
     if (finish_ret != 0)
       ret = finish_ret;
-    if (ret == 0 && (raw->batch_packets != SSF_MEMS_RAW_BATCH_PACKETS ||
+    if (ret == 0 && (raw->batch_packets != expected_packets ||
                     raw->discontinuities != 0 || raw->crc_errors != 0 ||
                     raw->drain_discontinuities != 0 || raw->drain_crc_errors != 0 ||
                     raw->ignored_bytes != 0))

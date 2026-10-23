@@ -149,10 +149,15 @@ static bool ssf_mems_modbus_reg_valid(const struct ssf_reg_desc *reg) {
           (field->width == sizeof(u8) && reg->value_mask <= 0xffU));
 }
 
-/* 检查型号表的编码、布局和名称是否有效。
- * 返回：0 有效，-EINVAL 无效；bad_name 指向出错配置或表项名称。
- * 允许稀疏寄存器，缺少业务表项仍由调用该业务时报告。
- */
+/* 检查长度是否在当前型号开放的二次幂批次范围内。 */
+bool ssf_mems_sensor_raw_samples_valid(const struct ssf_mems_sensor *sensor,
+                                      u32 samples) {
+  return sensor != NULL && samples >= 1024 && samples <= 32768 &&
+         samples <= sensor->profile.raw_batch_max_samples &&
+         (samples & (samples - 1U)) == 0;
+}
+
+/* 检查型号表的编码、布局和名称；bad_name 返回出错项。允许稀疏表。 */
 int ssf_mems_sensor_validate(const struct ssf_mems_sensor *sensor, const char **bad_name) {
   const char *bad = "sensor_profile";
   size_t i, j;
@@ -161,7 +166,8 @@ int ssf_mems_sensor_validate(const struct ssf_mems_sensor *sensor, const char **
       sensor->feature_size == 0 ||
       sensor->feature_size > sizeof(struct ssf_mems_sensor_data) ||
       sensor->ops == NULL || sensor->ops->read_features == NULL ||
-      sensor->ops->collect_raw == NULL || !ssf_mems_modbus_profile_valid(sensor))
+      sensor->ops->collect_raw == NULL || !ssf_mems_modbus_profile_valid(sensor) ||
+      !ssf_mems_sensor_raw_samples_valid(sensor, sensor->profile.raw_batch_max_samples))
     goto invalid;
   for (i = 0; i < sensor->reg_count; i++) {
     const struct ssf_reg_desc *reg = &sensor->regs[i];

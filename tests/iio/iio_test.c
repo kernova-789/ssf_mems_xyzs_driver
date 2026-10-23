@@ -36,6 +36,7 @@ static enum ssf_mems_sensor_setting last_setting;
 static struct ssf_mems_acquisition_config acquisition_config; /* 模拟采集层配置。 */
 static int control_error; /* 模拟配置层关闭或不支持的错误。 */
 static unsigned int control_writes; /* 检查非法 sysfs 输入不会进入配置层。 */
+static unsigned int raw_capture_calls; /* 每次显式触发只调用一次采集层。 */
 static enum ssf_mems_poll_setting last_poll_setting;
 static unsigned int last_poll_value;
 static unsigned int firmware_updates; /* 检查升级属性仅转交合法文件名。 */
@@ -397,6 +398,20 @@ int ssf_mems_acquisition_set_duration(struct ssf_mems_data *d,
     acquisition_config.feature_duration_ms = duration;
   return 0;
 }
+int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *d, u32 samples) {
+  if (!ssf_mems_sensor_raw_samples_valid(d->sensor, samples)) return -EINVAL;
+  acquisition_config.raw_batch_samples = samples;
+  return control_error;
+}
+int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *d, bool manual) {
+  acquisition_config.raw_manual = manual;
+  return control_error;
+}
+int ssf_mems_acquisition_capture_window(struct ssf_mems_data *d) {
+  assert(d == &sensor);
+  raw_capture_calls++;
+  return control_error;
+}
 /* 记录 IIO 分派结果；范围和上下限由真实 acquisition 用例验证。 */
 int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_data *d,
                                           enum ssf_mems_poll_setting setting,
@@ -642,6 +657,41 @@ static void test_firmware_attributes(void) {
   indio.private = NULL;
 }
 
+static void test_raw_control_attributes(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *samples = &iio_dev_attr_sensor_raw_batch_samples.dev_attr;
+  struct device_attribute *manual = &iio_dev_attr_sensor_raw_manual.dev_attr;
+  struct device_attribute *capture = &iio_dev_attr_sensor_raw_capture.dev_attr;
+  struct device_attribute *available = &iio_dev_attr_sensor_raw_batch_samples_available.dev_attr;
+  unsigned int before = raw_capture_calls;
+  char buf[4096];
+  indio.private = &state;
+  control_error = 0;
+  assert(available->show(&indio.dev, available, buf) > 0);
+  assert(!strcmp(buf, "1024 2048 4096 8192 16384 32768\n"));
+  assert(samples->store(&indio.dev, samples, "2048", 4) == 4);
+  assert(samples->show(&indio.dev, samples, buf) == 5 && !strcmp(buf, "2048\n"));
+  assert(samples->store(&indio.dev, samples, "1000", 4) == -EINVAL);
+  assert(manual->store(&indio.dev, manual, "1", 1) == 1);
+  assert(manual->show(&indio.dev, manual, buf) == 2 && !strcmp(buf, "1\n"));
+  assert(manual->store(&indio.dev, manual, "2", 1) == -EINVAL);
+  assert(capture->show == NULL);
+  assert(capture->store(&indio.dev, capture, "0", 1) == -EINVAL);
+  assert(raw_capture_calls == before);
+  assert(capture->store(&indio.dev, capture, "1", 1) == 1);
+  before = raw_capture_calls;
+  /* 已有采集副作用的命令不能向 syscall 层返回可自动重启的错误码。 */
+  control_error = -ERESTARTSYS;
+  assert(capture->store(&indio.dev, capture, "1", 1) == -EINTR);
+  assert(raw_capture_calls == before + 1);
+  control_error = -EINTR;
+  assert(capture->store(&indio.dev, capture, "1", 1) == -EINTR);
+  control_error = -ENODATA;
+  assert(capture->store(&indio.dev, capture, "1", 1) == -ENODATA);
+  control_error = 0;
+  indio.private = NULL;
+}
+
 static void test_raw_status_attributes(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   ssf_mems_iio_setup_features(&state);
@@ -820,6 +870,7 @@ int main(void) {
   test_poll_controls();
   test_firmware_attributes();
   test_raw_status_attributes();
+  test_raw_control_attributes();
   struct ssf_mems_iio_state publish_state = {.data = &sensor};
   ssf_mems_iio_setup_features(&publish_state);
   indio.private = &publish_state;

@@ -14,6 +14,7 @@
  */
 void ssf_mems_raw_init(struct ssf_mems_data *data) {
   memset(&data->raw, 0, sizeof(data->raw));
+  data->raw.batch_samples = SSF_MEMS_RAW_BATCH_SAMPLES;
   init_waitqueue_head(&data->raw.waitq);
 }
 
@@ -25,8 +26,9 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_data *data) {
   struct ssf_mems_raw_state *raw = &data->raw;
   u32 sequence = get_unaligned_be32(raw->packet + SSF_MEMS_RAW_SEQUENCE_OFFSET);
   unsigned int i;
+  u32 expected_packets = raw->batch_samples / SSF_MEMS_RAW_SAMPLES_PER_PACKET;
 
-  if (sequence != raw->next_sequence || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
+  if (sequence != raw->next_sequence || sequence >= expected_packets ||
       raw->batch_done == true) {
     if (raw->publishing == true) {
       WRITE_ONCE(raw->discontinuities, raw->discontinuities + 1U);
@@ -45,7 +47,7 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_data *data) {
     size_t offset = SSF_MEMS_RAW_PAYLOAD_OFFSET + i * SSF_MEMS_RAW_SAMPLE_BYTES;
     int ret;
 
-    if (raw->publishing == false || sequence >= SSF_MEMS_RAW_BATCH_PACKETS ||
+    if (raw->publishing == false || sequence >= expected_packets ||
         raw->batch_done == true)
       break;
 
@@ -63,7 +65,7 @@ static void ssf_mems_raw_publish_packet(struct ssf_mems_data *data) {
     WRITE_ONCE(raw->packets, raw->packets + 1U);
   else
     WRITE_ONCE(raw->drain_packets, raw->drain_packets + 1U);
-  if (sequence == SSF_MEMS_RAW_BATCH_PACKETS - 1U)
+  if (expected_packets != 0 && sequence == expected_packets - 1U)
     WRITE_ONCE(raw->batch_done, true);
   wake_up_interruptible(&raw->waitq);
 }

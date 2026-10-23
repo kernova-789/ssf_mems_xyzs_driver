@@ -38,7 +38,7 @@ enum scenario {
   STOP_STARTUP, STOP_VERIFY, STOP_READ, STOP_CONFIGURE, CONFIG_FAILURE,
   RAW_RECOVERY_FAILURE, RAW_ONLY, MODE_SWITCH, RAW_ONLY_RECOVERY,
   RAW_ONLY_DROPS, SHORT_WINDOWS, OTA_BLOCKED, POLL_SWITCH,
-  SAMPLING_TARGET_RECONNECT, RAW_UNSUPPORTED, RAW_ONLY_UNSUPPORTED
+  SAMPLING_TARGET_RECONNECT, RAW_UNSUPPORTED, RAW_ONLY_UNSUPPORTED, MANUAL_RAW_IDLE
 };
 static enum scenario scenario;
 static unsigned int mode_switch_step; /* 记录运行中模式切换的测试阶段。 */
@@ -243,6 +243,9 @@ void test_acquisition_wait(unsigned long timeout) {
     CHECK(timeout == 1000 && read_count == 0 && get_count == 0);
     if (scenario == STOP_STARTUP)
       stop_requested = true;
+  } else if (scenario == MANUAL_RAW_IDLE && wait_count >= 4) {
+    CHECK(raw_captures == 0);
+    stop_requested = true;
   } else if (scenario == OTA_BLOCKED) {
     CHECK(device.acquisition.firmware_blocked == true);
     CHECK(get_count == 0 && set_count == 0 && read_count == 0 && raw_captures == 0);
@@ -1041,7 +1044,39 @@ static void test_startup_baudrate_target(void) {
   CHECK(device.acquisition.target_baudrate == SSF_MEMS_BAUDRATE_128000);
 }
 
+/* 手动窗口与自动 raw 调度隔离，长度配置和错误返回不能越过门禁。 */
+static void test_manual_raw_window(void) {
+  struct ssf_mems_acquisition_config config;
+  reset_device(MANUAL);
+  CHECK(ssf_mems_acquisition_set_raw_samples(&device, 2048) == 0);
+  CHECK(ssf_mems_acquisition_set_raw_samples(&device, 1000) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_raw_samples(&device, 65536) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_raw_manual(&device, true) == 0);
+  CHECK(ssf_mems_acquisition_get_config(&device, &config) == 0);
+  CHECK(config.raw_batch_samples == 2048 && config.raw_manual);
+  CHECK(ssf_mems_acquisition_capture_window(&device) == -EINVAL);
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_RAW) == 0);
+  CHECK(ssf_mems_acquisition_capture_window(&device) == -ENODATA);
+  device.acquisition.online = true;
+  device.acquisition.phase = SSF_MEMS_ACQ_POLL;
+  CHECK(ssf_mems_acquisition_capture_window(&device) == 0);
+  CHECK(raw_captures == 1 && device.acquisition.phase == SSF_MEMS_ACQ_POLL);
+  device.acquisition.firmware_blocked = true;
+  CHECK(ssf_mems_acquisition_capture_window(&device) == -EBUSY);
+  device.acquisition.stopping = true;
+  CHECK(ssf_mems_acquisition_capture_window(&device) == -ENODEV);
+  CHECK(ssf_mems_acquisition_set_raw_samples(&device, 1024) == -ENODEV);
+  CHECK(ssf_mems_acquisition_set_raw_manual(&device, false) == -ENODEV);
+  reset_device(MANUAL_RAW_IDLE);
+  CHECK(ssf_mems_acquisition_set_mode(&device, SSF_MEMS_ACQ_MODE_RAW) == 0);
+  CHECK(ssf_mems_acquisition_set_raw_manual(&device, true) == 0);
+  run_thread();
+  CHECK(raw_captures == 0);
+
+}
+
 int main(void) {
+  test_manual_raw_window();
   enum ssf_mems_baudrate baud;
   u16 value;
 
