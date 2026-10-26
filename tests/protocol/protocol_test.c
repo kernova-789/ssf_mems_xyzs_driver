@@ -28,6 +28,8 @@ long test_wait_timeout(unsigned long timeout) {
 static struct ssf_mems_data sensor;
 static const struct ssf_mems_sensor *test_model = &ssf_mems_xyzs;
 static struct serdev_device serial;
+static bool emulate_sound, sound_started;
+static unsigned int sound_case, sound_triggers, sound_published;
 static unsigned int checks, sends;
 static u8 last_tx[256];
 static size_t last_tx_len;
@@ -178,6 +180,14 @@ ssize_t serdev_device_write(struct serdev_device *s, const u8 *buf,
     return -EIO;
   if (forced_send_result != -1)
     return forced_send_result;
+  if (emulate_sound && buf[1] == 6 && address == 62) {
+    CHECK(size == 8 && count == 1 && sensor.sound.active);
+    sound_triggers++;
+    CHECK(ssf_mems_rx_push(s, buf, size) == (ssize_t)size);
+    data->modbus_rx.work.fn(&data->modbus_rx.work);
+    sound_started = true;
+    return size;
+  }
   if (emulate_raw_mode)
     CHECK(!((buf[1] == 3 && address == 57) || (buf[1] == 6 && address == 58)));
   if (emulate_raw_mode && buf[1] == 3 && address == 59) {
@@ -277,6 +287,8 @@ static void cleanup_sensor(void) {
 static void reset_sensor(void) {
   cleanup_sensor();
   jiffies = 0;
+  emulate_sound = sound_started = false;
+  sound_triggers = sound_published = 0;
   wait_hook = NULL;
   wait_returns_early = false;
   memset(&sensor, 0, sizeof(sensor));
@@ -509,8 +521,39 @@ static void test_nested_candidate_payload(void) {
                             ARRAY_SIZE(values), 50) == 0);
   CHECK(sends == 1 && sensor.modbus_req.status == 0);
   CHECK(memcmp(values, setting_registers, sizeof(values)) == 0);
-  CHECK(serial.dev.error_count == 1); /* 实际回复正确，失败的是数据区里的假候选。 */
+  CHECK(serial.dev.error_count == 0); /* 合法响应里的假候选不能成为错误级告警。 */
+  CHECK(sensor.modbus_rx.crc_rejected_candidates == 1);
+  CHECK(sensor.modbus_rx.crc_valid_candidates == 1);
   CHECK(sensor.modbus_req.quarantine_until == 0);
+}
+
+/* 真正损坏的应答仍被拒绝，原值不改写，并保留超时隔离和后续恢复。 */
+static void test_rejected_crc_candidate_accounting(void) {
+  const struct ssf_reg_desc *reg =
+      ssf_mems_sensor_find_reg_by_name(test_model, "baudrate");
+  u16 value = 0x5a5a;
+
+  if (reg == NULL)
+    return;
+  reset_sensor();
+  CHECK(sensor.modbus_rx.crc_rejected_candidates == 0);
+  CHECK(sensor.modbus_rx.crc_valid_candidates == 0);
+  response_mode = REPLY_BAD_CRC;
+  CHECK(ssf_mems_modbus_read_reg(&serial, reg->display_reg, &value, 50) == -ETIMEDOUT);
+  CHECK(value == 0x5a5a && sensor.modbus_req.status == -ETIMEDOUT);
+  CHECK(!sensor.modbus_req.pending && !sensor.modbus_req.busy);
+  CHECK(sensor.modbus_req.quarantine_until > jiffies);
+  CHECK(sensor.modbus_rx.crc_rejected_candidates == 1);
+  CHECK(sensor.modbus_rx.crc_valid_candidates == 0);
+  CHECK(serial.dev.error_count == 0); /* 候选本身不定性为链路错误，失败由请求结果表达。 */
+  response_mode = REPLY_NORMAL;
+  CHECK(ssf_mems_modbus_read_reg(&serial, reg->display_reg, &value, 50) == 0);
+  CHECK(value == wire_value(reg->protocol_addr));
+  CHECK(sensor.modbus_rx.crc_rejected_candidates == 1);
+  CHECK(sensor.modbus_rx.crc_valid_candidates == 1);
+  ssf_mems_modbus_receive_flush(&sensor);
+  CHECK(sensor.modbus_rx.crc_rejected_candidates == 1);
+  CHECK(sensor.modbus_rx.crc_valid_candidates == 1);
 }
 
 /* 任意多个伪帧头不能丢失最大帧，内部合法帧也不能清空未完成的外层。 */
@@ -1674,6 +1717,85 @@ static void finite_sensor(void) {
   wait_returns_early = true;
 }
 
+/* 独立构造声音响应，经生产 FIFO/解析工作项交付；损坏批次不能发布片段。 */
+static void sound_wait_hook(unsigned long timeout) {
+  unsigned int sequence, i;
+  (void)timeout;
+  if (!sound_started)
+    return;
+  sound_started = false;
+  test_wait_result = sound_case == 5 ? 0 : sound_case == 6 ? -ERESTARTSYS : 1;
+  if (sound_case == 5)
+    return;
+  for (sequence = 0; sequence < 64; sequence++) {
+    u8 packet[267] = {1, 3, 0, 0, 64};
+    if (sound_case == 2 && sequence == 5)
+      continue;
+    packet[6] = sequence;
+    if (sound_case == 3 && sequence == 5)
+      packet[6] = 4;
+    if (sound_case == 4)
+      packet[4] = 63;
+    for (i = 0; i < 64; i++) {
+      u32 value = 0x80000000U | ((sequence * 64 + i) << 8);
+      packet[9 + i * 4] = value >> 24;
+      packet[10 + i * 4] = value >> 16;
+      packet[11 + i * 4] = value >> 8;
+      packet[12 + i * 4] = value;
+    }
+    finish_crc(packet, sizeof(packet));
+    if (sound_case == 1 && sequence == 5)
+      packet[265] ^= 1;
+    for (i = 0; i < sizeof(packet); i++) {
+      CHECK(ssf_mems_rx_push(&serial, packet + i, 1) == 1);
+      sensor.modbus_rx.work.fn(&sensor.modbus_rx.work);
+    }
+  }
+  if (sound_case == 7)
+    sensor.acquisition.stopping = true;
+}
+static int sound_publish(struct ssf_mems_data *data,
+                         const struct ssf_mems_sound_sample *sample) {
+  CHECK(data == &sensor);
+  CHECK(sample->pcm == (s32)(0x80000000U | (sound_published << 8)));
+  CHECK(sample->packet_sequence == sound_published / 64);
+  CHECK(sample->sample_index == sound_published % 64);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !sensor.sound.active);
+  sound_published++;
+  return sound_case == 8 ? -ENOSPC : 0;
+}
+static void test_sound_session(void) {
+  unsigned int action;
+  if (test_model != &ssf_mems_xyzs)
+    return;
+  for (action = 0; action <= 8; action++) {
+    reset_sensor();
+    emulate_settings = emulate_sound = true;
+    sound_case = action;
+    sensor.protocol.host_baudrate = serial.baudrate = 128000;
+    sensor.sound.sample_handler = sound_publish;
+    wait_hook = sound_wait_hook;
+    wait_returns_early = false;
+    test_wait_result = 0;
+    if (action == 0) {
+      CHECK(sensor.sensor_ops->collect_sound(&sensor) == 0);
+      CHECK(sound_published == 4096 && sensor.sound.captures == 1);
+    } else if (action == 5 || action == 6 || action == 7 || action == 8) {
+      int expected = action == 5 ? -ETIMEDOUT : action == 6 ? -ERESTARTSYS :
+                     action == 7 ? -ENODEV : -ENOSPC;
+      CHECK(sensor.sensor_ops->collect_sound(&sensor) == expected);
+      CHECK(sound_published == (action == 8 ? 4096 : 0));
+    } else {
+      CHECK(sensor.sensor_ops->collect_sound(&sensor) == -EILSEQ);
+      CHECK(sound_published == 0);
+    }
+    CHECK(sound_triggers == 1 && !sensor.sound.active && !sensor.sound.running);
+    CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && reboots == 0);
+    CHECK(sensor.raw.packets == 0);
+  }
+  reset_sensor();
+}
+
 /* 回归卸载前首包迟到、只读恢复门禁及失败后可重载，无 Flash 保存。 */
 static void test_raw_recovery(void) {
   enum ssf_mems_baudrate found;
@@ -2144,6 +2266,7 @@ int main(int argc, char **argv) {
   test_receive_callback();
   test_unclaimed_frames();
   test_nested_candidate_payload();
+  test_rejected_crc_candidate_accounting();
   test_receive_window_boundaries();
   test_codecs();
   test_response_matching();
@@ -2160,6 +2283,7 @@ int main(int argc, char **argv) {
   test_raw_parser();
   test_raw_session();
   test_variable_batches();
+  test_sound_session();
   test_raw_recovery();
   test_startup_baudrate_matching();
 done:

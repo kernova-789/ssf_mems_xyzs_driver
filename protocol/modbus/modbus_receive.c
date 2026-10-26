@@ -89,6 +89,8 @@ int ssf_mems_modbus_receive_init(struct ssf_mems_data *data,
   INIT_WORK(&rx->work, ssf_mems_modbus_rx_workfn);
   INIT_DELAYED_WORK(&rx->expiry_work, ssf_mems_rx_expiry_workfn);
   rx->frame_used = 0;
+  rx->crc_rejected_candidates = 0;
+  rx->crc_valid_candidates = 0;
 
   ret = kfifo_alloc(&rx->fifo, SSF_MEMS_RX_FIFO_SIZE, GFP_KERNEL);
   if (ret != 0)
@@ -221,9 +223,14 @@ static void ssf_mems_rx_complete(struct ssf_mems_data *data,
   int ret = ssf_mems_modbus_check_crc(buf, len);
 
   if (ret != 0) {
-    dev_err_ratelimited(&data->serdev->dev, "invalid frame CRC/length: %d\n", ret);
+    /* 合法外层帧的载荷也可能形成这个候选；此处不能判定链路坏帧。
+     * 仍丢弃该候选，保留外层帧；真正没有有效应答由请求层返回超时。
+     */
+    data->modbus_rx.crc_rejected_candidates++;
+    dev_dbg(&data->serdev->dev, "discarding CRC-invalid Modbus candidate: %d\n", ret);
     return;
   }
+  data->modbus_rx.crc_valid_candidates++;
   ret = data->modbus_rx.handler(data->modbus_rx.handler_context, buf, len);
   if (ret < 0)
     dev_err(&data->serdev->dev, "frame handler failed: %d\n", ret);
@@ -277,6 +284,8 @@ static void ssf_mems_rx_process_modbus(struct ssf_mems_data *data, u8 byte) {
 static void ssf_mems_rx_process_byte(struct ssf_mems_data *data, u8 byte) {
   if (READ_ONCE(data->protocol.mode) == SSF_MEMS_LINK_OTA)
     ssf_mems_ota_receive_byte(data, byte);
+  else if (READ_ONCE(data->sound.active))
+    ssf_mems_sound_receive_byte(data, byte);
   else if (READ_ONCE(data->raw.active) == true)
     ssf_mems_raw_receive_byte(data, byte);
   else

@@ -62,7 +62,7 @@ static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_data *data) {
 /* 等待串口接收持续安静 300 ms。
  * 返回：true 已静默，false 在 1 秒内未满足条件。
  */
-static bool ssf_mems_protocol_raw_quiet(struct ssf_mems_data *data) {
+bool ssf_mems_raw_wait_quiet(struct ssf_mems_data *data) {
   unsigned long began = jiffies;
   unsigned long deadline = began + msecs_to_jiffies(1000);
   unsigned long quiet = msecs_to_jiffies(SSF_MEMS_RAW_QUIET_MS);
@@ -89,6 +89,10 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
   u16 reported;
   int ret;
 
+  if (data->protocol.mode == SSF_MEMS_LINK_SOUND ||
+      data->protocol.mode == SSF_MEMS_LINK_SOUND_RECOVERING)
+    return ssf_mems_sound_finish_locked(data);
+
   WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_RECOVERING);
   mutex_lock(&data->modbus_rx.parse_lock);
   WRITE_ONCE(raw->publishing, false);
@@ -97,7 +101,7 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
          time_before(jiffies, data->protocol.raw_start_until) == true) {
     msleep(20);
   }
-  if (ssf_mems_protocol_raw_quiet(data) == false)
+  if (ssf_mems_raw_wait_quiet(data) == false)
     return -ETIMEDOUT;
   reg = ssf_mems_sensor_find_reg_by_name(data->sensor, "baudrate");
   if (reg == NULL)

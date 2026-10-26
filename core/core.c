@@ -105,6 +105,7 @@ static int ssf_mems_probe(struct serdev_device *serdev) {
   }
 
   data->raw.sample_handler = ssf_mems_iio_publish_raw;
+  data->sound.sample_handler = ssf_mems_iio_publish_sound;
   ret = ssf_mems_acquisition_start(data);
   if (ret != 0) {
     dev_err(&serdev->dev, "failed to start sensor acquisition: %d\n", ret);

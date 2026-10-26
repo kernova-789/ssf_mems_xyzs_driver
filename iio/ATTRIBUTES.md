@@ -186,6 +186,12 @@ cat "$FEATURE/sensor_poll_interval_ms"
 
 ## 6. 链路状态与样本年龄
 
+普通 Modbus 候选统计另提供 `sensor_modbus_crc_rejected_candidates` 与
+`sensor_modbus_crc_valid_candidates` 两个只读属性，均位于特征设备，XYZ/XYZS 通用。
+它们按接收器实例累计，初始化清零、flush 保留，读取不发送串口请求。
+拒绝候选可能来自合法响应内部的数据，不能把该计数当作真实坏帧或失败事务数；
+通过候选也不保证匹配当前请求。完整语义见 [IIO 映射说明](README.md#波特率与链路状态)。
+
 以下属性位于特征设备，只读取主机状态，不发送串口请求。
 
 | 属性 | 权限 | 用途及读法 |

@@ -589,6 +589,47 @@ int ssf_mems_acquisition_capture_window(struct ssf_mems_data *data) {
   return ret;
 }
 
+/* 一次性声音采集不改变振动长度、采样率或原有调度模式。 */
+int ssf_mems_acquisition_capture_sound(struct ssf_mems_data *data) {
+  struct ssf_mems_acquisition_state *acq;
+  int ret;
+
+  if (!data || !data->sensor_ops)
+    return -EINVAL;
+  if (!data->sensor_ops->collect_sound)
+    return -EOPNOTSUPP;
+  acq = &data->acquisition;
+  ret = mutex_lock_interruptible(&acq->lock);
+  if (ret)
+    return ret;
+  if (READ_ONCE(acq->stopping)) {
+    ret = -ENODEV;
+  } else if (acq->firmware_blocked) {
+    ret = -EBUSY;
+  } else if (!acq->online || acq->phase != SSF_MEMS_ACQ_POLL) {
+    ret = -ENODATA;
+  } else {
+    acq->phase = SSF_MEMS_ACQ_RAW;
+    mutex_lock(&acq->status_lock);
+    acq->have_sample = false;
+    mutex_unlock(&acq->status_lock);
+    ret = data->sensor_ops->collect_sound(data);
+    if (READ_ONCE(data->protocol.mode) != SSF_MEMS_LINK_MODBUS) {
+      ssf_mems_acquisition_offline(data);
+      acq->phase = SSF_MEMS_ACQ_BACKOFF;
+    } else {
+      acq->phase = SSF_MEMS_ACQ_POLL;
+    }
+    acq->feature_until = jiffies + msecs_to_jiffies(acq->feature_duration_ms);
+    if (!ret)
+      ssf_mems_acquisition_policy_contact(&acq->policy, jiffies);
+    else
+      ssf_mems_acquisition_error(data, ret);
+  }
+  mutex_unlock(&acq->lock);
+  return ret;
+}
+
 /* 修改主机特征轮询配置；不截断在途原始批次，不写传感器配置。 */
 int ssf_mems_acquisition_set_poll_setting(struct ssf_mems_data *data,
                                           enum ssf_mems_poll_setting setting,
@@ -683,6 +724,7 @@ void ssf_mems_acquisition_stop(struct ssf_mems_data *data) {
   WRITE_ONCE(acq->stopping, true);
   wake_up_interruptible(&acq->waitq);
   wake_up_interruptible(&data->raw.waitq);
+  wake_up_interruptible(&data->sound.waitq);
   if (acq->thread != NULL) {
     kthread_stop(acq->thread);
     acq->thread = NULL;

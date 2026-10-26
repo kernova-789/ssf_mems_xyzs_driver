@@ -9,6 +9,7 @@
 static struct ssf_mems_data sensor;
 static struct iio_dev indio;
 static struct iio_dev raw_indio;
+static struct iio_dev sound_indio;
 static struct iio_dev *xyz_feature_dev;
 static struct ssf_mems_raw_sample raw_sample = {
     .xyz = {-2, -32768, 5399}, .packet_sequence = 0x12345678, .sample_index = 63,
@@ -42,7 +43,7 @@ static unsigned int last_poll_value;
 static unsigned int firmware_updates; /* 检查升级属性仅转交合法文件名。 */
 
 /* 只模拟资源分配和注册结果，执行生产注册/撤销流程。 */
-static struct iio_dev *allocated_devices[2];
+static struct iio_dev *allocated_devices[3];
 static size_t allocated_count;
 static unsigned int allocation_calls, buffer_calls, register_calls;
 static unsigned int live_buffers, registered_devices;
@@ -122,16 +123,16 @@ static void test_registration(void) {
   data.serdev = &serdev;
   data.sensor = &ssf_mems_xyzs;
   data.sensor_ops = ssf_mems_xyzs.ops;
-  for (scenario = 0; scenario < 7; scenario++) {
-    int expected = scenario == 0 ? 0 : scenario <= 4 ? -ENOMEM : -EIO;
+  for (scenario = 0; scenario < 10; scenario++) {
+    int expected = scenario == 0 ? 0 : scenario <= 4 || scenario == 7 || scenario == 8 ? -ENOMEM : -EIO;
 
     allocation_calls = buffer_calls = register_calls = 0;
-    fail_allocation = scenario == 1 ? 1 : scenario == 2 ? 2 : 0;
-    fail_buffer = scenario == 3 ? 1 : scenario == 4 ? 2 : 0;
-    fail_register = scenario == 5 ? 1 : scenario == 6 ? 2 : 0;
+    fail_allocation = scenario == 1 ? 1 : scenario == 2 ? 2 : scenario == 7 ? 3 : 0;
+    fail_buffer = scenario == 3 ? 1 : scenario == 4 ? 2 : scenario == 8 ? 3 : 0;
+    fail_register = scenario == 5 ? 1 : scenario == 6 ? 2 : scenario == 9 ? 3 : 0;
     assert(ssf_mems_iio_register(&data) == expected);
     if (scenario == 0) {
-      assert(registered_devices == 2 && live_buffers == 2);
+      assert(registered_devices == 3 && live_buffers == 3);
       assert(strcmp(data.indio_dev->name, "ssf_mems_xyzs") == 0);
       assert(strcmp(data.raw_indio_dev->name, "ssf_mems_xyzs_raw") == 0);
       assert(data.indio_dev->num_channels == 30);
@@ -142,11 +143,11 @@ static void test_registration(void) {
       assert(((struct ssf_mems_iio_state *)iio_priv(data.indio_dev))->data == &data);
       assert(((struct ssf_mems_iio_state *)iio_priv(data.raw_indio_dev))->data == &data);
       assert(ssf_mems_iio_register(&data) == -EBUSY);
-      assert(allocation_calls == 2);
+      assert(allocation_calls == 3);
       ssf_mems_iio_unregister(&data);
       ssf_mems_iio_unregister(&data);
     }
-    assert(data.indio_dev == NULL && data.raw_indio_dev == NULL);
+    assert(data.indio_dev == NULL && data.raw_indio_dev == NULL && data.sound_indio_dev == NULL);
     assert(registered_devices == 0 && live_buffers == 0);
     release_test_devices();
   }
@@ -190,6 +191,28 @@ int iio_push_to_buffers_with_timestamp(struct iio_dev *dev, void *scan, s64 ts) 
     }
     assert(dev->scan_bytes == offset);
     assert(memcmp(scan, expected, offset) == 0);
+    pushes++;
+    return 0;
+  }
+  if (dev == &sound_indio) {
+    for (bit = 0; bit < 3; bit++) {
+      u32 value = bit == 0 ? 0x81234500U : 63;
+      size_t width = bit == 0 ? 4 : 2;
+      if (!(*dev->active_scan_mask & BIT(bit))) continue;
+      offset = ALIGN(offset, width);
+      largest = max(largest, width);
+      memcpy(expected + offset, &value, width);
+      offset += width;
+    }
+    if (dev->scan_timestamp) {
+      offset = ALIGN(offset, 8);
+      memcpy((u8 *)scan + offset, &ts, 8);
+      memcpy(expected + offset, &ts, 8);
+      offset += 8;
+      largest = 8;
+    }
+    offset = ALIGN(offset, largest);
+    assert(offset == dev->scan_bytes && !memcmp(scan, expected, offset));
     pushes++;
     return 0;
   }
@@ -335,6 +358,57 @@ static void test_raw_buffer(void) {
   assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -ENODEV);
 }
 
+/* 声音有独立扫描 ABI；必须开启实际数据通道，失败的触发不得自动重放。 */
+static void test_sound_buffer(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct iio_dev feature = {.private = &state};
+  struct ssf_mems_sound_sample sample = {.pcm = (s32)0x81234500U,
+      .packet_sequence = 63, .sample_index = 63};
+  struct device_attribute *attr = &iio_dev_attr_sensor_sound_capture.dev_attr;
+  unsigned long mask;
+  unsigned int ts, bit, before;
+
+  sound_indio.private = &state;
+  mutex_init(&sound_indio.mlock);
+  sensor.sound_indio_dev = &sound_indio;
+  sound_indio.currentmode = INDIO_DIRECT_MODE;
+  assert(attr->store(&feature.dev, attr, "1", 1) == -ENODATA);
+  assert(ssf_mems_iio_publish_sound(&sensor, &sample) == -ENODATA);
+  sound_indio.currentmode = INDIO_BUFFER_SOFTWARE;
+  sound_indio.active_scan_mask = &mask;
+  for (mask = 1; mask < 8; mask++) {
+    size_t bytes = 0, largest = 0;
+    for (bit = 0; bit < 3; bit++) if (mask & BIT(bit)) {
+      size_t width = bit == 0 ? 4 : 2;
+      bytes = ALIGN(bytes, width) + width;
+      largest = max(largest, width);
+    }
+    bytes = ALIGN(bytes, largest);
+    for (ts = 0; ts < 2; ts++) {
+      sound_indio.scan_timestamp = ts;
+      sound_indio.scan_bytes = ts ? ALIGN(bytes, 8) + 8 : bytes;
+      assert(ssf_mems_iio_publish_sound(&sensor, &sample) == ((mask & BIT(0)) ? 0 : -EINVAL));
+    }
+  }
+  before = raw_capture_calls;
+  assert(attr->store(&feature.dev, attr, "0", 1) == -EINVAL);
+  assert(attr->store(&feature.dev, attr, "bad", 3) == -EINVAL);
+  mask = BIT(3);
+  assert(attr->store(&feature.dev, attr, "1", 1) == -ENODATA);
+  assert(raw_capture_calls == before);
+  mask = BIT(0);
+  control_error = 0;
+  assert(attr->store(&feature.dev, attr, "1", 1) == 1);
+  control_error = -ERESTARTSYS;
+  assert(attr->store(&feature.dev, attr, "1", 1) == -EINTR);
+  control_error = -EINTR;
+  assert(attr->store(&feature.dev, attr, "1", 1) == -EINTR);
+  assert(raw_capture_calls == before + 3);
+  control_error = 0;
+  sensor.sound_indio_dev = NULL;
+  pthread_mutex_destroy(&sound_indio.mlock.native);
+}
+
 /* These unrelated interfaces are linked because sanitizer metadata retains
  * static channel/sysfs descriptors. They are never exercised by this test. */
 int ssf_mems_protocol_get_features(struct serdev_device *s,
@@ -405,6 +479,11 @@ int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *d, u32 samples) {
 }
 int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *d, bool manual) {
   acquisition_config.raw_manual = manual;
+  return control_error;
+}
+int ssf_mems_acquisition_capture_sound(struct ssf_mems_data *d) {
+  assert(d == &sensor);
+  raw_capture_calls++;
   return control_error;
 }
 int ssf_mems_acquisition_capture_window(struct ssf_mems_data *d) {
@@ -692,6 +771,27 @@ static void test_raw_control_attributes(void) {
   indio.private = NULL;
 }
 
+static void test_modbus_candidate_attributes(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *rejected = &iio_dev_attr_sensor_modbus_crc_rejected_candidates.dev_attr;
+  struct device_attribute *valid = &iio_dev_attr_sensor_modbus_crc_valid_candidates.dev_attr;
+  char buf[64];
+
+  indio.private = &state;
+  mutex_init(&sensor.modbus_rx.parse_lock);
+  sensor.modbus_rx.crc_rejected_candidates = 4294967300ULL;
+  sensor.modbus_rx.crc_valid_candidates = 8589934593ULL;
+  assert(rejected->show(&indio.dev, rejected, buf) == 11);
+  assert(!strcmp(buf, "4294967300\n"));
+  assert(valid->show(&indio.dev, valid, buf) == 11);
+  assert(!strcmp(buf, "8589934593\n"));
+  assert(rejected->store == NULL && valid->store == NULL);
+  assert(sensor.modbus_rx.crc_rejected_candidates == 4294967300ULL);
+  pthread_mutex_destroy(&sensor.modbus_rx.parse_lock.native);
+  sensor.modbus_rx.crc_rejected_candidates = sensor.modbus_rx.crc_valid_candidates = 0;
+  indio.private = NULL;
+}
+
 static void test_raw_status_attributes(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   ssf_mems_iio_setup_features(&state);
@@ -870,6 +970,7 @@ int main(void) {
   test_poll_controls();
   test_firmware_attributes();
   test_raw_status_attributes();
+  test_modbus_candidate_attributes();
   test_raw_control_attributes();
   struct ssf_mems_iio_state publish_state = {.data = &sensor};
   ssf_mems_iio_setup_features(&publish_state);
@@ -897,6 +998,7 @@ int main(void) {
   test_raw_buffer();
   pthread_mutex_destroy(&raw_indio.mlock.native);
   test_xyz_iio();
+  test_sound_buffer();
   printf("PASS IIO config attributes and publisher: 100000 publications / 20000 buffer reconfigurations, %u pushes\n", pushes);
   return 0;
 }

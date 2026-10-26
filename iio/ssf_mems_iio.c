@@ -789,7 +789,58 @@ static IIO_DEVICE_ATTR(sensor_raw_batch_samples_available, 0444,
 static IIO_DEVICE_ATTR(sensor_raw_capture, 0200,
                        NULL, ssf_mems_iio_raw_capture_store, 0);
 
+/* 一次写入触发一批；禁止 SA_RESTART 自动重放有副作用的命令。 */
+static ssize_t ssf_mems_iio_sound_capture_store(struct device *dev,
+    struct device_attribute *attr, const char *buf, size_t len) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct iio_dev *sound = state->data->sound_indio_dev;
+  unsigned int value;
+  bool ready;
+  int ret = kstrtouint(buf, 10, &value);
+
+  (void)attr;
+  if (ret)
+    return ret;
+  if (value != 1)
+    return -EINVAL;
+  if (!sound)
+    return -EOPNOTSUPP;
+  mutex_lock(&sound->mlock);
+  ready = iio_buffer_enabled(sound) && sound->active_scan_mask &&
+          (*sound->active_scan_mask & BIT(0));
+  mutex_unlock(&sound->mlock);
+  if (!ready)
+    return -ENODATA;
+  ret = ssf_mems_acquisition_capture_sound(state->data);
+  if (ret == -ERESTARTSYS)
+    ret = -EINTR;
+  return ret ? ret : (ssize_t)len;
+}
+static IIO_DEVICE_ATTR(sensor_sound_capture, 0200, NULL,
+                       ssf_mems_iio_sound_capture_store, 0);
+
+/* 累计 CRC 候选统计，不发送总线请求；拒绝候选不等同于坏帧/失败事务。 */
+static ssize_t ssf_mems_iio_modbus_crc_show(struct device *dev,
+    struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_modbus_receive_state *rx = &state->data->modbus_rx;
+  u64 value;
+
+  mutex_lock(&rx->parse_lock);
+  value = to_iio_dev_attr(attr)->address == 0 ?
+              rx->crc_rejected_candidates : rx->crc_valid_candidates;
+  mutex_unlock(&rx->parse_lock);
+  return sysfs_emit(buf, "%llu\n", (unsigned long long)value);
+}
+static IIO_DEVICE_ATTR(sensor_modbus_crc_rejected_candidates, 0444,
+                       ssf_mems_iio_modbus_crc_show, NULL, 0);
+static IIO_DEVICE_ATTR(sensor_modbus_crc_valid_candidates, 0444,
+                       ssf_mems_iio_modbus_crc_show, NULL, 1);
+
 static struct attribute *ssf_mems_iio_attributes[] = {
+    &iio_dev_attr_sensor_modbus_crc_rejected_candidates.dev_attr.attr,
+    &iio_dev_attr_sensor_modbus_crc_valid_candidates.dev_attr.attr,
+    &iio_dev_attr_sensor_sound_capture.dev_attr.attr,
     &iio_dev_attr_sensor_raw_batch_samples.dev_attr.attr,
     &iio_dev_attr_sensor_raw_batch_samples_available.dev_attr.attr,
     &iio_dev_attr_sensor_raw_manual.dev_attr.attr,
@@ -827,6 +878,9 @@ static umode_t ssf_mems_iio_attr_visible(struct kobject *kobj,
 
   (void)index;
 
+  if (attr == &iio_dev_attr_sensor_sound_capture.dev_attr.attr &&
+      !sensor->ops->collect_sound)
+    return 0;
   if ((attr == &iio_dev_attr_sensor_firmware_update.dev_attr.attr ||
        attr == &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr) &&
       !sensor->supports_ota)
@@ -867,7 +921,7 @@ static const struct iio_buffer_setup_ops ssf_mems_iio_buffer_ops = {};
 static int ssf_mems_iio_push_fields(
     struct iio_dev *indio_dev, const void *sample,
     const struct ssf_mems_sensor_field_desc *fields, size_t field_count,
-    size_t max_scan_bytes, s64 timestamp_ns) {
+    size_t max_scan_bytes, s64 timestamp_ns, bool required) {
   u8 scan[SSF_MEMS_IIO_MAX_SCAN_BYTES] __aligned(sizeof(s64)) = {0};
   size_t offset = 0;
   unsigned int bit;
@@ -876,9 +930,15 @@ static int ssf_mems_iio_push_fields(
   if (indio_dev == NULL)
     return -ENODEV;
   mutex_lock(&indio_dev->mlock);
-  if (iio_buffer_enabled(indio_dev) == false)
+  if (iio_buffer_enabled(indio_dev) == false) {
+    ret = required ? -ENODATA : 0;
     goto out;
+  }
   if (indio_dev->active_scan_mask == NULL) {
+    ret = -EINVAL;
+    goto out;
+  }
+  if (required && !(*indio_dev->active_scan_mask & BIT(0))) {
     ret = -EINVAL;
     goto out;
   }
@@ -926,7 +986,7 @@ int ssf_mems_iio_publish_features(
   state = iio_priv(data->indio_dev);
   return ssf_mems_iio_push_fields(data->indio_dev, features,
                                   state->fields, state->field_count,
-                                  SSF_MEMS_IIO_MAX_SCAN_BYTES, timestamp_ns);
+                                  SSF_MEMS_IIO_MAX_SCAN_BYTES, timestamp_ns, false);
 }
 
 /* 每个实例只创建本型号有寄存器映射的通道；XYZS 的既有索引保持不变。 */
@@ -1204,10 +1264,73 @@ int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
   return ssf_mems_iio_push_fields(
       data->raw_indio_dev, sample, ssf_mems_raw_fields,
       ARRAY_SIZE(ssf_mems_raw_fields),
-      ALIGN(sizeof(*sample), sizeof(s64)) + sizeof(s64), 0);
+      ALIGN(sizeof(*sample), sizeof(s64)) + sizeof(s64), 0, false);
 }
 
-/* 注册特征和原始数据两个 IIO 设备。
+#define SOUND_FIELD(_member) { .offset = offsetof(struct ssf_mems_sound_sample, _member), \
+  .width = sizeof(((struct ssf_mems_sound_sample *)0)->_member), \
+  .scale = SSF_MEMS_FEATURE_SCALE_UNITY }
+static const struct ssf_mems_sensor_field_desc ssf_mems_sound_fields[] = {
+  SOUND_FIELD(pcm), SOUND_FIELD(packet_sequence), SOUND_FIELD(sample_index),
+};
+#undef SOUND_FIELD
+#define SOUND_CHANNEL(_channel, _name, _sign, _bits) { \
+  .type = IIO_COUNT, .indexed = 1, .channel = (_channel), .extend_name = (_name), \
+  .scan_index = (_channel), .scan_type = { .sign = (_sign), \
+  .realbits = (_bits), .storagebits = (_bits), .endianness = IIO_CPU } }
+static const struct iio_chan_spec ssf_mems_sound_channels[] = {
+  SOUND_CHANNEL(0, "sound", 's', 32),
+  SOUND_CHANNEL(1, "packet_sequence", 'u', 16),
+  SOUND_CHANNEL(2, "sample_index", 'u', 16),
+  IIO_CHAN_SOFT_TIMESTAMP(3),
+};
+#undef SOUND_CHANNEL
+
+static ssize_t ssf_mems_sound_status_show(struct device *dev,
+    struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_sound_state *s = &state->data->sound;
+  int ret;
+
+  (void)attr;
+  mutex_lock(&state->data->modbus_rx.parse_lock);
+  ret = sysfs_emit(buf, "active=%u packets=%u sequence_gaps=%u crc_errors=%u "
+      "ignored_bytes=%u buffer_drops=%u captures=%u error=%d\n",
+      READ_ONCE(s->running), s->packets, s->sequence_gaps, s->crc_errors,
+      s->ignored_bytes, READ_ONCE(s->buffer_errors), READ_ONCE(s->captures),
+      READ_ONCE(s->error));
+  mutex_unlock(&state->data->modbus_rx.parse_lock);
+  return ret;
+}
+static ssize_t ssf_mems_sound_frequency_show(struct device *dev,
+    struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  (void)attr;
+  return sysfs_emit(buf, "%u\n", state->data->sensor->sound_sampling_frequency);
+}
+static IIO_DEVICE_ATTR(sound_capture_status, 0444, ssf_mems_sound_status_show, NULL, 0);
+static IIO_DEVICE_ATTR(sampling_frequency, 0444, ssf_mems_sound_frequency_show, NULL, 0);
+static IIO_CONST_ATTR(sound_batch_samples, "4096");
+static struct attribute *ssf_mems_sound_attributes[] = {
+  &iio_dev_attr_sound_capture_status.dev_attr.attr,
+  &iio_dev_attr_sampling_frequency.dev_attr.attr,
+  &iio_const_attr_sound_batch_samples.dev_attr.attr, NULL,
+};
+static const struct attribute_group ssf_mems_sound_attribute_group = {
+  .attrs = ssf_mems_sound_attributes,
+};
+static const struct iio_info ssf_mems_sound_info = {
+  .attrs = &ssf_mems_sound_attribute_group,
+};
+int ssf_mems_iio_publish_sound(struct ssf_mems_data *data,
+                              const struct ssf_mems_sound_sample *sample) {
+  if (!data || !sample)
+    return -EINVAL;
+  return ssf_mems_iio_push_fields(data->sound_indio_dev, sample,
+      ssf_mems_sound_fields, ARRAY_SIZE(ssf_mems_sound_fields), 16, 0, true);
+}
+
+/* 注册特征、振动及型号支持的声音 IIO 设备。
  * 返回：0 全部成功，负数为初始化错误。
  * 任一设备注册失败时撤销已注册设备。
  */
@@ -1216,7 +1339,8 @@ int ssf_mems_iio_register(struct ssf_mems_data *data) {
 
   if (data == NULL || data->serdev == NULL)
     return -EINVAL;
-  if (data->indio_dev != NULL || data->raw_indio_dev != NULL)
+  if (data->indio_dev != NULL || data->raw_indio_dev != NULL ||
+      data->sound_indio_dev != NULL)
     return -EBUSY;
   ret = ssf_mems_iio_register_device(
       data, &data->indio_dev, data->sensor->name, &ssf_mems_iio_info,
@@ -1226,6 +1350,10 @@ int ssf_mems_iio_register(struct ssf_mems_data *data) {
   ret = ssf_mems_iio_register_device(
       data, &data->raw_indio_dev, data->sensor->raw_name, &ssf_mems_raw_info,
       ssf_mems_raw_channels, ARRAY_SIZE(ssf_mems_raw_channels));
+  if (ret == 0 && data->sensor_ops->collect_sound)
+    ret = ssf_mems_iio_register_device(data, &data->sound_indio_dev,
+        data->sensor->sound_name, &ssf_mems_sound_info,
+        ssf_mems_sound_channels, ARRAY_SIZE(ssf_mems_sound_channels));
   if (ret != 0)
     ssf_mems_iio_unregister(data);
   return ret;
@@ -1243,13 +1371,14 @@ static void ssf_mems_iio_unregister_device(struct iio_dev **slot) {
   *slot = NULL;
 }
 
-/* 注销两个 IIO 设备并释放缓冲区。
+/* 注销已注册的 IIO 设备并释放缓冲区。
  * 返回：无。
  * 调用前须停止所有数据生产者。
  */
 void ssf_mems_iio_unregister(struct ssf_mems_data *data) {
   if (data == NULL)
     return;
+  ssf_mems_iio_unregister_device(&data->sound_indio_dev);
   ssf_mems_iio_unregister_device(&data->raw_indio_dev);
   ssf_mems_iio_unregister_device(&data->indio_dev);
 }

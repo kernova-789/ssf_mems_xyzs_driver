@@ -5,15 +5,16 @@
 
 struct ssf_mems_sensor_data;
 struct ssf_mems_raw_sample;
+struct ssf_mems_sound_sample;
 struct ssf_mems_data;
 
-/* 注册特征和原始数据两个 IIO 设备。
+/* 注册特征、振动及型号支持的声音 IIO 设备。
  * 返回：0 全部成功，负数为初始化错误。
  * 任一设备注册失败时撤销已注册设备。
  */
 int ssf_mems_iio_register(struct ssf_mems_data *data);
 
-/* 注销两个 IIO 设备并释放缓冲区。
+/* 注销已注册的 IIO 设备并释放缓冲区。
  * 返回：无。
  * 调用前须停止所有数据生产者。
  */
@@ -33,3 +34,6 @@ int ssf_mems_iio_publish_features(
  */
 int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
                             const struct ssf_mems_raw_sample *sample);
+
+int ssf_mems_iio_publish_sound(struct ssf_mems_data *data,
+                              const struct ssf_mems_sound_sample *sample);

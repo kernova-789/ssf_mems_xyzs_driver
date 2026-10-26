@@ -237,3 +237,9 @@ After this adjustment, `CONFIG_SSF_SENSOR` controls the in-tree build.
 [定长原始采集说明](protocol/raw/RAW_CAPTURE.md)。
 
 IIO 全部属性的中文说明和操作示例见 [iio/ATTRIBUTES.md](iio/ATTRIBUTES.md)。
+
+## 4096 点原始声音
+
+XYZS 新增 `sensor_sound_capture` 一次性触发和独立 `ssf_mems_xyzs_sound` IIO buffer，
+固定 4096 点 / 16 kHz。见 [接口与采集工具](iio/SOUND_CAPTURE.md) 和
+[双路实机验证](tests/hardware/sound/TEST_REPORT_2026-10-26.md)。

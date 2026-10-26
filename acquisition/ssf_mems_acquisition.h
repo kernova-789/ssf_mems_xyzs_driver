@@ -157,6 +157,9 @@ int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *data, u32 samples
 int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *data, bool manual);
 /* 同步执行一个完整原始窗口；仅支持 raw + manual，返回前确认收尾。 */
 int ssf_mems_acquisition_capture_window(struct ssf_mems_data *data);
+/* 同步获取一批声音；与全部采集和升级串行，不改变原调度选择。 */
+int ssf_mems_acquisition_capture_sound(struct ssf_mems_data *data);
+
 /* 修改一个主机特征轮询配置项。
  * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。
  * 设置周期不写传感器参数，也不截断在途原始批次。

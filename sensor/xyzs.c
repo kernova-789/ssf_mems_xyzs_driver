@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "sensor.h"
 #include "raw/raw_capture.h"
+#include "raw/sound.h"
 
 static const char *const ssf_sampling_frequencies[] = {
     "533.34", "888.9", "1066.68", "1333.35", "2666.7",
@@ -438,6 +439,7 @@ static const struct ssf_reg_desc ssf_reg_table[] = {
         .access = SSF_REG_READ | SSF_REG_WRITE,
         .type = SSF_REG_U16,
         .read_format = SSF_RX_HOLDING_REGS,
+        .write_single = true,
         .name = "raw_sound_4096_enable",
     },
     {
@@ -587,6 +589,7 @@ static int xyzs_collect_raw(struct ssf_mems_data *data,
                                     samples == 1024 ? 0 : samples);
 }
 static const struct ssf_mems_sensor_ops xyzs_ops = {
+  .collect_sound = ssf_mems_sound_collect_finite,
   .read_features = xyzs_read_features,
   .collect_raw = xyzs_collect_raw,
 };
@@ -594,6 +597,8 @@ static const struct ssf_mems_sensor_ops xyzs_ops = {
 const struct ssf_mems_sensor ssf_mems_xyzs = {
   .name = "ssf_mems_xyzs",
   .raw_name = "ssf_mems_xyzs_raw",
+  .sound_name = "ssf_mems_xyzs_sound",
+  .sound_sampling_frequency = 16000,
   .feature_size = sizeof(struct ssf_mems_xyzs_features),
   .regs = ssf_reg_table,
   .reg_count = ARRAY_SIZE(ssf_reg_table),

@@ -4,6 +4,8 @@
 
 struct ssf_mems_data;
 
+bool ssf_mems_raw_wait_quiet(struct ssf_mems_data *data);
+
 /* 收尾原始批次并确认普通通信恢复。
  * 返回：0 已恢复，负数为静默、表项或读回错误。
  * 调用者持 bus_lock；确认失败时禁止开始新业务。

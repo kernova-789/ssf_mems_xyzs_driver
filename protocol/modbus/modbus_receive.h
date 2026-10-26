@@ -35,6 +35,9 @@ struct ssf_mems_modbus_receive_state {
   u8 frame[SSF_MEMS_MODBUS_MAX_FRAME_LEN]; /* 保留所有未完成帧头的有界窗口。 */
   size_t frame_used;                 /* 窗口内字节数。 */
   unsigned long frame_started[SSF_MEMS_MODBUS_MAX_FRAME_LEN]; /* 各字节作为帧头的创建时间。 */
+  /* parse_lock 保护；模块实例累计值，flush 不清零。候选数不等于事务数。 */
+  u64 crc_rejected_candidates;
+  u64 crc_valid_candidates;
 };
 
 /* 初始化接收队列并注册完整帧回调。

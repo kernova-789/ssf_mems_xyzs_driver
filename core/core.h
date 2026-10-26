@@ -9,6 +9,7 @@
 #include "modbus/modbus_request.h"
 #include "ssf_mems_acquisition.h"
 #include "raw/raw_stream.h"
+#include "raw/sound.h"
 #include "firmware/ota.h"
 
 struct iio_dev;
@@ -25,6 +26,8 @@ struct ssf_mems_data {
   struct ssf_mems_acquisition_state acquisition; /* 采集线程、调度和恢复状态。 */
   struct iio_dev *indio_dev; // IIO 对象的创建/释放由 iio 目录代码负责
   struct iio_dev *raw_indio_dev; /* 独立的 XYZ 原始采样 IIO 设备。 */
+  struct iio_dev *sound_indio_dev; /* 支持声音的型号才注册。 */
+  struct ssf_mems_sound_state sound;
   struct ssf_mems_raw_state raw; /* 私有定长数据的拼包和丢包统计状态。 */
   struct ssf_mems_ota_state ota; /* bin 升级的应答、进度和生命周期。 */
 };

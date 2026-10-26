@@ -43,6 +43,8 @@ MODULES = {
     "modbus_receive": "modbus/modbus_receive.c",
     "protocol": "protocol.c",
     "raw_stream": "raw/raw_stream.c",
+    "sound_stream": "raw/sound_stream.c",
+    "sound_capture": "raw/sound_capture.c",
     "ota": "firmware/ota.c",
 }
 HEADERS = (
@@ -50,21 +52,23 @@ HEADERS = (
     "modbus/modbus.h", "model/modbus_table.h", "modbus/modbus_request.h",
     "modbus/modbus_receive.h", "protocol.h", "core.h",
     "ssf_mems_acquisition.h", "acquisition_policy.h", "raw/raw_stream.h",
-    "raw/raw_capture.h", "transport/serial_transport.h", "firmware/ota.h",
+    "raw/raw_capture.h", "raw/sound.h", "transport/serial_transport.h", "firmware/ota.h",
 )
 ALLOWED_DEPENDENCIES = {
     "sensor": {"modbus_table"},
     "features": {"sensor", "modbus_request", "protocol"},
-    "xyzs": {"features", "raw_capture"},
+    "xyzs": {"features", "raw_capture", "sound_capture"},
     "xyz": {"features", "raw_capture"},
     "modbus_table": set(),
     "serial_transport": {"modbus_table"},
-    "raw_capture": {"modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
+    "raw_capture": {"sound_capture", "modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
     "modbus": {"modbus_table"},
     "modbus_request": {"modbus", "modbus_table", "modbus_receive", "serial_transport"},
-    "modbus_receive": {"modbus", "modbus_table", "raw_stream", "ota", "serial_transport"},
-    "protocol": {"modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
+    "modbus_receive": {"sound_stream", "modbus", "modbus_table", "raw_stream", "ota", "serial_transport"},
+    "protocol": {"sound_stream", "modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
     "raw_stream": {"modbus", "modbus_table"},
+    "sound_stream": {"modbus"},
+    "sound_capture": {"modbus_table", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
     "ota": {"modbus_request", "modbus_receive", "protocol", "serial_transport"},
 }
 
@@ -101,7 +105,7 @@ def configure_table(text, deleted, variant):
             # Keep wire addresses unchanged while moving the display addresses.
             # Any high-level literal address now fails, even though names are stable.
             if variant == "relocate_registers" and address in {
-                40052, 40053, 40060, 40061, 40062, 40070, 40102, 40110, 40121
+                40052, 40053, 40060, 40061, 40062, 40063, 40070, 40102, 40110, 40121
             }:
                 entry = entry.replace(f".display_reg = {address}",
                                       f".display_reg = {address + 1000}")
@@ -175,7 +179,7 @@ def main():
             subprocess.run(flags + ["-c", str(TEST_DIR / "protocol_test.c"), "-o", str(harness)], check=True)
             subprocess.run(flags + [str(harness)] + [str(obj) for obj in objects.values()] +
                            ["-o", str(executable)], check=True)
-            subprocess.run([str(executable), name], check=True)
+            subprocess.run([str(executable), name], check=True, timeout=30)
     print("All independent-compilation, dependency-boundary, table-removal and protocol cases passed.")
 
 

@@ -1075,8 +1075,33 @@ static void test_manual_raw_window(void) {
 
 }
 
+static void test_sound_gate(void) {
+  reset_device(MANUAL);
+  CHECK(ssf_mems_acquisition_capture_sound(NULL) == -EINVAL);
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == -ENODATA);
+  device.acquisition.online = true;
+  device.acquisition.phase = SSF_MEMS_ACQ_POLL;
+  device.protocol.mode = SSF_MEMS_LINK_MODBUS;
+  enum ssf_mems_acquisition_mode original_mode = device.acquisition.mode;
+  unsigned int original_raw_captures = raw_captures;
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == 0);
+  CHECK(raw_captures == original_raw_captures + 1 && device.acquisition.mode == original_mode);
+  CHECK(device.acquisition.raw_batch_samples == 1024);
+  setting_error = -ETIMEDOUT;
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == -ETIMEDOUT);
+  device.acquisition.firmware_blocked = true;
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == -EBUSY);
+  device.acquisition.stopping = true;
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == -ENODEV);
+  struct ssf_mems_sensor_ops unsupported = *device.sensor_ops;
+  unsupported.collect_sound = NULL;
+  device.sensor_ops = &unsupported;
+  CHECK(ssf_mems_acquisition_capture_sound(&device) == -EOPNOTSUPP);
+}
+
 int main(void) {
   test_manual_raw_window();
+  test_sound_gate();
   enum ssf_mems_baudrate baud;
   u16 value;
 
@@ -1150,4 +1175,11 @@ int main(void) {
   CHECK(get_count == 0 && set_count == 0 && read_count == 0 && raw_captures == 0);
   printf("PASS acquisition policy and lifecycle: %u checks\n", checks);
   return 0;
+}
+
+int ssf_mems_sound_collect_finite(struct ssf_mems_data *data) {
+  CHECK(data == &device && data->acquisition.phase == SSF_MEMS_ACQ_RAW);
+  CHECK(data->sensor == &ssf_mems_xyzs);
+  raw_captures++;
+  return setting_error;
 }

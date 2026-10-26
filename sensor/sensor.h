@@ -5,6 +5,7 @@
 
 struct ssf_mems_data;
 struct ssf_mems_sensor_ops {
+  int (*collect_sound)(struct ssf_mems_data *data); /* 可选：单批 4096 点。 */
   int (*read_features)(struct ssf_mems_data *data, unsigned int timeout_ms);
   int (*collect_raw)(struct ssf_mems_data *data, unsigned int duration_ms,
                      u32 samples);
@@ -33,6 +34,8 @@ struct ssf_mems_sensor_profile {
 struct ssf_mems_sensor {
   const char *name;
   const char *raw_name;
+  const char *sound_name;
+  u32 sound_sampling_frequency; /* Hz，独立于振动采样率；无能力时为 0。 */
   size_t feature_size; /* 对应 union 成员的有效大小。 */
   const struct ssf_reg_desc *regs;
   size_t reg_count;

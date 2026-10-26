@@ -11,6 +11,7 @@ ssf_mems-y += protocol/modbus/modbus_request.o
 ssf_mems-y += protocol/protocol.o
 ssf_mems-y += protocol/raw/raw_stream.o
 ssf_mems-y += protocol/raw/raw_capture.o
+ssf_mems-y += protocol/raw/sound_stream.o protocol/raw/sound_capture.o
 ssf_mems-y += protocol/firmware/ota.o
 ssf_mems-y += iio/ssf_mems_iio.o
 ssf_mems-y += acquisition/ssf_mems_acquisition.o
