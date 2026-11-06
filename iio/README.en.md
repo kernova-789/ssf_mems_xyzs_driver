@@ -63,63 +63,41 @@ update. Sample age returns `-ENODATA` before the first successful sample.
 A reachable device returning Modbus exceptions can remain online while its
 feature cache is invalid, so link status and sample age need separate checks.
 
-## Changing acquisition policy at runtime
+## Runtime acquisition controls
 
-The following host scheduling attributes reside on the `ssf_mems_xyzs` feature
-device and do not change the scan record layout:
+The feature device exposes `sensor_acquisition_mode`: `feature`, `raw`, `sound`
+(XYZS only), or `alternating`. The available list reflects model capabilities.
+`sensor_feature_duration_ms`, `sensor_raw_duration_ms` and `sensor_sound_duration_ms`
+accept 100..60000 ms, defaulting to 5000 ms. Sound controls are hidden on XYZ.
 
-| Attribute | Values |
-| --- | --- |
-| `sensor_acquisition_mode` (read/write) | `raw`, `feature`, `alternating` |
-| `sensor_acquisition_mode_available` (read-only) | The three supported mode names |
-| `sensor_raw_duration_ms` (read/write) | Raw window, decimal 100..60000 ms |
-| `sensor_feature_duration_ms` (read/write) | Feature window, decimal 100..60000 ms |
+Alternating visits feature → raw → sound, filtered by `sensor_alternating_feature_en`,
+`sensor_alternating_raw_en` and `sensor_alternating_sound_en` (0/1). Supported routes
+are enabled by default; disabling the last selected route returns EINVAL.
+Automatic raw/sound acquisition also requires the corresponding data buffer to be
+enabled, with actual data channels selected. Opening a character device does not
+enable its buffer. Unavailable routes are skipped; with none runnable, the driver
+sleeps and checks again every 1000 ms. Feature polling continues to maintain the
+sysfs cache even without a feature buffer.
 
-`raw` repeatedly collects complete finite batches (1024 samples by default) without
-polling features. It still reads required configuration and confirms communication
-after each batch, so the waveform is not continuous. `feature` continuously polls
-features without triggering raw batches. `alternating` starts with a feature
-window, then alternates between feature and raw windows. At the raw window
-deadline, it finishes the batch in flight rather than truncating data. Feature
-polling defaults to a fixed 1000 ms period and also supports the settings below.
+Host configuration reads and writes take only the short status mutex. The worker
+copies configuration and consumes change flags atomically at complete batch
+boundaries. Mode, duration and route changes start a new window at the first runnable
+route; same-value writes do not restart it. Batch length and poll-period edits do not
+restart a route window. Multiple writes are independent, not one atomic transaction.
+Manual calls enqueue bounded requests and wait synchronously; the worker executes every capture.
+Sensor configuration still serializes through the acquisition mutex.
 
-The default is alternating mode with 5000 ms raw and feature windows. The two
-device-tree durations still supply the initial values. The legacy
-`sange-cbm,raw-duration-ms=0` selects feature-only mode, but the raw window reads
-back as 5000 ms for later mode changes. Runtime duration writes reject 0; select
-a mode to disable a type of acquisition. With parity enabled, the default is
-feature-only mode, and selecting a mode that includes raw acquisition returns
-`-EOPNOTSUPP` because the current private format supports no parity only.
+Protocol callbacks execute one complete vibration/sound batch including read-only
+recovery; the acquisition layer alone owns time windows and repetition. In-flight
+batches finish before switching routes. Manual `sensor_sound_capture=1` can run at
+any ready phase, including raw, without changing mode or the window deadline.
+Automatic sound plus a manual request produces an extra batch. Sound remains a
+4096-point finite capture, not gapless audio.
 
-Run as root and replace X with the device number whose `name` is `ssf_mems_xyzs`:
-
-```sh
-IIO=/sys/bus/iio/devices/iio:deviceX
-cat "$IIO/sensor_acquisition_mode_available"
-echo raw > "$IIO/sensor_acquisition_mode"          # Repeated finite raw batches
-echo feature > "$IIO/sensor_acquisition_mode"      # Continuous feature polling
-echo 2000 > "$IIO/sensor_raw_duration_ms"
-echo 3000 > "$IIO/sensor_feature_duration_ms"
-echo alternating > "$IIO/sensor_acquisition_mode"  # About 2 s raw / 3 s features
-```
-
-These attributes read or write host state without saving sensor configuration,
-restarting the sensor, or changing baud rate or sampling frequency. Reads use a
-short status lock and do not wait for serial transactions. Writes share
-`acquisition.lock` with acquisition and may wait for the current raw window
-(configured up to 60 s, plus the batch in flight and recovery) to finish, then
-wake the scheduler. A mode or window change restarts alternating scheduling
-from a new feature window; writing the same value does not reset it. The two
-windows update independently, so multiple writes are not an atomic transaction.
-
-Raw-only mode no longer provides a valid feature cache. The feature buffer may
-still contain records from before the switch; use timestamps to identify them.
-Acquisition modes do not automatically enable IIO buffers; the application must
-configure and consume the appropriate buffer. Settings can be saved in driver
-memory while offline and survive reconnection, but are lost on driver unload.
-The next load uses the device tree and defaults again. These controls have only
-completed offline regression and target-board kernel compilation; hardware
-validation remains pending.
+Legacy DT raw-duration-ms=0 and parity defaults remain feature-only. Reconnection
+retains host settings; unbinding resets them. This refactor has host regression and
+target-kernel cross-build coverage only, without new physical-board acceptance.
+See [attribute ABI](ATTRIBUTES.md) and [sound capture](SOUND_CAPTURE.md).
 
 ## Feature polling period
 
@@ -169,8 +147,7 @@ margin; it does not clear unfinished statistics. Alternating acquisition retains
 the learned period. Identical data does not cause periodic probes to speed
 polling up. Changing a parameter for the inactive mode does not interrupt polling.
 
-Writes share the acquisition mutex and may wait for the raw window in flight
-to finish. Changes to the active mode's parameters wake the scheduler without
+Host polling writes use only the short status mutex. Changes to the active mode's parameters wake the scheduler without
 restarting the feature window. Settings survive offline periods and reconnection
 but not driver unload. These operations do not send sensor configuration commands.
 The current period is a scheduling target: if a read takes longer, the driver
@@ -257,7 +234,7 @@ and reading examples.
 A successfully configured sampling rate remains the reconnection target during
 the current driver session; unload restores the model-table default. Reads of
 host mode, window, and polling settings use a short lock and do not wait for a
-raw window or firmware update; writes remain serialized. Feature fields and
+raw window or firmware update; host configuration writes also use only that short lock. Feature fields and
 units come from `sensor/sensor_fields.h`. Both devices share buffer packing and
 registration helpers.
 
@@ -268,3 +245,24 @@ registration helpers.
 cycle lengths automatically. See [training capture](../tests/training/README.md)
 and [attribute definitions](DEVICE_ATTRIBUTES.md) (Chinese) for the userspace schedule
 and synchronous manual-window interface. New lengths still require hardware validation.
+
+## Applied configuration and manual requests
+
+`sensor_acquisition_status` returns one short-lock snapshot with connection state,
+actual route, busy/manual flags, idle reason, requested/applied modes, and
+`config_version` / `applied_config_version`. Different versions mean configuration
+is pending; equal versions do not promise a fresh sample. Before first application,
+the applied mode is `none`. Host polling changes are applied at worker boundaries too.
+
+One manual request per route is allowed, including the running request; duplicates
+return EBUSY. The worker interleaves sound between batches of an explicit raw window.
+That window retains its submitted configuration and wall-clock deadline; new host
+configuration is staged until it completes. Signals cancel queued requests or wait
+for safe completion of an in-flight batch before returning EINTR. Baud discovery,
+baud changes, sensor-setting writes and firmware updates return EBUSY while a manual
+capture is pending. Shutdown and failed recovery complete waiting callers.
+
+Raw and sound publication requires actual data channels. Each batch snapshots the
+IIO buffer generation: closing or restarting the buffer invalidates the capture,
+even between publication calls. Delivery errors fail the batch without being
+misclassified as a link outage. Feature cache publication remains optional.

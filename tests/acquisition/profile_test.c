@@ -38,3 +38,13 @@ int main(void) {
   puts("PASS per-instance model targets and XYZ adaptive field comparison");
   return 0;
 }
+
+bool ssf_mems_iio_raw_enabled(struct ssf_mems_data *data) { (void)data; return false; }
+bool ssf_mems_iio_sound_enabled(struct ssf_mems_data *data) { (void)data; return false; }
+
+int ssf_mems_iio_begin_raw(struct ssf_mems_data *data) {
+  return ssf_mems_iio_raw_enabled(data) ? 0 : -ENODATA;
+}
+int ssf_mems_iio_begin_sound(struct ssf_mems_data *data) {
+  return ssf_mems_iio_sound_enabled(data) ? 0 : -ENODATA;
+}

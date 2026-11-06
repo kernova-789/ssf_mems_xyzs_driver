@@ -49,7 +49,8 @@ int ssf_mems_acquisition_update_firmware(struct ssf_mems_data *data,
     ret = -ENODEV;
     goto unlock_failed;
   }
-  if (data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
+  if (ssf_mems_acquisition_manual_pending(data) ||
+      data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
     ret = -EBUSY;
     goto unlock_failed;
   }

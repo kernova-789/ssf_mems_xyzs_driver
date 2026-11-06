@@ -7,8 +7,8 @@ struct ssf_mems_data;
 struct ssf_mems_sensor_ops {
   int (*collect_sound)(struct ssf_mems_data *data); /* 可选：单批 4096 点。 */
   int (*read_features)(struct ssf_mems_data *data, unsigned int timeout_ms);
-  int (*collect_raw)(struct ssf_mems_data *data, unsigned int duration_ms,
-                     u32 samples);
+  /* 一次完整振动批事务；reset_stats 开始新的观测统计区间。 */
+  int (*collect_raw)(struct ssf_mems_data *data, u32 samples, bool reset_stats);
 };
 
 /* 当前型号的配置含义；上层只使用规范化后的特征单位和配置编号。 */

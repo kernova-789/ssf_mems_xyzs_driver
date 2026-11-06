@@ -19,6 +19,7 @@ def main():
                           ROOT / "sensor", ROOT / "iio", ROOT / "core", ROOT / "protocol", ROOT / "acquisition"):
             flags += ["-I" + str(directory)]
         subprocess.run(flags + [str(TEST_DIR / "iio_test.c"),
+                               str(ROOT / "acquisition/acquisition_routes.c"),
                                str(ROOT / "sensor/sensor.c"), str(ROOT / "sensor/xyzs.c"),
                                str(ROOT / "sensor/xyz.c"), str(ROOT / "tests/protocol/model_ops_stub.c"),
                                str(ROOT / "protocol/firmware/ota.c"),

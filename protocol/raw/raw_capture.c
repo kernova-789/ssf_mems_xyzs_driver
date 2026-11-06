@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "raw/raw_capture.h"
+#include "raw/capture_session.h"
 #include "transport/serial_transport.h"
 
 #include "core.h"
@@ -59,26 +60,6 @@ static bool ssf_mems_protocol_raw_stopping(struct ssf_mems_data *data) {
          READ_ONCE(data->modbus_req.shutting_down) == true;
 }
 
-/* 等待串口接收持续安静 300 ms。
- * 返回：true 已静默，false 在 1 秒内未满足条件。
- */
-bool ssf_mems_raw_wait_quiet(struct ssf_mems_data *data) {
-  unsigned long began = jiffies;
-  unsigned long deadline = began + msecs_to_jiffies(1000);
-  unsigned long quiet = msecs_to_jiffies(SSF_MEMS_RAW_QUIET_MS);
-
-  do {
-    unsigned long last = ssf_mems_modbus_receive_last_activity(data);
-
-    if (time_before(last, began) == true)
-      last = began;
-    if (time_after_eq(jiffies, last + quiet) == true)
-      return true;
-    msleep(20);
-  } while (time_before(jiffies, deadline) == true);
-  return false;
-}
-
 /* 收尾原始批次并确认普通通信恢复。
  * 返回：0 已恢复，负数为静默、表项或读回错误。
  * 等待在途批次自然结束，确认失败时禁止开始新业务。
@@ -89,10 +70,6 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
   u16 reported;
   int ret;
 
-  if (data->protocol.mode == SSF_MEMS_LINK_SOUND ||
-      data->protocol.mode == SSF_MEMS_LINK_SOUND_RECOVERING)
-    return ssf_mems_sound_finish_locked(data);
-
   WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_RECOVERING);
   mutex_lock(&data->modbus_rx.parse_lock);
   WRITE_ONCE(raw->publishing, false);
@@ -101,7 +78,7 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
          time_before(jiffies, data->protocol.raw_start_until) == true) {
     msleep(20);
   }
-  if (ssf_mems_raw_wait_quiet(data) == false)
+  if (ssf_mems_capture_wait_quiet(data) == false)
     return -ETIMEDOUT;
   reg = ssf_mems_sensor_find_reg_by_name(data->sensor, "baudrate");
   if (reg == NULL)
@@ -123,22 +100,6 @@ int ssf_mems_raw_finish_locked(struct ssf_mems_data *data) {
                          "finite batch completion unconfirmed: %d; read-only recovery, no stop/reset\n",
                          ret);
   }
-  return ret;
-}
-
-/* 恢复尚未确认结束的原始批次。
- * 返回：0 已恢复或无需恢复，负数为参数或收尾错误。
- * 接收模块须仍可用，只读确认，不写 Flash。
- */
-int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data) {
-  int ret = 0;
-
-  if (data == NULL || data->serdev == NULL)
-    return -EINVAL;
-  mutex_lock(&data->protocol.bus_lock);
-  if (data->protocol.mode != SSF_MEMS_LINK_MODBUS)
-    ret = ssf_mems_raw_finish_locked(data);
-  mutex_unlock(&data->protocol.bus_lock);
   return ret;
 }
 
@@ -224,23 +185,24 @@ static void ssf_mems_raw_begin_batch(struct ssf_mems_data *data) {
   mutex_unlock(&data->modbus_rx.parse_lock);
 }
 
-/* 在指定窗口内逐批采集指定长度的 XYZ。
+/* 采集一批指定长度的 XYZ；时间窗口由采集模块管理。
  * 返回：0 完成，负数为配置、通信、数据完整性或 IIO 错误。
- * 调用者持采集锁；全程独占总线，窗口到期仍收完在途批次。
+ * 调用者持采集锁；全程独占总线，返回前确认本批收尾。
  */
-int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
-                                 unsigned int duration_ms, u32 length) {
+int ssf_mems_raw_collect_batch(struct ssf_mems_data *data,
+                                 u32 length, bool reset_stats) {
   struct ssf_mems_raw_state *raw;
-  unsigned long window_until, started;
+  unsigned long started;
   unsigned int batch_ms, first_ms, hz = 0;
   u32 samples = length == 0 ? SSF_MEMS_RAW_BATCH_SAMPLES : length;
   u32 expected_packets;
+  u32 gaps, crc_errors, drain_gaps, drain_errors, ignored, buffer_errors;
   const char *frequency;
   u16 sampling_index;
   int ret, finish_ret;
   long waited;
 
-  if (data == NULL || data->serdev == NULL || duration_ms == 0)
+  if (data == NULL || data->serdev == NULL)
     return -EINVAL;
   if (data->protocol.parity != SSF_MEMS_PARITY_NONE)
     return -EOPNOTSUPP;
@@ -250,7 +212,7 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
   raw = &data->raw;
   mutex_lock(&data->protocol.bus_lock);
   if (data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
-    ret = ssf_mems_raw_finish_locked(data);
+    ret = ssf_mems_capture_finish_locked(data);
     if (ret != 0)
       goto out;
   }
@@ -307,63 +269,68 @@ int ssf_mems_raw_collect_finite(struct ssf_mems_data *data,
   }
   ssf_mems_protocol_invalidate_features(data);
   WRITE_ONCE(raw->batch_samples, samples);
-  ssf_mems_raw_reset_window(data, sampling_index);
+  if (reset_stats)
+    ssf_mems_raw_reset_window(data, sampling_index);
+  WRITE_ONCE(raw->sampling_rate_index, sampling_index);
+  /* 窗口统计跨批累计，单批验收只比较本次新增错误。 */
+  gaps = raw->discontinuities;
+  crc_errors = raw->crc_errors;
+  drain_gaps = raw->drain_discontinuities;
+  drain_errors = raw->drain_crc_errors;
+  ignored = raw->ignored_bytes;
+  buffer_errors = raw->buffer_errors;
   batch_ms = first_ms + 2000U +
       ssf_mems_serial_wire_ms(data,
                               expected_packets * SSF_MEMS_RAW_PACKET_BYTES);
-  window_until = jiffies + msecs_to_jiffies(duration_ms);
-  do {
-    ssf_mems_raw_begin_batch(data);
-    msleep(max(5U, ssf_mems_serial_gap_ms(data)));
-    if (ssf_mems_protocol_raw_stopping(data) == true) {
-      WRITE_ONCE(raw->publishing, false);
-      ssf_mems_protocol_raw_receiver(data, false);
-      ret = -ENODEV;
-      break;
-    }
-    WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STARTING);
-    started = jiffies;
-    data->protocol.raw_start_until = started + msecs_to_jiffies(batch_ms);
-    ret = ssf_mems_protocol_raw_command(data);
-    if (ret == 0) {
-      waited = wait_event_interruptible_timeout(
-          raw->waitq, READ_ONCE(raw->batch_packets) != 0 ||
-                          ssf_mems_protocol_raw_stopping(data) == true,
-          msecs_to_jiffies(first_ms));
-      WRITE_ONCE(raw->start_wait_ms, jiffies_to_msecs(jiffies - started));
-      if (waited <= 0)
-        ret = waited < 0 ? (int)waited : -ETIMEDOUT;
-    }
-    if (ret == 0 && ssf_mems_protocol_raw_stopping(data) == false &&
-        READ_ONCE(raw->batch_done) == false) {
-      WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STREAMING);
-      waited = wait_event_interruptible_timeout(
-          raw->waitq, READ_ONCE(raw->batch_done) == true ||
-                          ssf_mems_protocol_raw_stopping(data) == true,
-          time_before(jiffies, data->protocol.raw_start_until) == true ?
-              data->protocol.raw_start_until - jiffies : 1UL);
-      if (waited <= 0)
-        ret = waited < 0 ? (int)waited : -ETIMEDOUT;
-    }
-    if (ret != 0 || ssf_mems_protocol_raw_stopping(data) == true)
-      WRITE_ONCE(raw->publishing, false);
-    finish_ret = ssf_mems_raw_finish_locked(data);
-    if (finish_ret != 0)
-      ret = finish_ret;
-    if (ret == 0 && (raw->batch_packets != expected_packets ||
-                    raw->discontinuities != 0 || raw->crc_errors != 0 ||
-                    raw->drain_discontinuities != 0 || raw->drain_crc_errors != 0 ||
-                    raw->ignored_bytes != 0))
-      ret = -EILSEQ;
-    if (ret == 0 && raw->buffer_errors != 0)
-      ret = -ENOSPC;
-    if (ret == 0)
-      WRITE_ONCE(raw->batches, raw->batches + 1U);
-    if (ssf_mems_protocol_raw_stopping(data) == true)
-      ret = -ENODEV;
-    if (ret != 0)
-      break;
-  } while (time_before(jiffies, window_until) == true);
+  ssf_mems_raw_begin_batch(data);
+  msleep(max(5U, ssf_mems_serial_gap_ms(data)));
+  if (ssf_mems_protocol_raw_stopping(data) == true) {
+    WRITE_ONCE(raw->publishing, false);
+    ssf_mems_protocol_raw_receiver(data, false);
+    ret = -ENODEV;
+    goto report;
+  }
+  WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STARTING);
+  started = jiffies;
+  data->protocol.raw_start_until = started + msecs_to_jiffies(batch_ms);
+  ret = ssf_mems_protocol_raw_command(data);
+  if (ret == 0) {
+    waited = wait_event_interruptible_timeout(
+        raw->waitq, READ_ONCE(raw->batch_packets) != 0 ||
+                        ssf_mems_protocol_raw_stopping(data) == true,
+        msecs_to_jiffies(first_ms));
+    WRITE_ONCE(raw->start_wait_ms, jiffies_to_msecs(jiffies - started));
+    if (waited <= 0)
+      ret = waited < 0 ? (int)waited : -ETIMEDOUT;
+  }
+  if (ret == 0 && ssf_mems_protocol_raw_stopping(data) == false &&
+      READ_ONCE(raw->batch_done) == false) {
+    WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_RAW_STREAMING);
+    waited = wait_event_interruptible_timeout(
+        raw->waitq, READ_ONCE(raw->batch_done) == true ||
+                        ssf_mems_protocol_raw_stopping(data) == true,
+        time_before(jiffies, data->protocol.raw_start_until) == true ?
+            data->protocol.raw_start_until - jiffies : 1UL);
+    if (waited <= 0)
+      ret = waited < 0 ? (int)waited : -ETIMEDOUT;
+  }
+  if (ret != 0 || ssf_mems_protocol_raw_stopping(data) == true)
+    WRITE_ONCE(raw->publishing, false);
+  finish_ret = ssf_mems_capture_finish_locked(data);
+  if (finish_ret != 0)
+    ret = finish_ret;
+  if (ret == 0 && (raw->batch_packets != expected_packets ||
+                  raw->discontinuities != gaps || raw->crc_errors != crc_errors ||
+                  raw->drain_discontinuities != drain_gaps || raw->drain_crc_errors != drain_errors ||
+                  raw->ignored_bytes != ignored))
+    ret = -EILSEQ;
+  if (ret == 0 && raw->buffer_errors != buffer_errors)
+    ret = -ENOSPC;
+  if (ret == 0)
+    WRITE_ONCE(raw->batches, raw->batches + 1U);
+  if (ssf_mems_protocol_raw_stopping(data) == true)
+    ret = -ENODEV;
+report:
   dev_info(&data->serdev->dev,
            "finite raw capture: %u batches, %u packets, %u sequence gaps, %u bad candidates, %u IIO drops; drain %u/%u/%u, ignored %u, start %u ms, status %d\n",
            raw->batches, raw->packets, raw->discontinuities, raw->crc_errors,

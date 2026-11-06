@@ -42,7 +42,7 @@ against the target kernel and validate the device's 40102 change timing on hardw
 原始恢复失败时必须立即离线退避；下一轮先恢复模式，再重新匹配。
 测试禁止恢复未确认期间读取/发布特征，且不能因此重复保存波特率。
 
-运行时控制覆盖三种模式、离线配置、空参数/范围/关闭检查、同值写不唤醒，
+运行时控制覆盖四种模式、离线配置、空参数/范围/关闭检查、同值写不唤醒，
 以及 feature→raw→feature→alternating 的线程内切换；切换不重新匹配或调速。
 纯原始模式检查零特征读写、恢复门禁和 IIO 满队列后继续采集；100 ms 短交替窗口
 检查不会被 1000 ms 特征周期拖长。设备树 raw-duration-ms=0 仍默认仅特征，
@@ -54,3 +54,37 @@ against the target kernel and validate the device's 40102 change timing on hardw
 
 替代型号测试还同时初始化 XYZ 和工作速率不同的 XYZS，确认目标配置按实例读取。
 XYZ 的自适应比较忽略 union 未使用区域，且能识别位移成员变化。
+
+## Three-route TDM regression (2026-11-06)
+
+The production worker now runs all seven nonempty feature/raw/sound combinations,
+including single-route alternating, with 100 ms windows and batches deliberately
+longer than their windows. The same cases run across jiffies wraparound. Additional
+cases cover sound-only buffer idle/resume, closing the sound buffer during a batch,
+configuration written from inside an in-flight raw callback, applying a new raw
+length on the next batch without restarting its window, sound recovery failure,
+and buffer drops without baud rediscovery.
+
+Manual sound is exercised from POLL, RAW, SOUND and IDLE with the original mode
+and deadline preserved. Configuration tests reject an empty alternating set and
+unsupported sound routes. The real-pthread-mutex test holds the serial transaction
+lock while reading and writing every host configuration type, including sound
+windows, raw lengths and polling, with a timeout guarding accidental lock waits.
+
+See [the refactor validation record](TDM_REFACTOR_2026-11-06.md). These remain host
+simulations, not physical-board validation.
+
+## Worker request and delivery fixes
+
+`request_test.c` runs the production worker with real pthread tasks, mutexes and
+completion waits. It blocks a raw batch while submitting sound and configuration,
+checks sound executes between raw-window batches on the same worker, rejects a
+duplicate raw request, and checks requested/applied versions differ until the
+submitted window completes. Queued and running cancellation are distinct cases:
+queued cancellation sends no trigger; a running writer remains blocked until the
+batch safely completes. Shutdown completes the outstanding writers.
+
+Connection state and acquisition route are tested separately. IIO tests check
+actual data channels, disabled-buffer errors, restart generations and coherent
+scheduler status formatting. Protocol tests check the shared recovery dispatcher
+rejects OTA without changing mode or sending data.

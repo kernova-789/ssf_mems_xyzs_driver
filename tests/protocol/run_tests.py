@@ -38,6 +38,7 @@ MODULES = {
     "xyz": "../sensor/xyz.c",
     "serial_transport": "transport/serial_transport.c",
     "raw_capture": "raw/raw_capture.c",
+    "capture_session": "raw/capture_session.c",
     "modbus": "modbus/modbus.c",
     "modbus_request": "modbus/modbus_request.c",
     "modbus_receive": "modbus/modbus_receive.c",
@@ -51,7 +52,7 @@ HEADERS = (
     "sensor_data.h", "sensor_fields.h", "sensor.h", "xyz.h", "xyzs.h", "modbus/modbus_types.h",
     "modbus/modbus.h", "model/modbus_table.h", "modbus/modbus_request.h",
     "modbus/modbus_receive.h", "protocol.h", "core.h",
-    "ssf_mems_acquisition.h", "acquisition_policy.h", "raw/raw_stream.h",
+    "ssf_mems_acquisition.h", "acquisition_policy.h", "acquisition_routes.h", "raw/capture_session.h", "raw/raw_stream.h",
     "raw/raw_capture.h", "raw/sound.h", "transport/serial_transport.h", "firmware/ota.h",
 )
 ALLOWED_DEPENDENCIES = {
@@ -61,14 +62,15 @@ ALLOWED_DEPENDENCIES = {
     "xyz": {"features", "raw_capture"},
     "modbus_table": set(),
     "serial_transport": {"modbus_table"},
-    "raw_capture": {"sound_capture", "modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
+    "capture_session": {"raw_capture", "sound_capture", "modbus_receive"},
+    "raw_capture": {"capture_session", "modbus_table", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
     "modbus": {"modbus_table"},
     "modbus_request": {"modbus", "modbus_table", "modbus_receive", "serial_transport"},
     "modbus_receive": {"sound_stream", "modbus", "modbus_table", "raw_stream", "ota", "serial_transport"},
-    "protocol": {"sound_stream", "modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
+    "protocol": {"capture_session", "sound_stream", "modbus", "modbus_table", "modbus_request", "modbus_receive", "raw_stream", "raw_capture", "ota"},
     "raw_stream": {"modbus", "modbus_table"},
     "sound_stream": {"modbus"},
-    "sound_capture": {"modbus_table", "raw_capture", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
+    "sound_capture": {"modbus_table", "capture_session", "modbus", "modbus_request", "modbus_receive", "protocol", "serial_transport"},
     "ota": {"modbus_request", "modbus_receive", "protocol", "serial_transport"},
 }
 

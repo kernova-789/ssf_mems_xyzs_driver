@@ -326,6 +326,7 @@ static void test_raw_buffer(void) {
   raw_indio.currentmode = INDIO_BUFFER_SOFTWARE;
   raw_indio.active_scan_mask = &mask;
   for (mask = 1; mask < BIT(5); mask++) {
+    assert(ssf_mems_iio_raw_enabled(&sensor) == ((mask & 7) != 0));
     size_t bytes = 0, largest = 0;
     for (bit = 0; bit < 5; bit++) {
       size_t width = bit == 3 ? 4 : 2;
@@ -340,18 +341,27 @@ static void test_raw_buffer(void) {
     for (with_timestamp = 0; with_timestamp < 2; with_timestamp++) {
       raw_indio.scan_timestamp = with_timestamp;
       raw_indio.scan_bytes = with_timestamp ? ALIGN(bytes, 8) + 8 : bytes;
-      assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == 0);
+      assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == ((mask & 7) ? 0 : -EINVAL));
     }
   }
   assert(ssf_mems_raw_read_scale(&raw_indio, &ssf_mems_raw_channels[0],
                                  &val, &val2, IIO_CHAN_INFO_SCALE) == IIO_VAL_INT_PLUS_NANO);
   assert(val == 0 && val2 == 4788403);
+  mask = BIT(0);
+  raw_indio.scan_timestamp = false;
+  raw_indio.scan_bytes = 2;
+  assert(ssf_mems_iio_begin_raw(&sensor) == 0);
+  assert(ssf_mems_iio_buffer_ops.predisable(&raw_indio) == 0);
+  assert(ssf_mems_iio_buffer_ops.postenable(&raw_indio) == 0);
+  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -ESTALE);
+  assert(ssf_mems_iio_begin_raw(&sensor) == 0);
+  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == 0);
   raw_indio.scan_bytes = 25;
   assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -EOVERFLOW);
   raw_indio.active_scan_mask = NULL;
   assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -EINVAL);
   raw_indio.currentmode = INDIO_DIRECT_MODE;
-  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == 0);
+  assert(ssf_mems_iio_publish_raw(&sensor, &raw_sample) == -ENODATA);
   assert(ssf_mems_iio_publish_raw(NULL, &raw_sample) == -EINVAL);
   assert(ssf_mems_iio_publish_raw(&sensor, NULL) == -EINVAL);
   sensor.raw_indio_dev = NULL;
@@ -377,6 +387,7 @@ static void test_sound_buffer(void) {
   sound_indio.currentmode = INDIO_BUFFER_SOFTWARE;
   sound_indio.active_scan_mask = &mask;
   for (mask = 1; mask < 8; mask++) {
+    assert(ssf_mems_iio_sound_enabled(&sensor) == ((mask & 1) != 0));
     size_t bytes = 0, largest = 0;
     for (bit = 0; bit < 3; bit++) if (mask & BIT(bit)) {
       size_t width = bit == 0 ? 4 : 2;
@@ -439,7 +450,11 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_data *d,
   setting_value = v;
   return setting_error;
 }
-void ssf_mems_acquisition_get_status(struct ssf_mems_data *d, struct ssf_mems_acquisition_status *s) { abort(); }
+static struct ssf_mems_acquisition_status scheduler_status;
+void ssf_mems_acquisition_get_status(struct ssf_mems_data *d, struct ssf_mems_acquisition_status *s) {
+  assert(d == &sensor);
+  *s = scheduler_status;
+}
 /* IIO 用例只检查分派，调度和锁由 acquisition 用例验证。 */
 int ssf_mems_acquisition_get_config(struct ssf_mems_data *d,
                                    struct ssf_mems_acquisition_config *c) {
@@ -459,17 +474,27 @@ int ssf_mems_acquisition_set_mode(struct ssf_mems_data *d,
 }
 /* 单独更新指定窗口，另一项不应被覆盖。 */
 int ssf_mems_acquisition_set_duration(struct ssf_mems_data *d,
-                                     bool raw_window, unsigned int duration) {
+                                     enum ssf_mems_acquisition_route route, unsigned int duration) {
   assert(d == &sensor);
   control_writes++;
   if (control_error != 0)
     return control_error;
   if (duration < SSF_MEMS_ACQ_MIN_DURATION_MS || duration > SSF_MEMS_ACQ_MAX_DURATION_MS)
     return -EINVAL;
-  if (raw_window == true)
+  if (route == SSF_MEMS_ACQ_ROUTE_RAW)
     acquisition_config.raw_duration_ms = duration;
+  else if (route == SSF_MEMS_ACQ_ROUTE_SOUND)
+    acquisition_config.sound_duration_ms = duration;
   else
     acquisition_config.feature_duration_ms = duration;
+  return 0;
+}
+int ssf_mems_acquisition_set_alternating_en(
+    struct ssf_mems_data *d, enum ssf_mems_acquisition_route route, bool enable) {
+  assert(d == &sensor);
+  control_writes++;
+  if (control_error) return control_error;
+  acquisition_config.alternating_en[route] = enable;
   return 0;
 }
 int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *d, u32 samples) {
@@ -483,6 +508,7 @@ int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *d, bool manual) {
 }
 int ssf_mems_acquisition_capture_sound(struct ssf_mems_data *d) {
   assert(d == &sensor);
+  if (!ssf_mems_iio_sound_enabled(d)) return -ENODATA;
   raw_capture_calls++;
   return control_error;
 }
@@ -598,6 +624,32 @@ static void test_configuration_attributes(void) {
 
 /* 新统计属性均只读；有效采集、排空和业务模式分别输出，不能串错成员。 */
 /* 覆盖模式字符串、两项时长、非法输入和关闭时错误的 sysfs 透传。 */
+static void test_scheduler_status(void) {
+  struct ssf_mems_iio_state state = {.data = &sensor};
+  struct device_attribute *attr = &iio_dev_attr_sensor_acquisition_status.dev_attr;
+  char buf[4096];
+
+  indio.private = &state;
+  scheduler_status = (struct ssf_mems_acquisition_status){
+    .connection = SSF_MEMS_ACQ_READY, .route = SSF_MEMS_ACQ_ROUTE_RAW,
+    .online = true, .busy = true, .manual_active = true, .manual_pending = true,
+    .requested_mode = SSF_MEMS_ACQ_MODE_SOUND, .applied_mode = SSF_MEMS_ACQ_MODE_RAW,
+    .config_version = 9, .applied_version = 7,
+  };
+  assert(attr->store == NULL && attr->show(&indio.dev, attr, buf) > 0);
+  assert(strstr(buf, "connection=ready route=raw busy=1 manual_active=1 manual_pending=1 idle_reason=none"));
+  assert(strstr(buf, "requested_mode=sound applied_mode=raw config_version=9 applied_config_version=7 config_pending=1"));
+  scheduler_status.busy = scheduler_status.manual_active = scheduler_status.manual_pending = false;
+  scheduler_status.manual_wait = true;
+  scheduler_status.route = SSF_MEMS_ACQ_ROUTE_NONE;
+  scheduler_status.applied_version = 9;
+  assert(attr->show(&indio.dev, attr, buf) > 0 && strstr(buf, "idle_reason=manual_wait"));
+  assert(strstr(buf, "route=none") && strstr(buf, "config_pending=0"));
+  scheduler_status.applied_version = 0;
+  assert(attr->show(&indio.dev, attr, buf) > 0 && strstr(buf, "applied_mode=none"));
+  indio.private = NULL;
+}
+
 static void test_acquisition_controls(void) {
   struct ssf_mems_iio_state state = {.data = &sensor};
   ssf_mems_iio_setup_features(&state);
@@ -616,6 +668,33 @@ static void test_acquisition_controls(void) {
   assert(mode->store(&indio.dev, mode, "feature", 7) == 7);
   assert(acquisition_config.mode == SSF_MEMS_ACQ_MODE_FEATURE);
   assert(mode->store(&indio.dev, mode, "alternating\n", 12) == 12);
+  assert(mode->store(&indio.dev, mode, "sound\n", 6) == 6);
+  assert(acquisition_config.mode == SSF_MEMS_ACQ_MODE_SOUND);
+  assert(mode->show(&indio.dev, mode, buf) == 6 && !strcmp(buf, "sound\n"));
+  struct device_attribute *available = &iio_dev_attr_sensor_acquisition_mode_available.dev_attr;
+  assert(available->show(&indio.dev, available, buf) > 0);
+  assert(!strcmp(buf, "raw feature sound alternating\n"));
+  struct device_attribute *sound = &iio_dev_attr_sensor_sound_duration_ms.dev_attr;
+  assert(sound->store(&indio.dev, sound, "4000", 4) == 4);
+  assert(acquisition_config.sound_duration_ms == 4000);
+  assert(sound->show(&indio.dev, sound, buf) == 5 && !strcmp(buf, "4000\n"));
+  struct device_attribute *routes[] = {
+    &iio_dev_attr_sensor_alternating_feature_en.dev_attr,
+    &iio_dev_attr_sensor_alternating_raw_en.dev_attr,
+    &iio_dev_attr_sensor_alternating_sound_en.dev_attr,
+  };
+  for (unsigned int route = 0; route < 3; route++) {
+    struct device_attribute *attr = routes[route];
+    assert(attr->store(&indio.dev, attr, "1\n", 2) == 2);
+    assert(acquisition_config.alternating_en[route]);
+    assert(attr->show(&indio.dev, attr, buf) == 2 && !strcmp(buf, "1\n"));
+    assert(attr->store(&indio.dev, attr, "0", 1) == 1);
+    assert(!acquisition_config.alternating_en[route]);
+    before = control_writes;
+    assert(attr->store(&indio.dev, attr, "2", 1) == -EINVAL);
+    assert(attr->store(&indio.dev, attr, "true", 4) == -EINVAL);
+    assert(control_writes == before);
+  }
   before = control_writes;
   assert(mode->store(&indio.dev, mode, "RAW\n", 4) == -EINVAL);
   assert(mode->store(&indio.dev, mode, "raw extra\n", 10) == -EINVAL);
@@ -925,6 +1004,16 @@ static void test_xyz_iio(void) {
       &iio_dev_attr_sensor_firmware_version.dev_attr.attr, 0) == 0);
   assert(ssf_mems_iio_attr_visible(&data.indio_dev->dev.kobj,
       &iio_dev_attr_sensor_sampling_rate_index.dev_attr.attr, 0) == 0644);
+  struct device_attribute *available = &iio_dev_attr_sensor_acquisition_mode_available.dev_attr;
+  char modes[128];
+  assert(available->show(&data.indio_dev->dev, available, modes) > 0);
+  assert(!strcmp(modes, "raw feature alternating\n"));
+  assert(ssf_mems_iio_attr_visible(&data.indio_dev->dev.kobj,
+      &iio_dev_attr_sensor_sound_duration_ms.dev_attr.attr, 0) == 0);
+  assert(ssf_mems_iio_attr_visible(&data.indio_dev->dev.kobj,
+      &iio_dev_attr_sensor_alternating_feature_en.dev_attr.attr, 0) == 0644);
+  assert(ssf_mems_iio_attr_visible(&data.indio_dev->dev.kobj,
+      &iio_dev_attr_sensor_alternating_raw_en.dev_attr.attr, 0) == 0644);
   /* 检查实际交给 IIO 核心的列表，不能只测试可见性回调本身。 */
   {
     struct attribute **attr = data.indio_dev->info->attrs->attrs;
@@ -933,6 +1022,9 @@ static void test_xyz_iio(void) {
     for (; *attr != NULL; attr++) {
       assert(*attr != &iio_dev_attr_sensor_feature_enable.dev_attr.attr);
       assert(*attr != &iio_dev_attr_sensor_parameter_switch.dev_attr.attr);
+      assert(*attr != &iio_dev_attr_sensor_sound_capture.dev_attr.attr);
+      assert(*attr != &iio_dev_attr_sensor_sound_duration_ms.dev_attr.attr);
+      assert(*attr != &iio_dev_attr_sensor_alternating_sound_en.dev_attr.attr);
       assert(*attr != &iio_dev_attr_sensor_firmware_update.dev_attr.attr);
       assert(*attr != &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr);
       assert(*attr != &iio_dev_attr_sensor_firmware_version.dev_attr.attr);
@@ -967,6 +1059,7 @@ int main(void) {
   test_registration();
   test_configuration_attributes();
   test_acquisition_controls();
+  test_scheduler_status();
   test_poll_controls();
   test_firmware_attributes();
   test_raw_status_attributes();

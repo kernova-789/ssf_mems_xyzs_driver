@@ -4,7 +4,7 @@
 #include "modbus/modbus_receive.h"
 #include "modbus/modbus_request.h"
 #include "model/modbus_table.h"
-#include "raw/raw_capture.h"
+#include "raw/capture_session.h"
 
 #include <linux/delay.h>
 #include <linux/errno.h>
@@ -646,7 +646,7 @@ int ssf_mems_protocol_get_baudrate(struct serdev_device *serdev,
 
   mutex_lock(&state->bus_lock);
   if (state->mode != SSF_MEMS_LINK_MODBUS) {
-    ret = ssf_mems_raw_finish_locked(data);
+    ret = ssf_mems_capture_finish_locked(data);
     if (ret != 0)
       goto out_unlock;
   }

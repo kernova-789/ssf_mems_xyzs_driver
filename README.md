@@ -58,9 +58,24 @@ build output with:
 make clean KDIR=/path/to/linux/build
 ```
 
-The default `make` target also runs `modules_prepare` and copies the module to
+The default `make` target first runs `olddefconfig` with the selected target
+toolchain, then `modules_prepare`, and copies the module to
 `INSTALL_DIR` (default `/home/u-yoimiya/nfs/`). Pass `INSTALL_DIR=/your/output`
-to change that destination. To build without copying, invoke Kbuild directly:
+to change that destination. `KDIR/.config` must already contain the target
+kernel configuration; existing selections are retained and newly available
+symbols use their Kconfig defaults. Back up that configuration before switching
+toolchains. A configuration evaluated with the host x86 compiler can lose ARM64
+capability flags and trigger interactive `syncconfig` prompts or a spurious
+`broken .inst` warning. Use the target's configuration and the ARM64 toolchain
+consistently, including for device-tree builds sharing the same kernel tree.
+
+To prepare and build locally without copying into the install directory:
+
+```sh
+make modules
+```
+
+For an already prepared, matching kernel build tree, Kbuild can also be invoked directly:
 
 ```sh
 make -C /path/to/linux/build M="$PWD" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
@@ -148,11 +163,12 @@ and starts baud-rate discovery with exponential retry delays capped at 30 s.
 Stale or disconnected samples become invalid and direct reads return `-ENODATA`.
 See [acquisition/README.md](acquisition/README.md) for the policy and tuning points.
 
-Runtime IIO controls `sensor_acquisition_mode` (`raw`, `feature`, `alternating`),
-`sensor_raw_duration_ms`, and `sensor_feature_duration_ms` select the host-side
-schedule. Durations accept 100..60000 ms; the default remains alternating with
-5000 ms windows. Updates wait for the current raw window to finish and do not
-save sensor configuration. See [IIO controls](iio/README.md#运行中修改采集策略).
+Runtime IIO controls select `raw`, `feature`, `sound` (XYZS), or `alternating`.
+Feature, vibration and sound windows accept 100..60000 ms and default to 5000 ms.
+Three `sensor_alternating_*_en` flags select routes in feature → raw → sound order.
+Automatic raw/sound routes require an enabled data buffer; unavailable routes are skipped.
+Host configuration writes use a short lock; the scheduler applies them at complete batch
+boundaries. Protocol callbacks execute one batch and do not own scheduling windows. See [IIO controls](iio/README.md#运行中修改采集策略).
 The serdev receive callback now explicitly uses the target Linux 5.10 `int`
 signature; the former `typeof` typedef for cross-kernel return-type inference
 has been removed. A newer kernel with a `size_t` callback needs adaptation.
@@ -240,6 +256,15 @@ IIO 全部属性的中文说明和操作示例见 [iio/ATTRIBUTES.md](iio/ATTRIB
 
 ## 4096 点原始声音
 
-XYZS 新增 `sensor_sound_capture` 一次性触发和独立 `ssf_mems_xyzs_sound` IIO buffer，
+XYZS 提供 `sound` / `alternating` 自动声音调度、`sensor_sound_capture` 手动点检及独立 `ssf_mems_xyzs_sound` IIO buffer，
 固定 4096 点 / 16 kHz。见 [接口与采集工具](iio/SOUND_CAPTURE.md) 和
-[双路实机验证](tests/hardware/sound/TEST_REPORT_2026-10-26.md)。
+[旧版单次采集的双路实机验证](tests/hardware/sound/TEST_REPORT_2026-10-26.md)。
+自动调度重构的主机验证与目标内核编译记录见 [重构记录](tests/acquisition/TDM_REFACTOR_2026-11-06.md)，尚未实机验收。
+
+## 采集架构修复与状态接口
+
+手动与自动采集统一由工作线程逐批仲裁；显式振动窗口允许声音插入。
+`sensor_acquisition_status` 区分请求模式、已应用模式、实际路线及配置版本。
+原始数据发布检查实际通道与 Buffer 代次，批中关闭/重启不能静默报告成功。
+见 [修复与架构评估](tests/acquisition/ARCHITECTURE_REPAIR_2026-11-06.md)。
+本轮未加入连续采集，未部署开发板。

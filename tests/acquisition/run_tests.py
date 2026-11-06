@@ -22,6 +22,7 @@ def main():
                     str(ROOT / "protocol/transport/serial_transport.c"),
                     str(ROOT / "acquisition/acquisition_policy.c"),
                     str(ROOT / "acquisition/ssf_mems_acquisition.c"),
+                    str(ROOT / "acquisition/acquisition_routes.c"),
                     str(ROOT / "sensor/sensor.c"), str(ROOT / "sensor/xyzs.c"),
                     str(TEST / "acquisition_test.c"), "-o", str(executable)]
         subprocess.run(command, check=True)
@@ -31,9 +32,24 @@ def main():
         status_command += ["-DSSF_TEST_REAL_MUTEX", "-pthread", "-ffunction-sections",
                            "-fdata-sections", "-Wl,--gc-sections",
                            str(ROOT / "acquisition/ssf_mems_acquisition.c"),
+                           str(ROOT / "acquisition/acquisition_routes.c"),
+                           str(ROOT / "acquisition/acquisition_policy.c"),
+                           str(ROOT / "sensor/sensor.c"),
                            str(TEST / "status_test.c"), "-o", str(status_executable)]
         subprocess.run(status_command, check=True)
         subprocess.run([str(status_executable)], check=True, timeout=5)
+        request_executable = Path(temp) / "request_test"
+        request_command = command[:command.index(str(ROOT / "protocol/model/modbus_table.c"))]
+        request_command += ["-DSSF_TEST_REAL_MUTEX", "-DSSF_TEST_THREADED_TASK", "-pthread",
+                            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+                            str(ROOT / "acquisition/ssf_mems_acquisition.c"),
+                            str(ROOT / "acquisition/acquisition_routes.c"),
+                            str(ROOT / "acquisition/acquisition_policy.c"),
+                            str(ROOT / "sensor/sensor.c"),
+                            str(ROOT / "protocol/transport/serial_transport.c"),
+                            str(TEST / "request_test.c"), "-o", str(request_executable)]
+        subprocess.run(request_command, check=True)
+        subprocess.run([str(request_executable)], check=True, timeout=15)
         profile_directory = Path(temp) / "alternate-profile"
         profile_directory.mkdir()
         source = (ROOT / "sensor/xyzs.c").read_text().replace(
@@ -50,6 +66,7 @@ def main():
                             str(ROOT / "protocol/protocol.c"),
                             str(ROOT / "acquisition/acquisition_policy.c"),
                             str(ROOT / "acquisition/ssf_mems_acquisition.c"),
+                           str(ROOT / "acquisition/acquisition_routes.c"),
                             str(TEST / "profile_test.c"), "-o", str(profile_executable)]
         subprocess.run(profile_command, check=True)
         subprocess.run([str(profile_executable)], check=True)

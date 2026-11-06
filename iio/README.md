@@ -64,47 +64,43 @@ CRC 不匹配的候选继续被拒绝，仅输出调试级日志；真实损坏�
 
 ## 运行中修改采集策略
 
-在特征设备 `ssf_mems_xyzs` 下增加以下主机调度属性，不改变扫描记录布局：
+所有调度控制位于特征设备；具体 ABI 见 [属性说明](ATTRIBUTES.md#3-采集模式与窗口)。
 
-| 属性 | 取值 |
+| 属性 | 取值 / 默认值 |
 | --- | --- |
-| `sensor_acquisition_mode`（读写） | `raw`、`feature`、`alternating` |
-| `sensor_acquisition_mode_available`（只读） | 支持的三个模式名称 |
-| `sensor_raw_duration_ms`（读写） | 原始窗口，十进制 100..60000 ms |
-| `sensor_feature_duration_ms`（读写） | 特征窗口，十进制 100..60000 ms |
+| `sensor_acquisition_mode` | `raw`、`feature`、`sound`、`alternating`；默认 alternating |
+| `sensor_acquisition_mode_available` | 型号实际支持的列表；XYZ 不包含 sound |
+| `sensor_feature_duration_ms` | 特征窗口，100..60000 ms，默认 5000 |
+| `sensor_raw_duration_ms` | 振动窗口，100..60000 ms，默认 5000 |
+| `sensor_sound_duration_ms` | 声音窗口，100..60000 ms，默认 5000；仅支持声音的型号 |
+| `sensor_alternating_feature_en` | 0/1，默认 1 |
+| `sensor_alternating_raw_en` | 0/1，默认 1 |
+| `sensor_alternating_sound_en` | 0/1，默认 1；仅支持声音的型号 |
 
-`raw` 持续重复完整定长批次（默认 1024 点），不读取特征。
-它仍会执行必要的配置读取和批后通信确认，因此不是无间断原始波形。
-`feature` 持续轮询特征，不触发原始批次。`alternating` 从特征窗口开始交替，
-到原始窗口截止时收完在途批次，不为了满足时长截断数据。特征轮询默认固定为
-1000 ms，也可使用下面的独立轮询配置。
-
-默认是交替模式、原始/特征各 5000 ms；设备树两项时段继续提供初始值。
-旧 `sange-cbm,raw-duration-ms=0` 仍选择仅特征，但原始窗口读回为可供以后切换的
-5000 ms。运行时写时长不接受 0，请用模式选择关闭某类采集。有校验位时默认仅特征，
-请求含原始采集的模式返回 `-EOPNOTSUPP`，因为当前私有格式只支持无校验。
-
-以 root 身份操作，先将路径中的 X 换为名字是 `ssf_mems_xyzs` 的设备编号：
+交替顺序为特征 → 振动 → 声音 → 特征，跳过关闭的路线和未启用 buffer 的振动/声音路线。
+窗口到期收完在途完整批次，再释放总线给下一路线。仅选择一条路线时持续重复该路线。
+特征轮询仍更新直接读取缓存，不要求开启特征 buffer。打开 `/dev/iio:deviceN` 不会自动
+开启 buffer；应用须配置扫描字段、启用并持续消费振动/声音 buffer。
+声音 4096 点批次会整体发布，建议声音 buffer 至少 4096 条。
 
 ```sh
-IIO=/sys/bus/iio/devices/iio:deviceX
-cat "$IIO/sensor_acquisition_mode_available"
-echo raw > "$IIO/sensor_acquisition_mode"          # 持续定长采集
-echo feature > "$IIO/sensor_acquisition_mode"      # 持续特征采集
-echo 2000 > "$IIO/sensor_raw_duration_ms"
+IIO=/sys/bus/iio/devices/iio:deviceX  # 实际特征设备
+# 例如只交替特征和声音；先启用声音设备的 buffer 并启动消费者。
+echo 1 > "$IIO/sensor_alternating_feature_en"
+echo 1 > "$IIO/sensor_alternating_sound_en"
+echo 0 > "$IIO/sensor_alternating_raw_en"
 echo 3000 > "$IIO/sensor_feature_duration_ms"
-echo alternating > "$IIO/sensor_acquisition_mode"  # 原始约 2 s / 特征约 3 s
+echo 5000 > "$IIO/sensor_sound_duration_ms"
+echo alternating > "$IIO/sensor_acquisition_mode"
+# 只重复采声音：echo sound > "$IIO/sensor_acquisition_mode"
 ```
 
-这些属性只读写主机状态，不发送保存命令、不重启、不改变波特率或采样率。
-主机配置读取使用短状态锁，不等待串口事务；配置写入与采集共用 `acquisition.lock`，
-可能等待当前原始窗口（最长配置 60 s 加
-在途批次/恢复等待）收尾，返回后唤醒调度。模式/窗口变化后交替调度从新的特征窗口
-开始；同值写不重置窗口。两个窗口分别更新，多个属性写入不是一次原子事务。
-纯原始模式不再提供有效特征缓存；特征 buffer 可能仍存有切换前的旧记录，须按
-时间戳识别。采集模式不自动开启 IIO buffer，仍需应用自行配置并消费对应 buffer。
-设置可在离线时保存于驱动内存并在重连后沿用；卸载后不保留，下一次加载重新使用
-设备树/默认值。新功能只完成离线回归和目标板内核编译，尚未实机验证。
+配置读写只取短状态锁，不等待在途串口事务。写入成功表示主机配置已保存；
+采集线程在当前完整批次和恢复结束后应用。模式、时长、路线开关实际变化时，
+从第一个可运行路线开启新窗口；同值写不重置。最后一条交替路线不能关闭。
+多个属性分别生效，重连保留配置，卸载后恢复默认。
+旧设备树 `raw-duration-ms=0` 保持 feature 默认；有校验时仅支持 feature 调度。
+新调度已做主机回归与目标内核交叉编译，尚未实机验证。
 
 ## 特征轮询周期
 
@@ -146,7 +142,7 @@ cat "$IIO/sensor_poll_interval_ms"
 不清空未完成统计。交替采集保留学习结果，完全重复数据不会被定时试探反向加速。
 只修改非当前模式的参数不会打断当前轮询。
 
-写入与采集共用采集锁，可能等待在途原始窗口完整结束；当前模式的参数变化会唤醒
+主机轮询配置写入只取短状态锁，不等待在途批次；当前模式的参数变化会唤醒
 调度，不重新开始特征窗口。配置在离线、重连后继续保留，本次驱动卸载后不保留。
 这些操作不发送传感器配置命令。当前周期是调度目标，读取耗时超过周期时不会并行
 发送或补发积压轮次。
@@ -210,7 +206,7 @@ buffer，保持特征设备原有布局不变。全部数据字段和时间戳�
 配置与读取示例见[定长原始采集说明](../protocol/raw/RAW_CAPTURE.md)。
 
 成功设置的采样率会在本次驱动运行期间作为重连目标，卸载后恢复型号表默认值。
-主机模式、窗口与轮询配置读取使用短锁，不等待原始窗口或 OTA；写入继续串行化。
+主机模式、窗口与轮询配置读写均使用短锁，不等待原始窗口或 OTA。
 特征字段/单位统一来自 `sensor/sensor_fields.h`，两设备共用缓冲区打包和注册辅助函数。
 
 ## 用户命令设置定长长度
@@ -222,3 +218,31 @@ buffer，保持特征设备原有布局不变。全部数据字段和时间戳�
 ## 4096 点原始声音
 
 XYZS 新增一次性声音触发和独立 IIO buffer，详见 [声音采集](SOUND_CAPTURE.md)。
+
+## 配置生效与同步采集状态
+
+特征设备的只读 `sensor_acquisition_status` 返回一个一致快照，例如：
+
+```text
+connection=ready route=raw busy=1 manual_active=1 manual_pending=1 idle_reason=none requested_mode=feature applied_mode=raw config_version=8 applied_config_version=6 config_pending=1
+```
+
+- `connection`：startup / matching / switching / configuring / verifying / ready / backoff / stopped。
+- `route`：实际采集路线 feature / raw / sound / none；`busy=1` 表示正在执行采集事务。
+- `manual_active`：当前事务是否来自手动请求；`manual_pending`：是否存在排队或未完成的手动请求。
+- `idle_reason`：none / interval / buffer_disabled / manual_wait / firmware_blocked 或连接阶段原因。
+- `requested_mode` 为请求模式，`applied_mode` 为工作线程已采用的模式（首次应用前为 none）。
+- `config_version` 为请求配置版本，`applied_config_version` 为已采用版本；不同则 `config_pending=1`。
+  相等不代表已采到新数据，仍应检查 busy、路线和数据本身。
+
+模式属性仍读回请求配置。轮询周期属性 `sensor_poll_interval_ms` 反映当前生效周期；
+轮询配置写入也在工作线程边界应用，不再由写入线程改变生效统计。
+显式手动振动窗口保留提交时的配置，新配置等待该窗口完成后应用。
+
+`sensor_raw_capture` / `sensor_sound_capture` 保持同步写入语义，由后台线程执行。
+每条路线同时最多一个请求，重复提交返回 EBUSY；声音可插入手动振动窗口的批次间隙，
+不改变后台模式和窗口截止时间。信号取消在途请求时先安全收尾再返回 EINTR，应用不可自动重放。
+有同步采集请求期间，波特率查询/修改、传感器参数写入及固件升级返回 EBUSY。
+
+振动/声音批次若中途关闭或重启 Buffer，或未选择实际数据通道，会记录交付失败，不能当作成功批次。
+即使 Buffer 在两次发布之间关闭后立即重启，驱动也会通过代次检查识别；Buffer 开启不保证应用持续消费。

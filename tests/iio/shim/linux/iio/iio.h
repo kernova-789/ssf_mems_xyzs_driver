@@ -17,7 +17,7 @@ struct iio_info {
   const struct attribute_group *attrs;
   int (*read_raw)(struct iio_dev *, const struct iio_chan_spec *, int *, int *, long);
 };
-struct iio_buffer_setup_ops { int unused; };
+struct iio_buffer_setup_ops { int (*postenable)(struct iio_dev *); int (*predisable)(struct iio_dev *); };
 struct iio_buffer { int unused; };
 struct iio_dev {
   struct mutex mlock;

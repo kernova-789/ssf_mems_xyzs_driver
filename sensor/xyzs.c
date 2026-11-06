@@ -583,10 +583,10 @@ static int xyzs_read_features(struct ssf_mems_data *data,
   return ssf_mems_sensor_read_features(data, timeout_ms);
 }
 static int xyzs_collect_raw(struct ssf_mems_data *data,
-                              unsigned int duration_ms, u32 samples) {
+                              u32 samples, bool reset_stats) {
   /* 保留 1024 点的现有固件编码；其他长度按 U32 自定义长度写入。 */
-  return ssf_mems_raw_collect_finite(data, duration_ms,
-                                    samples == 1024 ? 0 : samples);
+  return ssf_mems_raw_collect_batch(data,
+                                    samples == 1024 ? 0 : samples, reset_stats);
 }
 static const struct ssf_mems_sensor_ops xyzs_ops = {
   .collect_sound = ssf_mems_sound_collect_finite,

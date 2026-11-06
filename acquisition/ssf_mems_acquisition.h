@@ -6,18 +6,12 @@
 #include <linux/wait.h>
 
 #include "acquisition_policy.h"
+#include "acquisition_routes.h"
 #include "protocol.h"
 
 struct task_struct;
+struct ssf_mems_capture_request;
 struct ssf_mems_data;
-
-/* 采集策略；raw 反复执行完整定长批次，每批结束后确认普通通信。 */
-enum ssf_mems_acquisition_mode {
-  SSF_MEMS_ACQ_MODE_RAW,         /* 只重复定长原始采集。 */
-  SSF_MEMS_ACQ_MODE_FEATURE,     /* 只周期读取特征。 */
-  SSF_MEMS_ACQ_MODE_ALTERNATING, /* 特征与定长原始按窗口交替。 */
-  SSF_MEMS_ACQ_MODE_COUNT,       /* 模式数量，用于参数检查。 */
-};
 
 #define SSF_MEMS_ACQ_MIN_DURATION_MS 100U
 #define SSF_MEMS_ACQ_MAX_DURATION_MS 60000U
@@ -35,6 +29,8 @@ struct ssf_mems_acquisition_config {
   enum ssf_mems_acquisition_mode mode; /* 当前选择的采集策略。 */
   unsigned int raw_duration_ms;       /* 原始采集窗口；交替时决定原始阶段时长，单位 ms。 */
   unsigned int feature_duration_ms;   /* 交替模式的特征窗口，单位 ms。 */
+  unsigned int sound_duration_ms;     /* 声音窗口；到期后收完在途批次。 */
+  bool alternating_en[SSF_MEMS_ACQ_ROUTE_COUNT]; /* 交替路线；至少使能一项。 */
   u32 raw_batch_samples;             /* 请求的真实批次长度，默认 1024。 */
   bool raw_manual;                   /* raw 模式只由用户显式触发完整窗口。 */
   struct ssf_mems_poll_config poll;    /* 特征轮询模式及周期范围。 */
@@ -47,8 +43,7 @@ enum ssf_mems_acquisition_phase {
   SSF_MEMS_ACQ_SWITCH, /* 按保存/重启流程切到目标波特率。 */
   SSF_MEMS_ACQ_CONFIGURE, /* 设置并读回采样配置。 */
   SSF_MEMS_ACQ_VERIFY, /* 验证通信或首份完整特征。 */
-  SSF_MEMS_ACQ_POLL, /* 已连接，按当前模式调度采集。 */
-  SSF_MEMS_ACQ_RAW, /* 独占串口采集定长 XYZ 批次，完成窗口后回到特征轮询。 */
+  SSF_MEMS_ACQ_READY, /* 链路已验证，具体采集路线单独保存。 */
   SSF_MEMS_ACQ_BACKOFF, /* 连接失败，延迟后再尝试。 */
   SSF_MEMS_ACQ_STOPPED, /* 线程已退出。 */
 };
@@ -65,24 +60,34 @@ struct ssf_mems_acquisition_state {
   bool online; /* 最近连接验证成功，允许采集和配置请求。 */
   bool firmware_blocked; /* 末包结果不确定时停止自动通信，等待人工处理/再次升级。 */
   bool have_sample; /* 是否已有可计算年龄的完整特征样本。 */
-  enum ssf_mems_acquisition_phase phase; /* 当前连接/采集阶段。 */
+  enum ssf_mems_acquisition_phase phase; /* 当前连接阶段；采集路线单独保存。 */
   enum ssf_mems_baudrate target_baudrate; /* 启动配置/手动设置的目标，不被扫描覆盖。 */
   u16 target_sampling_rate_index; /* 初次采用型号默认值，成功手动设置后用于重连。 */
   unsigned int retry_ms; /* 下次连接失败后的退避时长，ms。 */
   unsigned long last_sample; /* 最近成功获取特征的 jiffies。 */
   struct ssf_mems_acquisition_policy policy; /* 轮询周期和断线判定统计。 */
-  enum ssf_mems_acquisition_mode mode; /* 调度使用的模式，不是串口协议模式。 */
-  bool config_changed; /* 唤醒调度并从新的窗口起点应用配置，不重新配置传感器。 */
-  bool poll_changed; /* 唤醒轮询等待，不重新开始特征窗口。 */
-  unsigned int raw_duration_ms; /* 每轮定长批采集窗口；收完在途批次。 */
-  u32 raw_batch_samples; /* 主机请求的批次长度，采集锁保护。 */
-  bool raw_manual; /* 为 true 时后台 raw 模式等待用户触发，不自动产生批次。 */
-  unsigned int feature_duration_ms; /* 每轮特征轮询时长，不含原始模式退出时间。 */
-  unsigned long feature_until; /* 本轮特征采集结束的 jiffies 时刻。 */
+  struct ssf_mems_acquisition_config config; /* status_lock 保护的用户配置。 */
+  struct ssf_mems_acquisition_config active_config; /* 线程在短锁内更新，事务持 lock 使用。 */
+  bool config_changed; /* 短锁内置位；线程在完整批次后重设路线窗口。 */
+  bool requests_changed; /* 新手动请求或取消唤醒批次间等待。 */
+  bool poll_changed; /* 唤醒等待，不重新开始路线窗口。 */
+  enum ssf_mems_acquisition_route route; /* 自动调度路线，采集锁保护。 */
+  bool window_start[SSF_MEMS_ACQ_ROUTE_COUNT]; /* 每条路线窗口的首批标志。 */
+  struct ssf_mems_capture_request *requests[SSF_MEMS_ACQ_ROUTE_COUNT]; /* status_lock 保护。 */
+  unsigned int manual_cursor; /* 手动请求逐批公平轮转，采集锁保护。 */
+  u64 config_version, applied_version; /* 请求和已应用的主机配置版本。 */
+  enum ssf_mems_acquisition_route visible_route; /* 短锁状态快照，包括手动插入。 */
+  bool busy, manual_active; /* 是否正在执行事务/手动事务。 */
+  unsigned long phase_until; /* 当前路线窗口截止时间；仅采集锁保护。 */
 };
 
 /* 用短临界区复制的只读状态，供 IIO 状态属性使用。 */
 struct ssf_mems_acquisition_status {
+  enum ssf_mems_acquisition_phase connection;
+  enum ssf_mems_acquisition_route route;
+  enum ssf_mems_acquisition_mode requested_mode, applied_mode;
+  u64 config_version, applied_version;
+  bool busy, manual_active, manual_pending, manual_wait, firmware_blocked;
   bool online; /* 当前是否经过连接验证。 */
   bool have_sample; /* sample_age_ms 是否有效。 */
   unsigned int interval_ms; /* 当前特征轮询周期，ms。 */
@@ -141,9 +146,9 @@ int ssf_mems_acquisition_write_setting(struct ssf_mems_data *data,
  */
 int ssf_mems_acquisition_get_config(
     struct ssf_mems_data *data, struct ssf_mems_acquisition_config *config);
-/* 设置原始、特征或交替采集模式。
+/* 设置振动、特征、声音或交替采集模式。
  * 返回：0 成功，负数为参数、停止或校验位错误。
- * 只改变主机调度，可能等待在途采集窗口完成。
+ * 只取短状态锁；线程在在途批次收尾后应用配置。
  */
 int ssf_mems_acquisition_set_mode(struct ssf_mems_data *data,
                                   enum ssf_mems_acquisition_mode mode);
@@ -151,14 +156,21 @@ int ssf_mems_acquisition_set_mode(struct ssf_mems_data *data,
  * 返回：0 成功，-EINVAL 参数无效，-ENODEV 正在停止。
  */
 int ssf_mems_acquisition_set_duration(struct ssf_mems_data *data,
-                                      bool raw_window, unsigned int duration_ms);
+                                      enum ssf_mems_acquisition_route route,
+                                      unsigned int duration_ms);
+/* 设置交替路线；不支持声音返回 EOPNOTSUPP，禁止关闭最后一项。 */
+int ssf_mems_acquisition_set_alternating_en(
+    struct ssf_mems_data *data, enum ssf_mems_acquisition_route route, bool enable);
 /* 设置定长批次长度/手动控制；不修改正在接收的窗口。 */
 int ssf_mems_acquisition_set_raw_samples(struct ssf_mems_data *data, u32 samples);
 int ssf_mems_acquisition_set_raw_manual(struct ssf_mems_data *data, bool manual);
-/* 同步执行一个完整原始窗口；仅支持 raw + manual，返回前确认收尾。 */
+/* 同步排队一个完整原始窗口；仅支持 raw + manual，线程逐批执行。 */
 int ssf_mems_acquisition_capture_window(struct ssf_mems_data *data);
-/* 同步获取一批声音；与全部采集和升级串行，不改变原调度选择。 */
+/* 同步排队一批声音；在安全批次边界插入，不改变原调度选择。 */
 int ssf_mems_acquisition_capture_sound(struct ssf_mems_data *data);
+
+/* 查询是否有待执行/在执行的同步采集请求；只取短状态锁。 */
+bool ssf_mems_acquisition_manual_pending(struct ssf_mems_data *data);
 
 /* 修改一个主机特征轮询配置项。
  * 返回：0 成功，-EINVAL 配置无效，-ENODEV 正在停止。

@@ -1805,9 +1805,14 @@ static void test_raw_recovery(void) {
   if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40060) == NULL ||
       ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40061) == NULL)
     return;
+  reset_sensor();
+  sensor.protocol.mode = SSF_MEMS_LINK_OTA;
+  before = sends;
+  CHECK(ssf_mems_protocol_recover_capture(&sensor) == -EBUSY);
+  CHECK(sensor.protocol.mode == SSF_MEMS_LINK_OTA && sends == before);
   finite_sensor();
   raw_wait_action = 2;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -ENODEV);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -ENODEV);
   CHECK(raw_published == 0 && sensor.raw.drain_packets == 16);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
   CHECK(serial.baudrate == 128000 && sensor.modbus_req.shutting_down);
@@ -1816,7 +1821,7 @@ static void test_raw_recovery(void) {
 
   finite_sensor();
   fail_on_send = 5; /* 批次结束后的只读确认发送失败。 */
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EIO);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EIO);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_RAW_RECOVERING);
   NO_SEND(ssf_mems_modbus_write_reg(&serial, 40102, 6, 50), -EAGAIN);
   before = sends;
@@ -1825,8 +1830,8 @@ static void test_raw_recovery(void) {
   CHECK(tx_events[before].function == 3 && tx_events[before].address == 101);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
   before = sends;
-  CHECK(ssf_mems_protocol_recover_raw(&sensor) == 0 && sends == before);
-  CHECK(ssf_mems_protocol_recover_raw(NULL) == -EINVAL);
+  CHECK(ssf_mems_protocol_recover_capture(&sensor) == 0 && sends == before);
+  CHECK(ssf_mems_protocol_recover_capture(NULL) == -EINVAL);
 
 }
 
@@ -1838,7 +1843,7 @@ static void test_variable_batches(void) {
     return;
   for (samples = 1024; samples <= 32768; samples *= 2) {
     finite_sensor();
-    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, samples) == 0);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, samples, true) == 0);
     CHECK(raw_published == samples && sensor.raw.batch_samples == samples);
     CHECK(sensor.raw.batch_packets == samples / 64 && sensor.raw.batches == 1);
     CHECK(sensor.raw.batch_done && !sensor.raw.active && !reboots);
@@ -1846,8 +1851,8 @@ static void test_variable_batches(void) {
     CHECK(setting_registers[61] == (samples == 1024 ? 0 : samples));
   }
   finite_sensor();
-  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100, 1000), -EINVAL);
-  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100, 65536), -EINVAL);
+  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 1000, true), -EINVAL);
+  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 65536, true), -EINVAL);
 }
 
 /* 验证定长触发、完整 16 包、零长度默认值和失败/卸载时有界收尾。 */
@@ -1855,32 +1860,32 @@ static void test_raw_session(void) {
   unsigned int action, i;
   finite_sensor();
   sensor.protocol.parity = SSF_MEMS_PARITY_EVEN;
-  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100, 1024), -EOPNOTSUPP);
-  CHECK(ssf_mems_xyzs.ops->collect_raw(NULL, 100, 1024) == -EINVAL);
+  NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 1024, true), -EOPNOTSUPP);
+  CHECK(ssf_mems_xyzs.ops->collect_raw(NULL, 1024, true) == -EINVAL);
   finite_sensor();
   if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40060) == NULL) {
-    NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 100, 1024), -ENOENT);
+    NO_SEND(sensor.sensor_ops->collect_raw(&sensor, 1024, true), -ENOENT);
     return;
   }
   if (ssf_mems_sensor_find_reg(&ssf_mems_xyzs, 40061) == NULL) {
-    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -ENOENT);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -ENOENT);
     CHECK(sends == 1);
     return;
   }
   setting_registers[51] = 9;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
   CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
   CHECK(sensor.raw.sampling_rate_index == 9 && !reboots);
   finite_sensor();
   setting_registers[51] = (ssf_mems_xyzs.profile.sampling_frequency_count - 1U) + 1;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EPROTO);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EPROTO);
   CHECK(sends == 1 && !sensor.raw.active);
 
   for (action = 0; action <= 7; action++) {
     const int expected[] = {0, -ETIMEDOUT, -ENODEV, -ERESTARTSYS, 0, -EILSEQ, -ETIMEDOUT, -ENODEV};
     finite_sensor();
     raw_wait_action = action;
-    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == expected[action]);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == expected[action]);
     CHECK(serial.baudrate == 128000 && !sensor.raw.active);
     CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
     CHECK(sends == 5 && tx_events[3].address == 59 && tx_events[4].address == 101);
@@ -1898,7 +1903,7 @@ static void test_raw_session(void) {
   setting_registers[61] = 4096;
   setting_registers[62] = 0x5678;
   setting_registers[69] = 0xfffd;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
   CHECK(setting_registers[60] == 0 && setting_registers[61] == 0);
   CHECK(setting_registers[62] == 0x5678 && setting_registers[69] == 0xfffd);
   CHECK(tx_events[3].function == 16 && tx_events[3].address == 60 && tx_events[3].value == 2);
@@ -1906,19 +1911,26 @@ static void test_raw_session(void) {
 
   finite_sensor();
   raw_publish_error = -ENOSPC;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -ENOSPC);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -ENOSPC);
   CHECK(sensor.raw.buffer_errors == 1024 && sensor.raw.batches == 0);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
+  /* 同一窗口下一批可成功，历史丢样保留供窗口验收而不污染单批返回值。 */
+  raw_publish_error = 0;
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, false) == 0);
+  CHECK(sensor.raw.buffer_errors == 1024 && sensor.raw.batches == 1);
+  CHECK(sensor.raw.packets == 32 && raw_published == 2048);
 
   finite_sensor();
   fail_on_send = 4; /* 触发发送失败，也只等待批次预算并做只读确认。 */
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EIO);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EIO);
   CHECK(sends == 5 && sensor.raw.packets == 0 && !reboots);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
 
   finite_sensor();
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1500, 1024) == 0);
-  CHECK(sensor.raw.batches >= 2 && raw_published == sensor.raw.batches * 1024);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
+  CHECK(sensor.raw.batches == 1 && raw_published == 1024);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, false) == 0);
+  CHECK(sensor.raw.batches == 2 && raw_published == 2048 && sensor.raw.packets == 32);
   CHECK(sensor.raw.discontinuities == 0);
 }
 
@@ -1984,7 +1996,7 @@ static void test_relocated_registers(void) {
   setting_registers[60] = 17;
   setting_registers[61] = 4096;
   setting_registers[62] = 0x5678;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
   CHECK(raw_published == 1024 && sensor.raw.batches == 1 && !sensor.raw.active);
   CHECK(setting_registers[60] == 0 && setting_registers[61] == 0);
   CHECK(setting_registers[62] == 0x5678 && !reboots);
@@ -2190,7 +2202,7 @@ static void test_xyz_model(void) {
   finite_sensor();
   CHECK(sensor.sensor == &ssf_mems_xyz);
   setting_registers[62] = 0x55aa; /* 不得写入不存在的声音参数。 */
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == 0);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
   CHECK(raw_published == 1024 && sensor.raw.batches == 1);
   CHECK(setting_registers[60] == 0 && setting_registers[61] == 1024);
   CHECK(setting_registers[62] == 0x55aa && sensor.protocol.mode == SSF_MEMS_LINK_MODBUS);
@@ -2201,7 +2213,7 @@ static void test_xyz_model(void) {
   }
   finite_sensor();
   raw_wait_action = 5; /* 包丢失仍必须恢复后才接受普通请求。 */
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EILSEQ);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EILSEQ);
   CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && !reboots);
 
   /* XYZ 超出线速预算时不得写长度、触发采集或丢弃可用特征缓存。 */
@@ -2209,11 +2221,11 @@ static void test_xyz_model(void) {
     finite_sensor();
     setting_registers[51] = i;
     if (i <= 3) {
-      CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == 0);
+      CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == 0);
       CHECK(raw_published == 1024 && sensor.raw.batches == 1);
     } else {
       sensor.protocol.valid = true;
-      CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EOPNOTSUPP);
+      CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EOPNOTSUPP);
       CHECK(sends == 1 && tx_events[0].function == 3 && tx_events[0].address == 51);
       CHECK(sensor.protocol.valid && !sensor.raw.active && raw_published == 0);
       CHECK(!reboots && setting_registers[51] == i);
@@ -2222,7 +2234,7 @@ static void test_xyz_model(void) {
   finite_sensor();
   sensor.protocol.host_baudrate = 9600;
   setting_registers[51] = 0;
-  CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EOPNOTSUPP && sends == 1);
+  CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EOPNOTSUPP && sends == 1);
   {
     struct ssf_mems_sensor invalid = ssf_mems_xyz;
     invalid.profile.raw_min_baudrate_count--;
@@ -2257,7 +2269,7 @@ int main(int argc, char **argv) {
   if (strncmp(argv[1], "nonadjacent_length_", strlen("nonadjacent_length_")) == 0) {
     finite_sensor();
     setting_registers[60] = 17;
-    CHECK(sensor.sensor_ops->collect_raw(&sensor, 100, 1024) == -EINVAL);
+    CHECK(sensor.sensor_ops->collect_raw(&sensor, 1024, true) == -EINVAL);
     CHECK(sends == 1 && !sensor.raw.active && !reboots);
     CHECK(setting_registers[60] == 17);
     goto done;

@@ -23,6 +23,7 @@ struct ssf_mems_iio_state {
   struct iio_chan_spec channels[SSF_MEMS_FIELD_MAX];
   struct ssf_mems_sensor_field_desc fields[SSF_MEMS_FIELD_MAX - 1];
   size_t field_count;
+  u64 buffer_epoch, capture_epoch; /* mlock 保护；跨 Buffer 重启的批次拒绝交付。 */
   struct iio_info info;
   struct attribute_group attribute_group;
   struct attribute *attributes[]; /* 注册时按只读型号能力筛选，随 IIO 私有区释放。 */
@@ -446,16 +447,13 @@ static IIO_DEVICE_ATTR(sensor_sampling_rate_index_available, 0444,
 
 /* 属性地址仅分派主机调度配置，不是 Modbus 寄存器地址。 */
 enum ssf_mems_iio_acquisition_control {
-  SSF_MEMS_IIO_ACQ_MODE,             /* 采集模式，raw / feature / alternating。 */
+  SSF_MEMS_IIO_ACQ_MODE,             /* 采集模式，包含声音及交替路线。 */
   SSF_MEMS_IIO_ACQ_RAW_DURATION,     /* 原始窗口，单位 ms。 */
   SSF_MEMS_IIO_ACQ_FEATURE_DURATION, /* 特征窗口，单位 ms。 */
-};
-
-/* 与采集层枚举对应的用户态名称。 */
-static const char *const ssf_mems_iio_acquisition_modes[] = {
-    [SSF_MEMS_ACQ_MODE_RAW] = "raw",                  //只进行原始数据定长采集
-    [SSF_MEMS_ACQ_MODE_FEATURE] = "feature",          //只进行特征数据采集
-    [SSF_MEMS_ACQ_MODE_ALTERNATING] = "alternating",  //两种数据交替采集
+  SSF_MEMS_IIO_ACQ_SOUND_DURATION,
+  SSF_MEMS_IIO_ACQ_ALT_FEATURE,
+  SSF_MEMS_IIO_ACQ_ALT_RAW,
+  SSF_MEMS_IIO_ACQ_ALT_SOUND,
 };
 
 /* 读取主机采集模式或窗口配置。
@@ -474,13 +472,19 @@ static ssize_t ssf_mems_iio_control_show(struct device *dev,
     return ret;
   switch (address) {
   case SSF_MEMS_IIO_ACQ_MODE:
-    if ((unsigned int)config.mode >= ARRAY_SIZE(ssf_mems_iio_acquisition_modes))
+    if (!ssf_mems_acquisition_mode_name(config.mode))
       return -EINVAL;
-    return sysfs_emit(buf, "%s\n", ssf_mems_iio_acquisition_modes[config.mode]);
+    return sysfs_emit(buf, "%s\n", ssf_mems_acquisition_mode_name(config.mode));
   case SSF_MEMS_IIO_ACQ_RAW_DURATION:
     return sysfs_emit(buf, "%u\n", config.raw_duration_ms);
   case SSF_MEMS_IIO_ACQ_FEATURE_DURATION:
     return sysfs_emit(buf, "%u\n", config.feature_duration_ms);
+  case SSF_MEMS_IIO_ACQ_SOUND_DURATION:
+    return sysfs_emit(buf, "%u\n", config.sound_duration_ms);
+  case SSF_MEMS_IIO_ACQ_ALT_FEATURE:
+  case SSF_MEMS_IIO_ACQ_ALT_RAW:
+  case SSF_MEMS_IIO_ACQ_ALT_SOUND:
+    return sysfs_emit(buf, "%u\n", config.alternating_en[address - SSF_MEMS_IIO_ACQ_ALT_FEATURE]);
   default:
     return -EINVAL;
   }
@@ -499,22 +503,38 @@ static ssize_t ssf_mems_iio_control_store(struct device *dev,
   int ret;
 
   if (address == SSF_MEMS_IIO_ACQ_MODE) {
-    for (i = 0; i < ARRAY_SIZE(ssf_mems_iio_acquisition_modes); i++) {
-      if (sysfs_streq(buf, ssf_mems_iio_acquisition_modes[i]) == true)
+    for (i = 0; i < SSF_MEMS_ACQ_MODE_COUNT; i++) {
+      if (sysfs_streq(buf, ssf_mems_acquisition_mode_name(i)) == true)
         break;
     }
-    if (i == ARRAY_SIZE(ssf_mems_iio_acquisition_modes))
+    if (i == SSF_MEMS_ACQ_MODE_COUNT)
       return -EINVAL;
     ret = ssf_mems_acquisition_set_mode(state->data, i);
   } else {
-    if (address != SSF_MEMS_IIO_ACQ_RAW_DURATION &&
-        address != SSF_MEMS_IIO_ACQ_FEATURE_DURATION)
-      return -EINVAL;
     ret = kstrtouint(buf, 10, &value);
     if (ret != 0)
       return ret;
-    ret = ssf_mems_acquisition_set_duration(
-        state->data, address == SSF_MEMS_IIO_ACQ_RAW_DURATION, value);
+    switch (address) {
+    case SSF_MEMS_IIO_ACQ_RAW_DURATION:
+      ret = ssf_mems_acquisition_set_duration(state->data, SSF_MEMS_ACQ_ROUTE_RAW, value);
+      break;
+    case SSF_MEMS_IIO_ACQ_FEATURE_DURATION:
+      ret = ssf_mems_acquisition_set_duration(state->data, SSF_MEMS_ACQ_ROUTE_FEATURE, value);
+      break;
+    case SSF_MEMS_IIO_ACQ_SOUND_DURATION:
+      ret = ssf_mems_acquisition_set_duration(state->data, SSF_MEMS_ACQ_ROUTE_SOUND, value);
+      break;
+    case SSF_MEMS_IIO_ACQ_ALT_FEATURE:
+    case SSF_MEMS_IIO_ACQ_ALT_RAW:
+    case SSF_MEMS_IIO_ACQ_ALT_SOUND:
+      if (value > 1)
+        return -EINVAL;
+      ret = ssf_mems_acquisition_set_alternating_en(
+          state->data, address - SSF_MEMS_IIO_ACQ_ALT_FEATURE, value != 0);
+      break;
+    default:
+      return -EINVAL;
+    }
   }
   if (ret != 0)
     return ret;
@@ -524,13 +544,48 @@ static ssize_t ssf_mems_iio_control_store(struct device *dev,
 static IIO_DEVICE_ATTR(sensor_acquisition_mode, 0644,
                        ssf_mems_iio_control_show, ssf_mems_iio_control_store,
                        SSF_MEMS_IIO_ACQ_MODE);
-static IIO_CONST_ATTR(sensor_acquisition_mode_available, "raw feature alternating");
+/* 型号能力列表与 set_mode 的能力检查保持一致。 */
+static ssize_t ssf_mems_iio_modes_available(struct device *dev,
+    struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+
+  unsigned int mode;
+  ssize_t len = 0;
+
+  (void)attr;
+
+  for (mode = 0; mode < SSF_MEMS_ACQ_MODE_COUNT; mode++) {
+    if (mode == SSF_MEMS_ACQ_MODE_ALTERNATING ||
+        !ssf_mems_acquisition_mode_supported(state->data, mode))
+      continue;
+    len += sysfs_emit_at(buf, len, "%s%s", len ? " " : "",
+                         ssf_mems_acquisition_mode_name(mode));
+  }
+  if (ssf_mems_acquisition_mode_supported(state->data, SSF_MEMS_ACQ_MODE_ALTERNATING))
+    len += sysfs_emit_at(buf, len, "%salternating", len ? " " : "");
+  return len + sysfs_emit_at(buf, len, "\n");
+}
+static IIO_DEVICE_ATTR(sensor_acquisition_mode_available, 0444,
+                       ssf_mems_iio_modes_available, NULL, 0);
 static IIO_DEVICE_ATTR(sensor_raw_duration_ms, 0644,
                        ssf_mems_iio_control_show, ssf_mems_iio_control_store,
                        SSF_MEMS_IIO_ACQ_RAW_DURATION);
 static IIO_DEVICE_ATTR(sensor_feature_duration_ms, 0644,
                        ssf_mems_iio_control_show, ssf_mems_iio_control_store,
                        SSF_MEMS_IIO_ACQ_FEATURE_DURATION);
+
+static IIO_DEVICE_ATTR(sensor_sound_duration_ms, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_SOUND_DURATION);
+static IIO_DEVICE_ATTR(sensor_alternating_feature_en, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_ALT_FEATURE);
+static IIO_DEVICE_ATTR(sensor_alternating_raw_en, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_ALT_RAW);
+static IIO_DEVICE_ATTR(sensor_alternating_sound_en, 0644,
+                       ssf_mems_iio_control_show, ssf_mems_iio_control_store,
+                       SSF_MEMS_IIO_ACQ_ALT_SOUND);
 
 static const char *const ssf_mems_poll_modes[] = {
     [SSF_MEMS_POLL_FIXED] = "fixed",
@@ -646,6 +701,40 @@ static ssize_t ssf_mems_iio_acquisition_show(struct device *dev,
     return -EINVAL;
   }
 }
+
+/* 一个短锁快照同时给出请求配置、已应用配置和实际执行路线。 */
+static ssize_t ssf_mems_iio_scheduler_show(struct device *dev,
+    struct device_attribute *attr, char *buf) {
+  struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
+  struct ssf_mems_acquisition_status status = {0};
+  static const char *const connections[] = {
+    [SSF_MEMS_ACQ_STARTUP] = "startup", [SSF_MEMS_ACQ_MATCH] = "matching",
+    [SSF_MEMS_ACQ_SWITCH] = "switching", [SSF_MEMS_ACQ_CONFIGURE] = "configuring",
+    [SSF_MEMS_ACQ_VERIFY] = "verifying", [SSF_MEMS_ACQ_READY] = "ready",
+    [SSF_MEMS_ACQ_BACKOFF] = "backoff", [SSF_MEMS_ACQ_STOPPED] = "stopped",
+  };
+  const char *connection, *reason;
+
+  (void)attr;
+  ssf_mems_acquisition_get_status(state->data, &status);
+  connection = (unsigned int)status.connection < ARRAY_SIZE(connections) ?
+      connections[status.connection] : "unknown";
+  reason = status.firmware_blocked ? "firmware_blocked" :
+      !status.online ? (status.connection == SSF_MEMS_ACQ_READY ? "offline" : connection) : status.busy ? "none" :
+      status.manual_pending ? "manual_queued" : status.manual_wait ? "manual_wait" :
+      status.route == SSF_MEMS_ACQ_ROUTE_NONE ? "buffer_disabled" : "interval";
+  return sysfs_emit(buf,
+      "connection=%s route=%s busy=%u manual_active=%u manual_pending=%u idle_reason=%s "
+      "requested_mode=%s applied_mode=%s config_version=%llu applied_config_version=%llu config_pending=%u\n",
+      connection, ssf_mems_acquisition_route_name(status.route), status.busy,
+      status.manual_active, status.manual_pending, reason,
+      ssf_mems_acquisition_mode_name(status.requested_mode),
+      status.applied_version ? ssf_mems_acquisition_mode_name(status.applied_mode) : "none",
+      (unsigned long long)status.config_version, (unsigned long long)status.applied_version,
+      status.config_version != status.applied_version);
+}
+static IIO_DEVICE_ATTR(sensor_acquisition_status, 0444,
+                       ssf_mems_iio_scheduler_show, NULL, 0);
 
 static IIO_DEVICE_ATTR(sensor_online, 0444, ssf_mems_iio_acquisition_show, NULL,
                        SSF_MEMS_IIO_STATUS_ONLINE);
@@ -793,9 +882,7 @@ static IIO_DEVICE_ATTR(sensor_raw_capture, 0200,
 static ssize_t ssf_mems_iio_sound_capture_store(struct device *dev,
     struct device_attribute *attr, const char *buf, size_t len) {
   struct ssf_mems_iio_state *state = iio_priv(dev_to_iio_dev(dev));
-  struct iio_dev *sound = state->data->sound_indio_dev;
   unsigned int value;
-  bool ready;
   int ret = kstrtouint(buf, 10, &value);
 
   (void)attr;
@@ -803,14 +890,6 @@ static ssize_t ssf_mems_iio_sound_capture_store(struct device *dev,
     return ret;
   if (value != 1)
     return -EINVAL;
-  if (!sound)
-    return -EOPNOTSUPP;
-  mutex_lock(&sound->mlock);
-  ready = iio_buffer_enabled(sound) && sound->active_scan_mask &&
-          (*sound->active_scan_mask & BIT(0));
-  mutex_unlock(&sound->mlock);
-  if (!ready)
-    return -ENODATA;
   ret = ssf_mems_acquisition_capture_sound(state->data);
   if (ret == -ERESTARTSYS)
     ret = -EINTR;
@@ -848,9 +927,14 @@ static struct attribute *ssf_mems_iio_attributes[] = {
     &iio_dev_attr_sensor_firmware_update.dev_attr.attr,
     &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr,
     &iio_dev_attr_sensor_acquisition_mode.dev_attr.attr,
-    &iio_const_attr_sensor_acquisition_mode_available.dev_attr.attr,
+    &iio_dev_attr_sensor_acquisition_status.dev_attr.attr,
+    &iio_dev_attr_sensor_acquisition_mode_available.dev_attr.attr,
     &iio_dev_attr_sensor_raw_duration_ms.dev_attr.attr,
     &iio_dev_attr_sensor_feature_duration_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_sound_duration_ms.dev_attr.attr,
+    &iio_dev_attr_sensor_alternating_feature_en.dev_attr.attr,
+    &iio_dev_attr_sensor_alternating_raw_en.dev_attr.attr,
+    &iio_dev_attr_sensor_alternating_sound_en.dev_attr.attr,
     &iio_dev_attr_sensor_poll_mode.dev_attr.attr,
     &iio_const_attr_sensor_poll_mode_available.dev_attr.attr,
     &iio_dev_attr_sensor_poll_fixed_interval_ms.dev_attr.attr,
@@ -878,8 +962,10 @@ static umode_t ssf_mems_iio_attr_visible(struct kobject *kobj,
 
   (void)index;
 
-  if (attr == &iio_dev_attr_sensor_sound_capture.dev_attr.attr &&
-      !sensor->ops->collect_sound)
+  if ((attr == &iio_dev_attr_sensor_sound_capture.dev_attr.attr ||
+       attr == &iio_dev_attr_sensor_sound_duration_ms.dev_attr.attr ||
+       attr == &iio_dev_attr_sensor_alternating_sound_en.dev_attr.attr) &&
+      !ssf_mems_acquisition_route_desc(SSF_MEMS_ACQ_ROUTE_SOUND)->supported(state->data))
     return 0;
   if ((attr == &iio_dev_attr_sensor_firmware_update.dev_attr.attr ||
        attr == &iio_dev_attr_sensor_firmware_update_status.dev_attr.attr) &&
@@ -905,7 +991,61 @@ static const struct iio_info ssf_mems_iio_info = {
     .read_raw = ssf_mems_iio_read_raw,
 };
 
-static const struct iio_buffer_setup_ops ssf_mems_iio_buffer_ops = {};
+static bool ssf_mems_iio_data_enabled(struct iio_dev *indio_dev,
+                                       unsigned long data_channels) {
+  bool enabled;
+
+  if (!indio_dev)
+    return false;
+  mutex_lock(&indio_dev->mlock);
+  enabled = iio_buffer_enabled(indio_dev) && indio_dev->active_scan_mask &&
+            (*indio_dev->active_scan_mask & data_channels);
+  mutex_unlock(&indio_dev->mlock);
+  return enabled;
+}
+
+bool ssf_mems_iio_raw_enabled(struct ssf_mems_data *data) {
+  return data && ssf_mems_iio_data_enabled(data->raw_indio_dev, BIT(0) | BIT(1) | BIT(2));
+}
+
+bool ssf_mems_iio_sound_enabled(struct ssf_mems_data *data) {
+  return data && ssf_mems_iio_data_enabled(data->sound_indio_dev, BIT(0));
+}
+
+static int ssf_mems_iio_buffer_changed(struct iio_dev *indio_dev) {
+  struct ssf_mems_iio_state *state = iio_priv(indio_dev);
+
+  /* IIO 核心调用此回调时已持 mlock，不能反向获取采集锁。 */
+  state->buffer_epoch++;
+  return 0;
+}
+static const struct iio_buffer_setup_ops ssf_mems_iio_buffer_ops = {
+  .postenable = ssf_mems_iio_buffer_changed,
+  .predisable = ssf_mems_iio_buffer_changed,
+};
+
+static int ssf_mems_iio_begin_capture(struct iio_dev *indio_dev, unsigned long channels) {
+  struct ssf_mems_iio_state *state;
+  int ret = 0;
+
+  if (!indio_dev)
+    return -ENODEV;
+  state = iio_priv(indio_dev);
+  mutex_lock(&indio_dev->mlock);
+  if (!iio_buffer_enabled(indio_dev) || !indio_dev->active_scan_mask ||
+      !(*indio_dev->active_scan_mask & channels))
+    ret = -ENODATA;
+  else
+    state->capture_epoch = state->buffer_epoch;
+  mutex_unlock(&indio_dev->mlock);
+  return ret;
+}
+int ssf_mems_iio_begin_raw(struct ssf_mems_data *data) {
+  return ssf_mems_iio_begin_capture(data->raw_indio_dev, BIT(0) | BIT(1) | BIT(2));
+}
+int ssf_mems_iio_begin_sound(struct ssf_mems_data *data) {
+  return ssf_mems_iio_begin_capture(data->sound_indio_dev, BIT(0));
+}
 
 /*
  * 所有特征中只有 startup_flags 为 8 bit，按全部 16 bit 估算可得到
@@ -921,7 +1061,7 @@ static const struct iio_buffer_setup_ops ssf_mems_iio_buffer_ops = {};
 static int ssf_mems_iio_push_fields(
     struct iio_dev *indio_dev, const void *sample,
     const struct ssf_mems_sensor_field_desc *fields, size_t field_count,
-    size_t max_scan_bytes, s64 timestamp_ns, bool required) {
+    size_t max_scan_bytes, s64 timestamp_ns, unsigned long required_channels) {
   u8 scan[SSF_MEMS_IIO_MAX_SCAN_BYTES] __aligned(sizeof(s64)) = {0};
   size_t offset = 0;
   unsigned int bit;
@@ -931,14 +1071,20 @@ static int ssf_mems_iio_push_fields(
     return -ENODEV;
   mutex_lock(&indio_dev->mlock);
   if (iio_buffer_enabled(indio_dev) == false) {
-    ret = required ? -ENODATA : 0;
+    ret = required_channels ? -ENODATA : 0;
     goto out;
   }
   if (indio_dev->active_scan_mask == NULL) {
     ret = -EINVAL;
     goto out;
   }
-  if (required && !(*indio_dev->active_scan_mask & BIT(0))) {
+  if (required_channels &&
+      ((struct ssf_mems_iio_state *)iio_priv(indio_dev))->capture_epoch !=
+      ((struct ssf_mems_iio_state *)iio_priv(indio_dev))->buffer_epoch) {
+    ret = -ESTALE;
+    goto out;
+  }
+  if (required_channels && !(*indio_dev->active_scan_mask & required_channels)) {
     ret = -EINVAL;
     goto out;
   }
@@ -986,7 +1132,7 @@ int ssf_mems_iio_publish_features(
   state = iio_priv(data->indio_dev);
   return ssf_mems_iio_push_fields(data->indio_dev, features,
                                   state->fields, state->field_count,
-                                  SSF_MEMS_IIO_MAX_SCAN_BYTES, timestamp_ns, false);
+                                  SSF_MEMS_IIO_MAX_SCAN_BYTES, timestamp_ns, 0);
 }
 
 /* 每个实例只创建本型号有寄存器映射的通道；XYZS 的既有索引保持不变。 */
@@ -1264,7 +1410,7 @@ int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
   return ssf_mems_iio_push_fields(
       data->raw_indio_dev, sample, ssf_mems_raw_fields,
       ARRAY_SIZE(ssf_mems_raw_fields),
-      ALIGN(sizeof(*sample), sizeof(s64)) + sizeof(s64), 0, false);
+      ALIGN(sizeof(*sample), sizeof(s64)) + sizeof(s64), 0, BIT(0) | BIT(1) | BIT(2));
 }
 
 #define SOUND_FIELD(_member) { .offset = offsetof(struct ssf_mems_sound_sample, _member), \
@@ -1327,7 +1473,7 @@ int ssf_mems_iio_publish_sound(struct ssf_mems_data *data,
   if (!data || !sample)
     return -EINVAL;
   return ssf_mems_iio_push_fields(data->sound_indio_dev, sample,
-      ssf_mems_sound_fields, ARRAY_SIZE(ssf_mems_sound_fields), 16, 0, true);
+      ssf_mems_sound_fields, ARRAY_SIZE(ssf_mems_sound_fields), 16, 0, BIT(0));
 }
 
 /* 注册特征、振动及型号支持的声音 IIO 设备。
@@ -1350,7 +1496,7 @@ int ssf_mems_iio_register(struct ssf_mems_data *data) {
   ret = ssf_mems_iio_register_device(
       data, &data->raw_indio_dev, data->sensor->raw_name, &ssf_mems_raw_info,
       ssf_mems_raw_channels, ARRAY_SIZE(ssf_mems_raw_channels));
-  if (ret == 0 && data->sensor_ops->collect_sound)
+  if (ret == 0 && ssf_mems_acquisition_route_desc(SSF_MEMS_ACQ_ROUTE_SOUND)->supported(data))
     ret = ssf_mems_iio_register_device(data, &data->sound_indio_dev,
         data->sensor->sound_name, &ssf_mems_sound_info,
         ssf_mems_sound_channels, ARRAY_SIZE(ssf_mems_sound_channels));

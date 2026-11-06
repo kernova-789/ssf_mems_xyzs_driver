@@ -20,9 +20,10 @@ def main():
                      ROOT / "iio"):
             command += ["-I" + str(path)]
         command += [str(ROOT / "protocol" / source) for source in
-                    ("model/modbus_table.c", "transport/serial_transport.c", "raw/raw_capture.c",
+                    ("model/modbus_table.c", "transport/serial_transport.c", "raw/raw_capture.c", "raw/capture_session.c",
                      "modbus/modbus.c", "modbus/modbus_request.c", "modbus/modbus_receive.c",
-                     "protocol.c", "raw/raw_stream.c", "firmware/ota.c")]
+                     "protocol.c", "raw/raw_stream.c", "raw/sound_stream.c",
+                     "raw/sound_capture.c", "firmware/ota.c")]
         command += [str(ROOT / "sensor" / source) for source in
                     ("sensor.c", "xyzs.c", "xyz.c", "features.c")]
         command += [str(ROOT / "acquisition/ssf_mems_firmware.c"),

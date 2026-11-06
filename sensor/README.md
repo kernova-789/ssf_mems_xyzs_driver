@@ -23,10 +23,11 @@
 
 ```c
 ret = data->sensor_ops->read_features(data, timeout_ms);
-ret = data->sensor_ops->collect_raw(data, duration_ms, samples);
+ret = data->sensor_ops->collect_raw(data, samples, reset_stats);
 ```
 
-两个型号各自提供回调，相同机制共用。`protocol/` 负责串口、Modbus 请求、
+`collect_raw()` 和可选 `collect_sound()` 都只执行一批，重复调度和窗口由采集层负责。
+`reset_stats` 仅指定新统计区间，保持振动整窗口累计属性的 ABI。两个型号各自提供回调，相同机制共用。`protocol/` 负责串口、Modbus 请求、
 总线模式、缓存同步和原始包解析；采集线程负责调度；IIO 负责用户态表现。
 增加型号无需在采集线程中增加型号分支。
 
@@ -80,7 +81,7 @@ XYZ 的位移变化也参与重复率判断。
 
 ## 定长原始采集
 
-两款型号回调共用 `ssf_mems_raw_collect_finite()` 的总线独占、收流和只读恢复机制。
+两款型号回调共用 `ssf_mems_raw_collect_batch()` 的总线独占、收流和只读恢复机制。
 每批为 1024 组同步 XYZ，触发地址来自各自的 `start_custom_length` 表项（40060）。
 仅通过 FC10 修改 40061/40062 并读回，不借用 XYZS 的十参数工作块：
 

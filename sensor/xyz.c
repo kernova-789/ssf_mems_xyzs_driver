@@ -398,8 +398,8 @@ static int xyz_read_features(struct ssf_mems_data *data,
   return ssf_mems_sensor_read_features(data, timeout_ms);
 }
 static int xyz_collect_raw(struct ssf_mems_data *data,
-                              unsigned int duration_ms, u32 samples) {
-  return ssf_mems_raw_collect_finite(data, duration_ms, samples);
+                              u32 samples, bool reset_stats) {
+  return ssf_mems_raw_collect_batch(data, samples, reset_stats);
 }
 static const struct ssf_mems_sensor_ops xyz_ops = {
   .read_features = xyz_read_features,

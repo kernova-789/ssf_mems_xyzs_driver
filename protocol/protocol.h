@@ -93,7 +93,7 @@ int ssf_mems_protocol_configure_serial(struct ssf_mems_data *data);
  * 返回：0 已恢复或无需恢复，负数为参数或收尾错误。
  * 接收模块须仍可用，只读确认，不写 Flash。
  */
-int ssf_mems_protocol_recover_raw(struct ssf_mems_data *data);
+int ssf_mems_protocol_recover_capture(struct ssf_mems_data *data);
 
 /* 把完整 Modbus 帧交给请求层匹配。
  * 返回：0 已处理或丢弃，-EINVAL 参数为空。

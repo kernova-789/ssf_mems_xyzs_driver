@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "raw/sound.h"
-#include "raw/raw_capture.h"
+#include "raw/capture_session.h"
 #include "core.h"
 #include "modbus/modbus.h"
 #include "modbus/modbus_request.h"
@@ -32,7 +32,7 @@ int ssf_mems_sound_finish_locked(struct ssf_mems_data *data) {
   WRITE_ONCE(data->protocol.mode, SSF_MEMS_LINK_SOUND_RECOVERING);
   while (!READ_ONCE(s->done) && time_before(jiffies, s->deadline))
     msleep(20);
-  if (!ssf_mems_raw_wait_quiet(data))
+  if (!ssf_mems_capture_wait_quiet(data))
     return -ETIMEDOUT;
   mutex_lock(&data->modbus_rx.parse_lock);
   if (s->used)
@@ -72,7 +72,7 @@ int ssf_mems_sound_collect_finite(struct ssf_mems_data *data) {
   s = &data->sound;
   mutex_lock(&data->protocol.bus_lock);
   if (data->protocol.mode != SSF_MEMS_LINK_MODBUS) {
-    ret = ssf_mems_raw_finish_locked(data);
+    ret = ssf_mems_capture_finish_locked(data);
     if (ret)
       goto out;
   }

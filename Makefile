@@ -10,11 +10,11 @@ ssf_mems-y += protocol/modbus/modbus_receive.o
 ssf_mems-y += protocol/modbus/modbus_request.o
 ssf_mems-y += protocol/protocol.o
 ssf_mems-y += protocol/raw/raw_stream.o
-ssf_mems-y += protocol/raw/raw_capture.o
+ssf_mems-y += protocol/raw/raw_capture.o protocol/raw/capture_session.o
 ssf_mems-y += protocol/raw/sound_stream.o protocol/raw/sound_capture.o
 ssf_mems-y += protocol/firmware/ota.o
 ssf_mems-y += iio/ssf_mems_iio.o
-ssf_mems-y += acquisition/ssf_mems_acquisition.o
+ssf_mems-y += acquisition/ssf_mems_acquisition.o acquisition/acquisition_routes.o
 ssf_mems-y += acquisition/acquisition_policy.o
 ssf_mems-y += acquisition/ssf_mems_firmware.o
 
@@ -31,21 +31,28 @@ CROSS_COMPILE ?= aarch64-linux-gnu-
 # .ko 自动复制到这个目录
 INSTALL_DIR ?= /home/u-yoimiya/nfs/
 
-.PHONY: all prepare install clean
+.PHONY: all modules prepare install clean
 
-all: prepare
-	$(MAKE) -C $(KDIR) M=$(CURDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
-	@mkdir -p $(INSTALL_DIR)
-	@cp -f $(CURDIR)/ssf_mems.ko $(INSTALL_DIR)/
+all: modules
+	@mkdir -p "$(INSTALL_DIR)"
+	@cp -f "$(CURDIR)/ssf_mems.ko" "$(INSTALL_DIR)/"
 	@echo "Installed: $(INSTALL_DIR)/ssf_mems.ko"
 
+# Build locally without copying into INSTALL_DIR (which may be NFS-exported).
+modules: prepare
+	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
+
 prepare:
-	$(MAKE) -C $(KDIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules_prepare
+	@test -f "$(KDIR)/.config" || { echo "Missing $(KDIR)/.config: supply the target kernel configuration first." >&2; exit 1; }
+# Re-evaluate compiler capabilities with the target toolchain before syncconfig.
+# Keep existing choices; use Kconfig defaults for newly available symbols.
+	$(MAKE) -C "$(KDIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
+	$(MAKE) -C "$(KDIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules_prepare
 
 install:
-	@mkdir -p $(INSTALL_DIR)
-	@cp -f $(CURDIR)/ssf_mems.ko $(INSTALL_DIR)/
+	@mkdir -p "$(INSTALL_DIR)"
+	@cp -f "$(CURDIR)/ssf_mems.ko" "$(INSTALL_DIR)/"
 	@echo "Installed: $(INSTALL_DIR)/ssf_mems.ko"
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) clean

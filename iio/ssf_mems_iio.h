@@ -29,7 +29,7 @@ int ssf_mems_iio_publish_features(
     const struct ssf_mems_sensor_data *features, s64 timestamp_ns);
 
 /* 把一组 XYZ 原始样本推入 IIO 缓冲区。
- * 返回：0 成功或未启用缓冲区，负数为参数、设备或推送错误。
+ * 返回：0 已交付，未启用缓冲区/数据通道或推送失败返回负数。
  * 注销 IIO 前须停止生产者；持 mlock 打包和推送。
  */
 int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
@@ -37,3 +37,11 @@ int ssf_mems_iio_publish_raw(struct ssf_mems_data *data,
 
 int ssf_mems_iio_publish_sound(struct ssf_mems_data *data,
                               const struct ssf_mems_sound_sample *sample);
+
+/* 短持 mlock 检查 buffer/enable 和实际数据通道；打开 /dev 不代表启用。 */
+bool ssf_mems_iio_raw_enabled(struct ssf_mems_data *data);
+bool ssf_mems_iio_sound_enabled(struct ssf_mems_data *data);
+
+/* 记录本批的 Buffer 代次；批中关闭或重启 Buffer 后发布必须失败。 */
+int ssf_mems_iio_begin_raw(struct ssf_mems_data *data);
+int ssf_mems_iio_begin_sound(struct ssf_mems_data *data);

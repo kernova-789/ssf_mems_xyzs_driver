@@ -245,9 +245,9 @@ static void reset(size_t size, enum fault selected) {
   mutex_init(&sensor.acquisition.lock);
   mutex_init(&sensor.acquisition.status_lock);
   sensor.acquisition.online = true;
-  sensor.acquisition.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
-  sensor.acquisition.raw_duration_ms = 5000;
-  sensor.acquisition.feature_duration_ms = 5000;
+  sensor.acquisition.config.mode = SSF_MEMS_ACQ_MODE_ALTERNATING;
+  sensor.acquisition.config.raw_duration_ms = 5000;
+  sensor.acquisition.config.feature_duration_ms = 5000;
   serial.baudrate = 128000;
   for (i = 0; i < sizeof(image); i++)
     image[i] = (i * 59U + i / 17U) & 0xff;
@@ -299,8 +299,8 @@ static void test_success(void) {
     CHECK(serial.baudrate_set_count == 0 && serial.parity_set_count == 0);
     CHECK(sensor.acquisition.reconnect == true && sensor.acquisition.firmware_blocked == false);
     CHECK(sensor.protocol.mode == SSF_MEMS_LINK_MODBUS && sensor.ota.pending == false);
-    CHECK(sensor.acquisition.mode == SSF_MEMS_ACQ_MODE_ALTERNATING);
-    CHECK(sensor.acquisition.raw_duration_ms == 5000 && sensor.acquisition.feature_duration_ms == 5000);
+    CHECK(sensor.acquisition.config.mode == SSF_MEMS_ACQ_MODE_ALTERNATING);
+    CHECK(sensor.acquisition.config.raw_duration_ms == 5000 && sensor.acquisition.config.feature_duration_ms == 5000);
   }
 }
 
@@ -396,6 +396,10 @@ static void test_validation(void) {
   CHECK(ssf_mems_acquisition_update_firmware(&sensor, "update.bin") == -EBUSY);
   CHECK(sends == 0);
   reset(513, NORMAL);
+  sensor.acquisition.requests[SSF_MEMS_ACQ_ROUTE_RAW] = (void *)&sensor;
+  CHECK(ssf_mems_acquisition_update_firmware(&sensor, "update.bin") == -EBUSY);
+  CHECK(sends == 0 && sensor.acquisition.online && releases == 1);
+  reset(513, NORMAL);
   sensor.acquisition.online = false;
   CHECK(ssf_mems_acquisition_update_firmware(&sensor, "update.bin") == -ENODATA);
   CHECK(sends == 0);
@@ -467,4 +471,11 @@ int main(void) {
   cleanup();
   printf("PASS OTA framing, staged Flash, ACK faults, loader and lifecycle: %u checks\n", checks);
   return 0;
+}
+
+/* Admission substitute: the production worker request lifecycle is tested separately. */
+bool ssf_mems_acquisition_manual_pending(struct ssf_mems_data *data) {
+  for (unsigned int route = 0; route < SSF_MEMS_ACQ_ROUTE_COUNT; route++)
+    if (data->acquisition.requests[route]) return true;
+  return false;
 }
